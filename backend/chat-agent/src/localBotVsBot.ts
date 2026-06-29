@@ -1,5 +1,5 @@
 // Local dev helper: runs bot-vs-bot rounds against a local backend using the real
-// local Ollama, publishing each transcript to /v1/chat/live so the frontend
+// local Ollama, publishing each transcript to /v1/sessions/:sessionId/chat/live/publish so the frontend
 // Spectator tab can display the conversation. Not part of the shipped agent —
 // safe to delete after manual testing.
 import { MpClient, resolveMpWsUrl } from "./mpClient.ts";

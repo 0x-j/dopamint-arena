@@ -32,7 +32,7 @@ export async function registerChatSession(
     }),
   });
   if (!resp.ok) {
-    throw new Error(`registerSession failed: ${resp.status}`);
+    throw new Error(`registerChatSession failed: ${resp.status}`);
   }
   return (await resp.json()) as ChatSessionCredentials;
 }

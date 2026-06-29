@@ -26,8 +26,7 @@ export async function main(): Promise<void> {
   console.log("[chat-agent] loading config...");
   const cfg = loadConfig();
   console.log(
-    "[chat-agent] config loaded, operator=",
-    cfg.operatorAddress ?? "derived",
+    "[chat-agent] config loaded, operator=derived-from-keypair",
   );
   const operatorKeypair = Ed25519Keypair.fromSecretKey(
     fromB64(cfg.operatorKey),

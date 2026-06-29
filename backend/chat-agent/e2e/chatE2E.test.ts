@@ -6,7 +6,10 @@ import { resolve as pathResolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { runBotVsBot } from "../src/botVsBot.ts";
 import { MpClient, resolveMpWsUrl } from "../src/mpClient.ts";
-import { OllamaBackendClient } from "../src/ollama.ts";
+import {
+  OllamaBackendClient,
+  registerChatSession,
+} from "../src/ollama.ts";
 
 const BACKEND_PORT = 18080;
 const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
@@ -167,7 +170,18 @@ test(
 
       const live = await subscribeLive();
 
-      const ollama = new OllamaBackendClient(BACKEND_URL);
+      const chatSession = await registerChatSession(
+        BACKEND_URL,
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+      );
+      const ollama = new OllamaBackendClient(
+        ollamaUrl,
+        BACKEND_URL,
+        "qwen2.5:1.5b",
+        { numPredict: 64, topicPredict: 24, numCtx: 2048, keepAlive: "30m" },
+        chatSession.sessionId,
+        chatSession.statsToken,
+      );
       const alice = new MpClient(WS_URL, "0xalice");
       const bob = new MpClient(WS_URL, "0xbob");
 
