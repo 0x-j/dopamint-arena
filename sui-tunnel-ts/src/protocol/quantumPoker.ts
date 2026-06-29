@@ -203,6 +203,15 @@ function assertSlot(slot: number): void {
   }
 }
 
+/**
+ * First seat to act in a hand. Heads-up here is dealerless, so position is rotated
+ * by hand index: A opens even hands, B opens odd ones. Without this A would act first
+ * every street of every hand, a permanent positional edge for the tunnel opener.
+ */
+function firstActorFor(handNo: bigint): Party {
+  return handNo % 2n === 0n ? "A" : "B";
+}
+
 function sameNumberSet(a: readonly number[], b: readonly number[]): boolean {
   if (a.length !== b.length) return false;
   const aa = [...a].sort((x, y) => x - y);
@@ -413,7 +422,7 @@ export class QuantumPokerProtocol implements Protocol<PokerState, PokerMove> {
       totalBetB: 0n,
       streetBetA: 0n,
       streetBetB: 0n,
-      toAct: "A",
+      toAct: firstActorFor(0n),
       actedA: false,
       actedB: false,
       foldedBy: null,
@@ -564,7 +573,7 @@ export class QuantumPokerProtocol implements Protocol<PokerState, PokerMove> {
     s.phase = phase;
     s.streetBetA = 0n;
     s.streetBetB = 0n;
-    s.toAct = "A";
+    s.toAct = firstActorFor(s.handNo);
     s.actedA = false;
     s.actedB = false;
   }
@@ -783,7 +792,7 @@ export class QuantumPokerProtocol implements Protocol<PokerState, PokerMove> {
       default:
         throw new Error(`cannot advance from ${s.phase}`);
     }
-    s.toAct = "A";
+    s.toAct = firstActorFor(s.handNo);
     s.actedA = false;
     s.actedB = false;
     s.streetBetA = 0n;
@@ -900,7 +909,7 @@ export class QuantumPokerProtocol implements Protocol<PokerState, PokerMove> {
     s.totalBetB = 0n;
     s.streetBetA = 0n;
     s.streetBetB = 0n;
-    s.toAct = "A";
+    s.toAct = firstActorFor(s.handNo);
     s.actedA = false;
     s.actedB = false;
     s.foldedBy = null;

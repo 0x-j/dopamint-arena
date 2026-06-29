@@ -372,3 +372,35 @@ test("a flush is ranked by its high cards, not by a duplicate-rank pair", () => 
     "K-high flush must beat J-high flush despite the low pair",
   );
 });
+
+test("first actor alternates by hand so neither seat keeps a positional edge", () => {
+  const p = new QuantumPokerProtocol();
+  const commit = (s: PokerState, sec: SlotSecret[], by: Party) =>
+    p.applyMove(
+      s,
+      { kind: "commit_slots", commitments: commitSlotSecrets(sec), localSecrets: sec },
+      by,
+    );
+  const toPreflop = (s: PokerState, a: SlotSecret[], b: SlotSecret[]) => {
+    s = commit(s, a, "A");
+    s = commit(s, b, "B");
+    s = p.applyMove(s, reveal(a, [2, 3]), "A");
+    s = p.applyMove(s, reveal(b, [0, 1]), "B");
+    return s;
+  };
+
+  let s = p.initialState({ tunnelId: "0xalt", initialBalances: { a: 1000n, b: 1000n } });
+  s = toPreflop(s, secrets(1), secrets(2));
+  assert.equal(s.phase, "preflop_bet");
+  assert.equal(s.toAct, "A", "hand 0 (even): A acts first");
+
+  // Finish hand 0 quickly (first actor folds), advance to hand 1.
+  s = p.applyMove(s, { kind: "fold" }, "A");
+  assert.equal(s.phase, "hand_over");
+  s = p.applyMove(s, { kind: "next_hand" }, "A");
+  assert.equal(s.handNo, 1n);
+
+  s = toPreflop(s, secrets(3), secrets(4));
+  assert.equal(s.phase, "preflop_bet");
+  assert.equal(s.toAct, "B", "hand 1 (odd): B acts first — alternated");
+});
