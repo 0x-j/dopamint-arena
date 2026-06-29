@@ -35,8 +35,7 @@ export class ChatApiClient {
 
   constructor(
     baseUrl: string,
-    fetchImpl: typeof globalThis.fetch = (url, init) =>
-      globalThis.fetch(url, init),
+    fetchImpl: typeof globalThis.fetch = globalThis.fetch,
     ollama: OllamaDirectConfig | null = null,
     sessionId?: string,
     statsToken?: string,
@@ -74,7 +73,7 @@ export class ChatApiClient {
         body: JSON.stringify({ messages }),
       },
     );
-    if (!res.ok) throw new Error(`chat failed: ${res.status}`);
+    if (!res.ok) throw new Error(`chat failed: ${res.status} ${res.statusText}`);
     const json = (await res.json()) as { content: string };
     return json.content;
   }
@@ -96,7 +95,7 @@ export class ChatApiClient {
         headers: { Authorization: `Bearer ${this.statsToken}` },
       },
     );
-    if (!res.ok) throw new Error(`topic failed: ${res.status}`);
+    if (!res.ok) throw new Error(`topic failed: ${res.status} ${res.statusText}`);
     const json = (await res.json()) as { topic: string };
     return json.topic;
   }
@@ -160,7 +159,7 @@ export function createChatApiClient(
     : null;
   return new ChatApiClient(
     import.meta.env.VITE_BACKEND_URL ?? "",
-    (url, init) => globalThis.fetch(url, init),
+    globalThis.fetch,
     ollama,
     sessionId,
     statsToken,
