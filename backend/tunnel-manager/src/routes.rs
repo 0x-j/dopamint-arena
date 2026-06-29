@@ -521,12 +521,17 @@ pub(crate) struct PublishChatRequest {
 
 pub(crate) async fn chat_publish(
     State(state): State<SharedState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<PublishChatRequest>,
-) -> StatusCode {
+) -> Response {
+    if let Err(resp) = require_session_auth(&state, &session_id, &headers).await {
+        return resp;
+    }
     for msg in req.messages {
         state.chat.publish(msg).await;
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub(crate) async fn chat_live(
