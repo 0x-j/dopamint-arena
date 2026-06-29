@@ -708,6 +708,7 @@ fn render_metrics(snap: &StatsSnapshot, colocated: u64, split: u64) -> String {
 mod tests {
     use super::test_support::{auth_headers, register_test_session, test_state};
     use super::*;
+    use crate::ollama::{OllamaClient, OllamaMessage};
 
     // The binary /settle body the SDK codec (`encodeSettleBody`) emits — byte-identical to
     // the TS golden vector (settleBinary.test.ts). Pasting it here pins TS↔Rust wire parity: a
@@ -919,38 +920,45 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    // POST /v1/chat forwards messages to Ollama and returns the assistant reply.
-    #[tokio::test]
-    async fn chat_endpoint_forwards_to_ollama() {
-        use crate::ollama::{OllamaClient, OllamaMessage};
-        let mut state = test_state();
-        let server = wiremock::MockServer::start().await;
-        let body = serde_json::json!({ "message": { "role": "assistant", "content": "ok" } });
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/api/chat"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
-            .mount(&server)
-            .await;
-        let ollama = OllamaClient::new(server.uri(), "qwen2.5:1.5b".into()).unwrap();
-        std::sync::Arc::get_mut(&mut state)
-            .expect("unique test arc")
-            .ollama = ollama;
-
-        let session_id = register_test_session(&state, "tok").await;
-
-        let req = ChatRequest {
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
             messages: vec![OllamaMessage {
                 role: "user".into(),
                 content: "hi".into(),
             }],
             model: None,
             stream: None,
-        };
+        }
+    }
+
+    async fn install_mock_ollama(state: &mut SharedState) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        let ollama = OllamaClient::new(server.uri(), "qwen2.5:1.5b".into()).unwrap();
+        std::sync::Arc::get_mut(state)
+            .expect("unique test arc")
+            .ollama = ollama;
+        server
+    }
+
+    // POST /v1/chat forwards messages to Ollama and returns the assistant reply.
+    #[tokio::test]
+    async fn chat_endpoint_forwards_to_ollama() {
+        let mut state = test_state();
+        let server = install_mock_ollama(&mut state).await;
+        let body = serde_json::json!({ "message": { "role": "assistant", "content": "ok" } });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let session_id = register_test_session(&state, "tok").await;
+
         let resp = chat(
             axum::extract::State(state),
             axum::extract::Path(session_id),
             auth_headers("tok"),
-            axum::Json(req),
+            axum::Json(chat_request()),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -960,22 +968,13 @@ mod tests {
 
     #[tokio::test]
     async fn chat_endpoint_rejects_missing_bearer_token() {
-        use crate::ollama::OllamaMessage;
         let state = test_state();
         let session_id = register_test_session(&state, "tok").await;
-        let req = ChatRequest {
-            messages: vec![OllamaMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            model: None,
-            stream: None,
-        };
         let resp = chat(
             axum::extract::State(state),
             axum::extract::Path(session_id),
             HeaderMap::new(),
-            axum::Json(req),
+            axum::Json(chat_request()),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -983,22 +982,13 @@ mod tests {
 
     #[tokio::test]
     async fn chat_endpoint_rejects_wrong_bearer_token() {
-        use crate::ollama::OllamaMessage;
         let state = test_state();
         let session_id = register_test_session(&state, "tok").await;
-        let req = ChatRequest {
-            messages: vec![OllamaMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            model: None,
-            stream: None,
-        };
         let resp = chat(
             axum::extract::State(state),
             axum::extract::Path(session_id),
             auth_headers("wrong"),
-            axum::Json(req),
+            axum::Json(chat_request()),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -1006,21 +996,12 @@ mod tests {
 
     #[tokio::test]
     async fn chat_endpoint_rejects_unknown_session() {
-        use crate::ollama::OllamaMessage;
         let state = test_state();
-        let req = ChatRequest {
-            messages: vec![OllamaMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            model: None,
-            stream: None,
-        };
         let resp = chat(
             axum::extract::State(state),
             axum::extract::Path("sess_does_not_exist".into()),
             auth_headers("tok"),
-            axum::Json(req),
+            axum::Json(chat_request()),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1028,34 +1009,21 @@ mod tests {
 
     #[tokio::test]
     async fn chat_endpoint_returns_bad_gateway_on_ollama_error() {
-        use crate::ollama::{OllamaClient, OllamaMessage};
         let mut state = test_state();
-        let server = wiremock::MockServer::start().await;
+        let server = install_mock_ollama(&mut state).await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/chat"))
             .respond_with(wiremock::ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let ollama = OllamaClient::new(server.uri(), "qwen2.5:1.5b".into()).unwrap();
-        std::sync::Arc::get_mut(&mut state)
-            .expect("unique test arc")
-            .ollama = ollama;
 
         let session_id = register_test_session(&state, "tok").await;
 
-        let req = ChatRequest {
-            messages: vec![OllamaMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            model: None,
-            stream: None,
-        };
         let resp = chat(
             axum::extract::State(state),
             axum::extract::Path(session_id),
             auth_headers("tok"),
-            axum::Json(req),
+            axum::Json(chat_request()),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1064,9 +1032,8 @@ mod tests {
     // GET /v1/chat/topic asks Ollama for a short random conversation topic.
     #[tokio::test]
     async fn chat_topic_endpoint_returns_topic() {
-        use crate::ollama::OllamaClient;
         let mut state = test_state();
-        let server = wiremock::MockServer::start().await;
+        let server = install_mock_ollama(&mut state).await;
         let body =
             serde_json::json!({ "message": { "role": "assistant", "content": "space travel" } });
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1074,10 +1041,6 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
-        let ollama = OllamaClient::new(server.uri(), "qwen2.5:1.5b".into()).unwrap();
-        std::sync::Arc::get_mut(&mut state)
-            .expect("unique test arc")
-            .ollama = ollama;
 
         let session_id = register_test_session(&state, "tok").await;
 
@@ -1088,5 +1051,45 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(resp).await).unwrap();
+        assert_eq!(body["topic"], "space travel");
+    }
+
+    #[tokio::test]
+    async fn chat_topic_rejects_missing_bearer_token() {
+        let state = test_state();
+        let session_id = register_test_session(&state, "tok").await;
+        let resp = chat_topic(
+            axum::extract::State(state),
+            axum::extract::Path(session_id),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_topic_rejects_wrong_bearer_token() {
+        let state = test_state();
+        let session_id = register_test_session(&state, "tok").await;
+        let resp = chat_topic(
+            axum::extract::State(state),
+            axum::extract::Path(session_id),
+            auth_headers("wrong"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_topic_rejects_unknown_session() {
+        let state = test_state();
+        let resp = chat_topic(
+            axum::extract::State(state),
+            axum::extract::Path("sess_does_not_exist".into()),
+            auth_headers("tok"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
