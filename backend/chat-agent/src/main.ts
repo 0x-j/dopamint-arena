@@ -9,7 +9,10 @@ import {
   ensureDopamintBalanceForAddress,
 } from "./funding.ts";
 import { MpClient, resolveMpWsUrl } from "./mpClient.ts";
-import { OllamaBackendClient } from "./ollama.ts";
+import {
+  OllamaBackendClient,
+  registerChatSession,
+} from "./ollama.ts";
 
 export function buildMpUrl(backendUrl: string): string {
   return `${resolveMpWsUrl(backendUrl)}/v1/mp`;
@@ -35,7 +38,20 @@ export async function main(): Promise<void> {
   console.log("[chat-agent] operator address:", operatorAddress);
   console.log("[chat-agent] bob address:", bobAddress);
   const sui = createSuiClient(cfg.suiRpcUrl);
-  const ollama = new OllamaBackendClient(cfg.backendUrl, cfg.ollamaModel);
+  console.log("[chat-agent] registering chat session...");
+  const chatSession = await registerChatSession(
+    cfg.backendUrl,
+    operatorAddress,
+  );
+  console.log("[chat-agent] chat session:", chatSession.sessionId);
+  const ollama = new OllamaBackendClient(
+    cfg.ollamaUrl,
+    cfg.backendUrl,
+    cfg.ollamaModel,
+    cfg.ollamaSpeed,
+    chatSession.sessionId,
+    chatSession.statsToken,
+  );
 
   const botNeed = BigInt(cfg.stakeRaw) * 2n;
   console.log("[chat-agent] ensuring DOPAMINT balance...");

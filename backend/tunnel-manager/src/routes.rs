@@ -1097,4 +1097,63 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn chat_publish_rejects_missing_bearer_token() {
+        let state = test_state();
+        let session_id = register_test_session(&state, "tok").await;
+        let req = PublishChatRequest {
+            messages: vec![crate::chat_store::ChatMessage {
+                sender: "bot".into(),
+                text: "hi".into(),
+            }],
+        };
+        let resp = chat_publish(
+            axum::extract::State(state),
+            axum::extract::Path(session_id),
+            HeaderMap::new(),
+            axum::Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_publish_rejects_wrong_bearer_token() {
+        let state = test_state();
+        let session_id = register_test_session(&state, "tok").await;
+        let req = PublishChatRequest {
+            messages: vec![crate::chat_store::ChatMessage {
+                sender: "bot".into(),
+                text: "hi".into(),
+            }],
+        };
+        let resp = chat_publish(
+            axum::extract::State(state),
+            axum::extract::Path(session_id),
+            auth_headers("wrong"),
+            axum::Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_publish_rejects_unknown_session() {
+        let state = test_state();
+        let req = PublishChatRequest {
+            messages: vec![crate::chat_store::ChatMessage {
+                sender: "bot".into(),
+                text: "hi".into(),
+            }],
+        };
+        let resp = chat_publish(
+            axum::extract::State(state),
+            axum::extract::Path("sess_does_not_exist".into()),
+            auth_headers("tok"),
+            axum::Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }

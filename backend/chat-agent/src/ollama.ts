@@ -13,10 +13,35 @@ interface OllamaChatResponse {
 const TOPIC_PROMPT =
   "Give me one short, fun conversation topic for two chat bots. Answer with the topic only, no extra text.";
 
+export interface ChatSessionCredentials {
+  sessionId: string;
+  statsToken: string;
+}
+
+export async function registerChatSession(
+  backendUrl: string,
+  userAddress: string,
+): Promise<ChatSessionCredentials> {
+  const resp = await fetch(`${backendUrl.replace(/\/+$/, "")}/v1/sessions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      userAddress,
+      game: "chat",
+      tunnels: [],
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`registerSession failed: ${resp.status}`);
+  }
+  return (await resp.json()) as ChatSessionCredentials;
+}
+
 /**
  * Generates chat replies by talking to a local Ollama instance directly,
  * skipping the chat backend's proxy hop. Transcript publishing still goes
- * through the backend (`/v1/chat/live/publish`) — that route is not an LLM call.
+ * through the backend (`/v1/sessions/:sessionId/chat/live/publish`) — that
+ * route is not an LLM call.
  *
  * Tuned for speed over quality: output is capped (`num_predict`), the context
  * window is shrunk (`num_ctx`) so prompt processing is cheaper, and the model
@@ -29,16 +54,16 @@ export class OllamaBackendClient {
   readonly backendUrl: string;
   readonly model: string;
   private readonly speed: OllamaSpeedOptions;
-  private readonly sessionId?: string;
-  private readonly statsToken?: string;
+  private readonly sessionId: string;
+  private readonly statsToken: string;
 
   constructor(
     ollamaUrl: string,
     backendUrl: string,
     model: string,
     speed: OllamaSpeedOptions,
-    sessionId?: string,
-    statsToken?: string,
+    sessionId: string,
+    statsToken: string,
   ) {
     this.ollamaUrl = ollamaUrl.replace(/\/+$/, "");
     this.backendUrl = backendUrl.replace(/\/+$/, "");
@@ -88,14 +113,12 @@ export class OllamaBackendClient {
   async publishTranscript(
     messages: { sender: string; text: string }[],
   ): Promise<void> {
-    const url = this.sessionId
-      ? `${this.backendUrl}/v1/sessions/${this.sessionId}/chat/live/publish`
-      : `${this.backendUrl}/v1/chat/live/publish`;
+    const url = `${this.backendUrl}/v1/sessions/${this.sessionId}/chat/live/publish`;
     const resp = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        ...(this.statsToken ? { Authorization: `Bearer ${this.statsToken}` } : {}),
+        Authorization: `Bearer ${this.statsToken}`,
       },
       body: JSON.stringify({ messages }),
     });
