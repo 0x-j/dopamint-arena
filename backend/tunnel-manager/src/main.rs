@@ -147,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/ready", get(routes::ready))
         .route("/metrics", get(routes::metrics))
         .route("/v1/sessions", post(routes::register_session))
-        .route("/v1/sessions/:id/heartbeat", post(routes::heartbeat))
+        .route("/v1/sessions/:session_id/heartbeat", post(routes::heartbeat))
         // Settlement carries the off-chain transcript as a v2 binary body (one fixed ~248 B entry
         // per co-signed move), archived to Walrus verbatim. Maximizing moves/tunnel amortizes the
         // on-chain close and Walrus per-blob cost, so a long self-play game ships tens of thousands
