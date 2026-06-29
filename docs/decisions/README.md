@@ -89,6 +89,9 @@ _why_ survives after the people involved have moved on.
   snake_case segments separated by dots and an explicit `.vN` suffix; `.series`
   replaces new `.multi` wrapper IDs, with legacy aliases recorded in the port
   inventory.
+- [0023](0023-control-plane-durable-s3-archive-retry-queue.md) — Control plane gains
+  narrow read/write access to one Postgres work-queue table (`pending_s3_archive`) for
+  durable S3-archive retry; a contained exception to ADR-0005/0015's Redis-only rule.
 
 > Numbers 0004 (multiplayer experience lane) and 0006 have no record file: 0004
 > predates this directory (still referenced from code/specs), and 0006 was
