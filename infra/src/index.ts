@@ -26,9 +26,7 @@ const backendImageTag: pulumi.Input<string> = cfg.backendImageTag
   : resolveBackendImageTag(cfg.environment);
 
 const network = createNetwork(`dopamint-${cfg.environment}`);
-const sgs = createSecurityGroups(`dopamint-${cfg.environment}`, network.vpcId, {
-  ollamaEnabled: cfg.ollamaEnabled,
-});
+const sgs = createSecurityGroups(`dopamint-${cfg.environment}`, network.vpcId);
 
 const dns = createDns(`dopamint-${cfg.environment}`, {
   domain: cfg.domain,
