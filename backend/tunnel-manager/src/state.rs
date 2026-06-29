@@ -1,9 +1,13 @@
 //! Shared application state + the stats wire types.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+
+use crate::archive_queue::ArchiveQueue;
+use crate::s3::TranscriptArchiver;
 
 pub struct AppState {
     pub control: std::sync::Arc<dyn crate::store::ControlStore>,
@@ -14,6 +18,13 @@ pub struct AppState {
     /// `settler` as the fallback. `None` = settler-only.
     pub enoki: Option<crate::enoki::EnokiClient>,
     pub walrus: crate::walrus::WalrusClient,
+    #[allow(dead_code)] // TODO(s3-archive): wired into settle handler in Task 8
+    /// S3 transcript archiver (ADR-0023). `None` when S3 is unconfigured (dev/test) —
+    /// archival is then disabled. Concurrent with Walrus; Walrus is untouched.
+    pub archiver: Option<Arc<dyn TranscriptArchiver>>,
+    #[allow(dead_code)] // TODO(s3-archive): consumed by archive drain worker in Task 7
+    /// Durable retry queue for S3 archival. `None` when unconfigured.
+    pub archive_queue: Option<Arc<dyn ArchiveQueue>>,
     #[allow(dead_code)] // TODO(chat-v2): used by chat routes in Task 4
     pub ollama: crate::ollama::OllamaClient,
     /// Latest aggregate snapshot is computed once per tick and fanned out here to
@@ -50,6 +61,8 @@ impl AppState {
             settler: crate::sui::SuiSettler::noop(),
             enoki: None,
             walrus: crate::walrus::WalrusClient::noop(),
+            archiver: None,
+            archive_queue: None,
             ollama: crate::ollama::OllamaClient::new(
                 "http://localhost:11434".into(),
                 "qwen2.5:1.5b".into(),

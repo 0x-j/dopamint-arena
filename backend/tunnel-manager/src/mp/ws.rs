@@ -1253,6 +1253,8 @@ mod tests {
             settler: crate::sui::SuiSettler::noop(),
             enoki: None,
             walrus: crate::walrus::WalrusClient::noop(),
+            archiver: None,
+            archive_queue: None,
             ollama: crate::ollama::OllamaClient::new(
                 "http://localhost:11434".into(),
                 "qwen2.5:1.5b".into(),
@@ -1404,6 +1406,8 @@ mod tests {
             settler: crate::sui::SuiSettler::noop(),
             enoki: None,
             walrus: crate::walrus::WalrusClient::noop(),
+            archiver: None,
+            archive_queue: None,
             ollama: crate::ollama::OllamaClient::new(
                 "http://localhost:11434".into(),
                 "qwen2.5:1.5b".into(),

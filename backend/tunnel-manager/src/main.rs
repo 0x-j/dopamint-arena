@@ -128,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
         settler,
         enoki,
         walrus,
+        archiver: None,
+        archive_queue: None,
         ollama,
         stats_tx,
         actions: crate::stats_counter::LocalActionCounter::default(),
