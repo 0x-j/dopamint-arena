@@ -1255,6 +1255,7 @@ mod tests {
             walrus: crate::walrus::WalrusClient::noop(),
             archiver: None,
             archive_queue: None,
+            s3_prefix: "".into(),
             ollama: crate::ollama::OllamaClient::new(
                 "http://localhost:11434".into(),
                 "qwen2.5:1.5b".into(),
@@ -1408,6 +1409,7 @@ mod tests {
             walrus: crate::walrus::WalrusClient::noop(),
             archiver: None,
             archive_queue: None,
+            s3_prefix: "".into(),
             ollama: crate::ollama::OllamaClient::new(
                 "http://localhost:11434".into(),
                 "qwen2.5:1.5b".into(),

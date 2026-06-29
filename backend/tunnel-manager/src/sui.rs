@@ -124,6 +124,9 @@ pub struct SuiSettler {
     /// Per-sponsorship nonce source for the `ValidDuring` FundsWithdrawal replay guard. Seeded
     /// from wall-clock nanos at boot so two process runs in the same epoch don't collide.
     sponsor_nonce: AtomicU32,
+    /// Test-only override: when set, `submit_close` returns this digest without RPC calls.
+    #[cfg(any(test, feature = "test-util"))]
+    fixed_close_digest: Option<String>,
 }
 
 /// A parsed tunnel lifecycle event: the type suffix drives status folding; the rest feeds the
@@ -256,6 +259,8 @@ impl SuiSettler {
             signer,
             sender,
             sponsor_nonce: AtomicU32::new(nonce_seed),
+            #[cfg(any(test, feature = "test-util"))]
+            fixed_close_digest: None,
         })
     }
 
@@ -274,13 +279,28 @@ impl SuiSettler {
             signer,
             sender,
             sponsor_nonce: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            fixed_close_digest: None,
         }
+    }
+
+    /// Test-only settler that returns a fixed digest from `submit_close` without RPC calls.
+    /// Use this in handler-level tests that need the settle success path to run.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fixed_digest(digest: impl Into<String>) -> Self {
+        let mut s = Self::noop();
+        s.fixed_close_digest = Some(digest.into());
+        s
     }
 
     /// Build, sign, and execute `close_cooperative_with_root`; returns the tx digest.
     /// Resolves the tunnel shared ref + reference gas price over JSON-RPC, builds offline.
     /// Concurrent calls are safe: no shared gas coin means no equivocation risk.
     pub async fn submit_close(&self, args: CloseArgs) -> anyhow::Result<String> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(digest) = self.fixed_close_digest.clone() {
+            return Ok(digest);
+        }
         let tunnel = self.resolve_shared(&args.tunnel_id).await?;
         let (epoch, gas_price) = self.epoch_and_gas_price().await?;
         let chain = Digest::from_base58(CHAIN_DIGEST_B58).context("chain digest")?;

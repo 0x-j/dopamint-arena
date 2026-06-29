@@ -172,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         walrus,
         archiver,
         archive_queue,
+        s3_prefix: config.s3_prefix.clone().unwrap_or_default(),
         ollama,
         stats_tx,
         actions: crate::stats_counter::LocalActionCounter::default(),

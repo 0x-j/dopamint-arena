@@ -49,6 +49,7 @@ pub(crate) mod test_support {
             walrus,
             archiver: None,
             archive_queue: None,
+            s3_prefix: "".into(),
             ollama,
             stats_tx,
             actions: crate::stats_counter::LocalActionCounter::default(),
@@ -304,6 +305,31 @@ pub(crate) async fn settle(
                 .control
                 .set_tunnel_status(&tunnel_id, crate::state::TunnelStatus::Closed)
                 .await;
+            // S3 archival runs CONCURRENTLY with Walrus and is independent of it (ADR-0023).
+            // Fire-and-forget from the response; the worker guarantees it lands. `body` is
+            // cheap to clone (Bytes is ref-counted); Walrus below still gets `body.to_vec()`
+            // exactly as before — its call site, error handling, and result are unchanged.
+            if state.archiver.is_some() {
+                let key = crate::s3::archive_key(&state.s3_prefix, &tunnel_id, &digest);
+                let meta = crate::s3::ArchiveMeta {
+                    tunnel_id: tunnel_id.clone(),
+                    tx_digest: digest.clone(),
+                    transcript_root: transcript_root_hex.clone(),
+                    settle_version: crate::routes::SETTLE_BODY_VERSION,
+                };
+                let s3_state = state.clone();
+                let s3_bytes = body.clone();
+                tokio::spawn(async move {
+                    crate::archive_worker::archive_or_enqueue(
+                        &s3_state,
+                        key,
+                        s3_bytes.to_vec(),
+                        meta,
+                    )
+                    .await;
+                });
+            }
+
             // Archive the body verbatim — the blob IS the settle body. The in-browser verifier
             // (verifyTranscript) parses the same fixed-offset bytes and re-checks the
             // co-signed root against the recomputed Merkle root and the on-chain anchor.
@@ -644,6 +670,7 @@ fn render_metrics(snap: &StatsSnapshot, colocated: u64, split: u64) -> String {
 mod tests {
     use super::test_support::test_state;
     use super::*;
+    use crate::state::AppState;
 
     // The binary /settle body the SDK codec (`encodeSettleBody`) emits — byte-identical to
     // the TS golden vector (settleBinary.test.ts). Pasting it here pins TS↔Rust wire parity: a
@@ -911,6 +938,68 @@ mod tests {
         };
         let resp = chat(axum::extract::State(state), axum::Json(req)).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // POST /v1/tunnels/:tunnel_id/settle archives the identical binary body to S3 concurrently
+    // with Walrus (ADR-0023). The bytes recorded by the S3 archiver must match the request body
+    // byte-for-byte, and the object key must live under the `transcripts/` prefix.
+    #[tokio::test]
+    async fn settle_archives_identical_body_to_s3() {
+        use std::time::Duration;
+
+        use axum::routing::post;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        use crate::archive_queue::InMemoryArchiveQueue;
+        use crate::s3::FakeArchiver;
+
+        let body = sample_settle_body();
+        let parsed = parse_settle_body(&body).expect("valid settle body");
+        let tunnel_id = normalize_tunnel_id(&parsed.tunnel_id);
+
+        let archiver = std::sync::Arc::new(FakeArchiver::default());
+        let mut state = AppState::with_fake_archiver(
+            archiver.clone(),
+            std::sync::Arc::new(InMemoryArchiveQueue::default()),
+        );
+        // Reach the settlement success path (S3 archival sits inside it) without real RPC.
+        std::sync::Arc::get_mut(&mut state)
+            .expect("unique test arc")
+            .settler = crate::sui::SuiSettler::fixed_digest("DiG123");
+
+        let app = Router::new()
+            .route("/v1/tunnels/:tunnel_id/settle", post(settle))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tunnels/{}/settle", tunnel_id))
+                    .header("x-settle-version", SETTLE_BODY_VERSION.to_string())
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Give the fire-and-forget S3 spawn a chance to finish before inspecting the recording.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let archived = archiver.archived.lock().unwrap().clone();
+        assert_eq!(archived.len(), 1, "expected exactly one S3 archive");
+        assert_eq!(
+            archived[0].1,
+            body.to_vec(),
+            "archived bytes must match the settle body"
+        );
+        assert!(
+            archived[0].0.starts_with("transcripts/"),
+            "key must start with transcripts/: {}",
+            archived[0].0
+        );
     }
 
     // GET /v1/chat/topic asks Ollama for a short random conversation topic.
