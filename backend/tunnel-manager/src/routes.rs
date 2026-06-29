@@ -468,8 +468,13 @@ pub(crate) async fn sponsor(
 /// Proxy a non-streaming chat request to the configured Ollama model.
 pub(crate) async fn chat(
     State(state): State<SharedState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
+    if let Err(resp) = require_session_auth(&state, &session_id, &headers).await {
+        return resp;
+    }
     match state.ollama.chat(&req.messages).await {
         Ok(content) => Json(ChatResponse { content }).into_response(),
         Err(e) => {
@@ -557,7 +562,14 @@ pub(crate) struct TopicResponse {
 }
 
 /// Ask Ollama for a short random conversation topic for two chat bots.
-pub(crate) async fn chat_topic(State(state): State<SharedState>) -> Response {
+pub(crate) async fn chat_topic(
+    State(state): State<SharedState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = require_session_auth(&state, &session_id, &headers).await {
+        return resp;
+    }
     match state.ollama.topic().await {
         Ok(topic) => Json(TopicResponse { topic }).into_response(),
         Err(e) => {
@@ -601,6 +613,31 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|t| t == expected)
         .unwrap_or(false)
+}
+
+/// Look up `session_id` and require a matching `Authorization: Bearer` token.
+async fn require_session_auth(
+    state: &SharedState,
+    session_id: &str,
+    headers: &HeaderMap,
+) -> Result<SessionRecord, Response> {
+    let Some(rec) = state.control.get_session(session_id).await else {
+        return Err(ApiError::resp(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no such session",
+        )
+        .into_response());
+    };
+    if !bearer_matches(headers, &rec.stats_token) {
+        return Err(ApiError::resp(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid bearer token",
+        )
+        .into_response());
+    }
+    Ok(rec)
 }
 
 /// SSE feed for the catalog activity panel (ADR-0002 `GET /v1/stats/live`).
