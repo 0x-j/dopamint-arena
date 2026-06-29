@@ -32,6 +32,11 @@ export interface InfraConfig {
   ollamaEnabled: boolean;
   ollamaModel: string;
   ollamaImageTag: string;
+  // Comma-separated browser origins allowed to call Ollama directly
+  // (Ollama OLLAMA_ORIGINS). Only relevant for direct sidecar access (e.g., local
+  // debugging); the ALB no longer exposes /api/*. Omit to keep Ollama private
+  // (only reachable from within the backend task).
+  ollamaOrigins?: string;
 }
 
 export function getConfig(): InfraConfig {
@@ -56,6 +61,7 @@ export function getConfig(): InfraConfig {
     ollamaEnabled: config.getBoolean("ollama-enabled") ?? true,
     ollamaModel: config.get("ollama-model") ?? "qwen2.5:1.5b",
     ollamaImageTag: config.get("ollama-image-tag") ?? "0.6.2",
+    ollamaOrigins: config.get("ollama-origins") || undefined,
   };
 }
 

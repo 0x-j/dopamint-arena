@@ -215,4 +215,54 @@ describe("backend component", () => {
       "4096",
     );
   });
+
+  it("passes configured origins to the Ollama sidecar (OLLAMA_ORIGINS)", async () => {
+    const backend = createBackend(
+      makeBackendArgs({
+        ollamaEnabled: true,
+        ollamaModel: "qwen2.5:1.5b",
+        ollamaImageTag: "0.6.2",
+        ollamaOrigins: "https://app.example.com",
+      }),
+    );
+
+    const defs = JSON.parse(
+      await awaitOutput(backend.taskDefinition.containerDefinitions),
+    );
+    const ollamaContainer = defs.find(
+      (c: { name: string }) => c.name === "ollama",
+    );
+
+    assert.ok(
+      ollamaContainer.environment.some(
+        (e: { name: string; value: string }) =>
+          e.name === "OLLAMA_ORIGINS" && e.value === "https://app.example.com",
+      ),
+      "OLLAMA_ORIGINS must be set on the sidecar when configured",
+    );
+  });
+
+  it("omits OLLAMA_ORIGINS when no origins are configured", async () => {
+    const backend = createBackend(
+      makeBackendArgs({
+        ollamaEnabled: true,
+        ollamaModel: "qwen2.5:1.5b",
+        ollamaImageTag: "0.6.2",
+      }),
+    );
+
+    const defs = JSON.parse(
+      await awaitOutput(backend.taskDefinition.containerDefinitions),
+    );
+    const ollamaContainer = defs.find(
+      (c: { name: string }) => c.name === "ollama",
+    );
+
+    assert.ok(
+      !ollamaContainer.environment.some(
+        (e: { name: string }) => e.name === "OLLAMA_ORIGINS",
+      ),
+      "OLLAMA_ORIGINS must be absent when origins are not configured",
+    );
+  });
 });

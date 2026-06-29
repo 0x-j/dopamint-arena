@@ -27,6 +27,10 @@ export interface BackendArgs {
   ollamaModel?: pulumi.Input<string>;
   // Tag of the ollama/ollama image to run as the sidecar.
   ollamaImageTag?: pulumi.Input<string>;
+  // Browser origins allowed to call Ollama directly (Ollama OLLAMA_ORIGINS). Only
+  // relevant when the sidecar is reached directly (e.g., local debugging); the ALB no
+  // longer exposes /api/*. Omitted => no CORS allow-list.
+  ollamaOrigins?: pulumi.Input<string>;
   // Comma-separated list of origins allowed by the CORS layer. Omitted => permissive CORS.
   corsAllowedOrigins?: pulumi.Input<string>;
 }
@@ -46,13 +50,19 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
   const ollamaEnabled = pulumi.output(args.ollamaEnabled ?? false);
   const ollamaModel = pulumi.output(args.ollamaModel ?? "qwen2.5:1.5b");
   const ollamaImageTag = pulumi.output(args.ollamaImageTag ?? "0.6.2");
-  // pulumi.all's tuple overloads stop at 8 elements; bundling the ollama trio
+  const ollamaOrigins = pulumi.output(args.ollamaOrigins ?? undefined);
+  // pulumi.all's tuple overloads stop at 8 elements; bundling the ollama config
   // into one output keeps the outer all an 8-tuple, so it stays heterogeneously
   // typed (the boolean enabled flag alongside the string config) rather than
   // collapsing to the homogeneous-array overload that rejects the boolean.
   const ollama = pulumi
-    .all([ollamaEnabled, ollamaModel, ollamaImageTag])
-    .apply(([enabled, model, imageTag]) => ({ enabled, model, imageTag }));
+    .all([ollamaEnabled, ollamaModel, ollamaImageTag, ollamaOrigins])
+    .apply(([enabled, model, imageTag, origins]) => ({
+      enabled,
+      model,
+      imageTag,
+      origins,
+    }));
 
   return pulumi
     .all([
@@ -80,6 +90,7 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
           enabled: ollamaEnabled,
           model: ollamaModel,
           imageTag: ollamaImageTag,
+          origins: ollamaOriginsCfg,
         } = ollama;
         const backendEnv: Array<{ name: string; value: string }> = [
           {
@@ -177,7 +188,12 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
             image: `ollama/ollama:${ollamaImageTag}`,
             essential: false,
             portMappings: [{ containerPort: 11434, protocol: "tcp" }],
-            environment: [{ name: "OLLAMA_KEEP_ALIVE", value: "-1" }],
+            environment: [
+              { name: "OLLAMA_KEEP_ALIVE", value: "-1" },
+              ...(ollamaOriginsCfg
+                ? [{ name: "OLLAMA_ORIGINS", value: ollamaOriginsCfg }]
+                : []),
+            ],
             // Override the image entrypoint so we can pull the model before serving.
             entryPoint: ["/bin/sh", "-c"],
             command: [
