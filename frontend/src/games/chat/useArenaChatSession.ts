@@ -9,7 +9,7 @@ import { OffchainTunnel } from "sui-tunnel-ts/core/tunnel";
 import { Transcript } from "sui-tunnel-ts/proof/transcript";
 import type { ChatMove, ChatStateData } from "sui-tunnel-ts/protocol/chat";
 import { registerWindowDisposer } from "@/lib/windowSessions";
-import { ChatApiClient } from "@/lib/chatApi";
+import { createChatApiClient } from "@/lib/chatApi";
 import { useTelemetry } from "@/telemetry/TelemetryProvider";
 import type { TelemetryWriter } from "@/telemetry/TelemetryProvider";
 import { getControlPlaneClient } from "@/backend/controlPlane";
@@ -122,7 +122,9 @@ class ChatSession {
   };
   private txDigest: string | null = null;
 
-  private api = new ChatApiClient(import.meta.env.VITE_BACKEND_URL ?? "");
+  private api = createChatApiClient();
+  private sessionId?: string;
+  private statsToken?: string;
 
   subscribe = (cb: () => void): (() => void) => {
     this.listeners.add(cb);
@@ -173,6 +175,8 @@ class ChatSession {
     this.error = null;
     this.stats = { updates: 0, signatures: 0, verifications: 0, bytes: 0 };
     this.txDigest = null;
+    this.sessionId = undefined;
+    this.statsToken = undefined;
     this.deps?.report.setActive(0);
     this.status = "idle";
     this.emit();
@@ -183,6 +187,8 @@ class ChatSession {
     this.deps?.report.setActive(0);
     this.tunnel = null;
     this.transcript = null;
+    this.sessionId = undefined;
+    this.statsToken = undefined;
     this.listeners.clear();
   };
 
@@ -326,6 +332,11 @@ class ChatSession {
             userAddress: a.address,
             game: "chat",
             tunnels: [{ tunnelId, partyA: a.address, partyB: b.address }],
+          })
+          .then((result) => {
+            this.sessionId = result.sessionId;
+            this.statsToken = result.statsToken;
+            this.api.setSession(result.sessionId, result.statsToken);
           })
           .catch((e) => console.error("[chat] registerSession failed:", e));
 
