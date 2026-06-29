@@ -191,4 +191,118 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].tx_digest, "D1");
     }
+
+    /// End-to-end smoke against real AWS S3 + a local Postgres (Task 11). This is marked
+    /// `#[ignore]` so CI does not need AWS credentials; run it manually with:
+    ///   S3_TRANSCRIPTS_BUCKET=<bucket> DATABASE_URL=postgresql://dopamint:dopamint@localhost:5432/dopamint \
+    ///     cargo test --locked -p tunnel-manager archive_worker::tests::e2e_real_s3_and_postgres_retry -- --ignored
+    #[tokio::test]
+    #[ignore = "needs real AWS credentials, S3_TRANSCRIPTS_BUCKET, and DATABASE_URL"]
+    async fn e2e_real_s3_and_postgres_retry() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::Client as S3Client;
+
+        use crate::archive_queue::PgArchiveQueue;
+        use crate::s3::{archive_key, ArchiveMeta, S3Archiver};
+        use crate::state::AppState;
+
+        let bucket = std::env::var("S3_TRANSCRIPTS_BUCKET").expect("set S3_TRANSCRIPTS_BUCKET");
+        let database_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL");
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
+
+        let aws_cfg = aws_config::defaults(BehaviorVersion::latest())
+            .region(aws_config::Region::new(region))
+            .load()
+            .await;
+        let client = S3Client::new(&aws_cfg);
+        let archiver = std::sync::Arc::new(S3Archiver::new(client.clone(), bucket.clone()));
+        let queue = std::sync::Arc::new(
+            PgArchiveQueue::connect(&database_url).await.expect("connect to postgres"),
+        );
+
+        let mut state = AppState::in_memory_for_test();
+        let inner = std::sync::Arc::get_mut(&mut state).expect("unique test arc");
+        inner.archiver = Some(archiver.clone());
+        inner.archive_queue = Some(queue.clone());
+        inner.s3_prefix = "e2e/".into();
+        let state = state;
+
+        let tx_digest = "E2EDiG1";
+        let tunnel_id = "0xe2e";
+        let key = archive_key("e2e/", tunnel_id, tx_digest);
+        let bytes = b"real aws s3 e2e body".to_vec();
+        let meta = ArchiveMeta {
+            tunnel_id: tunnel_id.into(),
+            tx_digest: tx_digest.into(),
+            transcript_root: "0xroot".into(),
+            settle_version: 2,
+        };
+
+        // 1. Happy path: inline PutObject lands in S3.
+        archive_or_enqueue(&state, key.clone(), bytes.clone(), meta.clone()).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let obj = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .expect("get object from S3");
+        let body = obj.body.collect().await.expect("read body").into_bytes();
+        assert_eq!(body.to_vec(), bytes, "S3 bytes must match");
+
+        // 2. Failure path: a failing archiver enqueues to Postgres.
+        let failing = std::sync::Arc::new(crate::s3::FakeArchiver {
+            archived: Mutex::new(vec![]),
+            fail_with: Some("boom"),
+        }) as std::sync::Arc<dyn crate::s3::TranscriptArchiver>;
+        let mut state2 = AppState::in_memory_for_test();
+        let inner2 = std::sync::Arc::get_mut(&mut state2).expect("unique test arc");
+        inner2.archiver = Some(failing);
+        inner2.archive_queue = Some(queue.clone());
+        inner2.s3_prefix = "e2e/".into();
+        let state2 = state2;
+
+        let tx_digest2 = "E2EDiG2";
+        let key2 = archive_key("e2e/", tunnel_id, tx_digest2);
+        let meta2 = ArchiveMeta {
+            tunnel_id: tunnel_id.into(),
+            tx_digest: tx_digest2.into(),
+            transcript_root: "0xroot".into(),
+            settle_version: 2,
+        };
+        archive_or_enqueue(&state2, key2.clone(), bytes.clone(), meta2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rows = queue.drain_due(10).await.expect("drain queued row");
+        assert!(rows.iter().any(|r| r.tx_digest == tx_digest2), "row should be queued");
+
+        // 3. Drain worker retries the queued row against real S3 and deletes it.
+        let mut state3 = AppState::in_memory_for_test();
+        let inner3 = std::sync::Arc::get_mut(&mut state3).expect("unique test arc");
+        inner3.archiver = Some(archiver.clone());
+        inner3.archive_queue = Some(queue.clone());
+        inner3.s3_prefix = "e2e/".into();
+        let state3 = state3;
+        drain_once(&state3).await.expect("drain_once");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let obj2 = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key2)
+            .send()
+            .await
+            .expect("get retried object from S3");
+        let body2 = obj2.body.collect().await.expect("read body2").into_bytes();
+        assert_eq!(body2.to_vec(), bytes, "retried S3 bytes must match");
+
+        let rows_after = queue.drain_due(10).await.expect("drain after retry");
+        assert!(
+            !rows_after.iter().any(|r| r.tx_digest == tx_digest2),
+            "row should be deleted after success"
+        );
+    }
 }
