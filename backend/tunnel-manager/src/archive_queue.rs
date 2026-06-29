@@ -34,8 +34,8 @@ pub trait ArchiveQueue: Send + Sync {
     async fn requeue(&self, tx_digest: &str) -> anyhow::Result<()>;
 }
 
-/// In-memory queue for tests. `drain_due` returns everything (no real scheduling); a
-/// failed row stays until deleted, so requeue is a no-op.
+/// In-memory queue for tests. `drain_due` returns clones of all rows (no real
+/// scheduling); rows are only removed by `delete`, so `requeue` is a no-op.
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct InMemoryArchiveQueue {
@@ -49,10 +49,9 @@ impl ArchiveQueue for InMemoryArchiveQueue {
         Ok(())
     }
     async fn drain_due(&self, limit: i64) -> anyhow::Result<Vec<PendingArchive>> {
-        let mut g = self.rows.lock().unwrap();
-        let len = g.len();
+        let g = self.rows.lock().unwrap();
         let take = limit.max(0) as usize;
-        Ok(g.drain(..take.min(len)).collect())
+        Ok(g.iter().take(take).cloned().collect())
     }
     async fn delete(&self, tx_digest: &str) -> anyhow::Result<()> {
         self.rows
@@ -194,8 +193,7 @@ mod tests {
         .unwrap();
         let drained = q.drain_due(10).await.unwrap();
         assert_eq!(drained.len(), 2);
-        // drain removes from the in-memory deque (mirrors "claimed"); delete is a no-op
-        // safety net here.
+        // drain_due returns clones; rows are only removed by delete, so delete each one.
         for p in &drained {
             q.delete(&p.tx_digest).await.unwrap();
         }
