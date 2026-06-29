@@ -330,7 +330,8 @@ class ChatSession {
         // Register the on-chain tunnel for control-plane TPS stats and obtain the
         // bearer token for backend-proxy chat auth. In backend-proxy mode this is
         // required; in Ollama-direct mode the result is unused but harmless.
-        let registration: { sessionId: string; statsToken: string } | null = null;
+        let registration: { sessionId: string; statsToken: string } | null =
+          null;
         try {
           registration = await getControlPlaneClient().registerSession({
             userAddress: a.address,

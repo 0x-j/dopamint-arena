@@ -9,10 +9,10 @@ export interface LiveMessage {
 }
 
 /**
- * Direct-to-Ollama config. When set, chat/topic bypass the backend proxy and
- * call Ollama directly. `url` is the exposed Ollama base (the ALB routes /api/*
- * to the sidecar): empty = same-origin (prod), a full URL = cross-origin (dev,
- * which requires OLLAMA_ORIGINS on the Ollama side).
+ * Direct-to-Ollama config. When set, chat/topic bypass the authenticated
+ * backend /v1/chat proxy and call Ollama directly. `url` is the Ollama base
+ * (empty = same-origin, a full URL = cross-origin). Prefer leaving this unset
+ * so the frontend uses the secure backend proxy.
  */
 export interface OllamaDirectConfig {
   url: string;
@@ -47,7 +47,10 @@ export class ChatApiClient {
     this.statsToken = statsToken;
   }
 
-  setSession(sessionId: string | undefined, statsToken: string | undefined): void {
+  setSession(
+    sessionId: string | undefined,
+    statsToken: string | undefined,
+  ): void {
     this.sessionId = sessionId;
     this.statsToken = statsToken;
   }
@@ -73,7 +76,8 @@ export class ChatApiClient {
         body: JSON.stringify({ messages }),
       },
     );
-    if (!res.ok) throw new Error(`chat failed: ${res.status} ${res.statusText}`);
+    if (!res.ok)
+      throw new Error(`chat failed: ${res.status} ${res.statusText}`);
     const json = (await res.json()) as { content: string };
     return json.content;
   }
@@ -95,7 +99,8 @@ export class ChatApiClient {
         headers: { Authorization: `Bearer ${this.statsToken}` },
       },
     );
-    if (!res.ok) throw new Error(`topic failed: ${res.status} ${res.statusText}`);
+    if (!res.ok)
+      throw new Error(`topic failed: ${res.status} ${res.statusText}`);
     const json = (await res.json()) as { topic: string };
     return json.topic;
   }

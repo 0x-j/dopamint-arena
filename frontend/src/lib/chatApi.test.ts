@@ -105,11 +105,10 @@ test("chat calls ollama directly when configured", async () => {
       json: async () => ({ message: { content: "hi back" } }),
     } as Response;
   });
-  const client = new ChatApiClient(
-    "http://localhost:8080",
-    fetch as never,
-    { url: "http://ollama-host/", model: "qwen2.5:1.5b" },
-  );
+  const client = new ChatApiClient("http://localhost:8080", fetch as never, {
+    url: "http://ollama-host/",
+    model: "qwen2.5:1.5b",
+  });
   const answer = await client.chat([{ role: "user", content: "hi" }]);
   assert.equal(answer, "hi back");
   assert.equal(calledUrl, "http://ollama-host/api/chat");
@@ -127,11 +126,10 @@ test("topic calls ollama directly and trims", async () => {
       json: async () => ({ message: { content: "  cats vs dogs  " } }),
     } as Response;
   });
-  const client = new ChatApiClient(
-    "http://localhost:8080",
-    fetch as never,
-    { url: "http://ollama-host", model: "qwen2.5:1.5b" },
-  );
+  const client = new ChatApiClient("http://localhost:8080", fetch as never, {
+    url: "http://ollama-host",
+    model: "qwen2.5:1.5b",
+  });
   const topic = await client.topic();
   assert.equal(topic, "cats vs dogs");
   assert.equal(calledUrl, "http://ollama-host/api/chat");
