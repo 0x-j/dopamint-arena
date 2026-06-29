@@ -167,8 +167,8 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         .route("/v1/sponsor", post(routes::sponsor))
-        .route("/v1/chat", post(routes::chat))
-        .route("/v1/chat/topic", get(routes::chat_topic))
+        .route("/v1/sessions/:session_id/chat", post(routes::chat))
+        .route("/v1/sessions/:session_id/chat/topic", get(routes::chat_topic))
         .route("/v1/chat/live/publish", post(routes::chat_publish))
         .route("/v1/chat/live", get(routes::chat_live))
         .route("/v1/stats/live", get(routes::stats_live))
