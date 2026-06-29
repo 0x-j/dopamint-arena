@@ -552,15 +552,15 @@ impl QuantumPoker {
         }
 
         match next.phase {
-            PokerPhase::OpenPrivateHoles => {
+            PokerPhase::OpenPrivateHoles
                 if has_revealed(&next, Seat::A, &B_HOLE_SLOTS)
-                    && has_revealed(&next, Seat::B, &A_HOLE_SLOTS)
-                {
-                    next.hole_a = self.derive_hole_cards(&next, Seat::A, true);
-                    next.hole_b = self.derive_hole_cards(&next, Seat::B, true);
-                    self.post_antes_and_begin_street(&mut next)?;
-                }
+                    && has_revealed(&next, Seat::B, &A_HOLE_SLOTS) =>
+            {
+                next.hole_a = self.derive_hole_cards(&next, Seat::A, true);
+                next.hole_b = self.derive_hole_cards(&next, Seat::B, true);
+                self.post_antes_and_begin_street(&mut next)?;
             }
+            PokerPhase::OpenPrivateHoles => {}
             PokerPhase::RevealFlop => {
                 self.try_reveal_board_then_bet(&mut next, &FLOP_SLOTS, PokerPhase::FlopBet)?;
             }
