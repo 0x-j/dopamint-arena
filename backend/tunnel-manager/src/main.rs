@@ -1,6 +1,7 @@
 //! tunnel-manager — Dopamint Arena control-plane backend (DOP-170).
 //! Off the per-move path (ADR-0001): registry + settlement + Walrus + stats only.
 
+mod archive_queue;
 mod chat_store;
 mod config;
 mod enoki;
