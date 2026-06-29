@@ -82,9 +82,9 @@ pulumi config set dopamint:ollama-image-tag 0.6.2
 pulumi up -y
 ```
 
-When enabled, the backend task size increases from `1024 CPU / 2048 MiB` to `2048 CPU / 4096 MiB` to accommodate the model. The sidecar pulls the model at startup, so the first deployment may take 1–2 minutes before `/v1/chat` is healthy. The backend receives `OLLAMA_URL=http://localhost:11434` and `OLLAMA_MODEL` automatically.
+When enabled, the backend task size increases from `1024 CPU / 2048 MiB` to `2048 CPU / 4096 MiB` to accommodate the model. The sidecar pulls the model at startup, so the first deployment may take 1–2 minutes before `/v1/sessions/:sessionId/chat` is healthy. The backend receives `OLLAMA_URL=http://localhost:11434` and `OLLAMA_MODEL` automatically.
 
-Browsers no longer reach Ollama directly. The backend proxies chat/topic requests through authenticated `/v1/chat/*` routes using the existing session bearer-token pattern; the Ollama sidecar is reachable only from inside the backend task. `dopamint:ollama-origins` is no longer needed for public access and can be left unset.
+Browsers no longer reach Ollama directly. The backend proxies chat/topic requests through authenticated `/v1/sessions/:sessionId/chat/*` routes using the existing session bearer-token pattern; the Ollama sidecar is reachable only from inside the backend task. `dopamint:ollama-origins` is no longer needed for public access and can be left unset.
 
 To disable chat and revert to the smaller task size:
 

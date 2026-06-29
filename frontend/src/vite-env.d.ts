@@ -2,7 +2,9 @@
 
 interface ImportMetaEnv {
   readonly VITE_BACKEND_URL?: string;
-  // Direct-to-Ollama chat (bypasses the authenticated backend /v1/chat proxy). Set
+  // Warning: When set, the frontend calls Ollama directly and bypasses backend auth.
+  // Leave unset in deployed stacks to keep chat behind the authenticated backend proxy.
+  // Direct-to-Ollama chat (bypasses the authenticated backend /v1/sessions/:sessionId/chat proxy). Set
   // VITE_OLLAMA_URL to enable; empty = use the backend proxy, a full URL = direct
   // Ollama access (cross-origin, requires OLLAMA_ORIGINS on the Ollama side).
   readonly VITE_OLLAMA_URL?: string;

@@ -32,6 +32,8 @@ export interface InfraConfig {
   ollamaEnabled: boolean;
   ollamaModel: string;
   ollamaImageTag: string;
+  // Warning: Only relevant when Ollama is exposed directly. With the backend-proxy
+  // architecture, this should remain unset in deployed stacks.
   // Comma-separated browser origins allowed to call Ollama directly
   // (Ollama OLLAMA_ORIGINS). Only relevant for direct sidecar access (e.g., local
   // debugging); the ALB no longer exposes /api/*. Omit to keep Ollama private
