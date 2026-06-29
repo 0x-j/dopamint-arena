@@ -177,6 +177,7 @@ class ChatSession {
     this.txDigest = null;
     this.sessionId = undefined;
     this.statsToken = undefined;
+    this.api.setSession(undefined, undefined);
     this.deps?.report.setActive(0);
     this.status = "idle";
     this.emit();
@@ -189,6 +190,7 @@ class ChatSession {
     this.transcript = null;
     this.sessionId = undefined;
     this.statsToken = undefined;
+    this.api.setSession(undefined, undefined);
     this.listeners.clear();
   };
 
@@ -325,20 +327,28 @@ class ChatSession {
         this.tunnelId = tunnelId;
         this.createdAt = createdAt;
 
-        // Register the on-chain tunnel for control-plane TPS stats. Best-effort: a failed
-        // register must not block play.
-        getControlPlaneClient()
-          .registerSession({
+        // Register the on-chain tunnel for control-plane TPS stats and obtain the
+        // bearer token for backend-proxy chat auth. In backend-proxy mode this is
+        // required; in Ollama-direct mode the result is unused but harmless.
+        let registration: { sessionId: string; statsToken: string } | null = null;
+        try {
+          registration = await getControlPlaneClient().registerSession({
             userAddress: a.address,
             game: "chat",
             tunnels: [{ tunnelId, partyA: a.address, partyB: b.address }],
-          })
-          .then((result) => {
-            this.sessionId = result.sessionId;
-            this.statsToken = result.statsToken;
-            this.api.setSession(result.sessionId, result.statsToken);
-          })
-          .catch((e) => console.error("[chat] registerSession failed:", e));
+          });
+        } catch (e) {
+          console.error("[chat] registerSession failed:", e);
+          if (!import.meta.env.VITE_OLLAMA_URL) {
+            throw new Error("chat registration failed; please try again");
+          }
+        }
+        if (this.gen !== myGen) return;
+        if (registration) {
+          this.sessionId = registration.sessionId;
+          this.statsToken = registration.statsToken;
+          this.api.setSession(registration.sessionId, registration.statsToken);
+        }
 
         this.deps?.report.bumpCounters({ tunnelsOpened: 1 });
         this.deps?.report.setActive(2);

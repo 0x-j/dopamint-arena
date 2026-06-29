@@ -47,7 +47,7 @@ export class ChatApiClient {
     this.statsToken = statsToken;
   }
 
-  setSession(sessionId: string, statsToken: string): void {
+  setSession(sessionId: string | undefined, statsToken: string | undefined): void {
     this.sessionId = sessionId;
     this.statsToken = statsToken;
   }
