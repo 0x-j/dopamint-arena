@@ -35,6 +35,13 @@ use crate::state::{AppState, SharedState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Pin a single rustls CryptoProvider (ring) as the process default BEFORE any TLS
+    // client (fred, reqwest, sqlx, aws-sdk-s3) initializes. aws-sdk-s3 compiles aws-lc
+    // (hence cmake in the Dockerfile) but at runtime every rustls user shares this one
+    // provider, avoiding the rustls 0.23 "two default providers" panic. See Cargo.toml
+    // TLS-provider note + ADR-0023.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -91,6 +98,40 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "qwen2.5:1.5b".into()),
     )?;
 
+    // S3 transcript archival (ADR-0023). Optional: absent in dev/test (archive_or_enqueue
+    // and the drain worker are no-ops when these are None). Concurrent with Walrus;
+    // Walrus above is unchanged.
+    let archiver: Option<std::sync::Arc<dyn crate::s3::TranscriptArchiver>> =
+        match config.s3_bucket.clone() {
+            Some(bucket) => {
+                let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .load()
+                    .await;
+                let client = aws_sdk_s3::Client::new(&aws_cfg);
+                tracing::info!(bucket = %bucket, "s3 transcript archival enabled");
+                Some(std::sync::Arc::new(crate::s3::S3Archiver::new(
+                    client, bucket,
+                )))
+            }
+            None => {
+                tracing::info!("s3 transcript archival disabled (S3_TRANSCRIPTS_BUCKET unset)");
+                None
+            }
+        };
+    let archive_queue: Option<std::sync::Arc<dyn crate::archive_queue::ArchiveQueue>> = match (
+        &config.database_url,
+        &archiver,
+    ) {
+        (Some(url), Some(_)) => match crate::archive_queue::PgArchiveQueue::connect(url).await {
+            Ok(q) => Some(std::sync::Arc::new(q)),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to connect s3 archive queue (postgres); durable retry disabled");
+                None
+            }
+        },
+        _ => None,
+    };
+
     let instance_id = config
         .instance_id
         .clone()
@@ -129,8 +170,8 @@ async fn main() -> anyhow::Result<()> {
         settler,
         enoki,
         walrus,
-        archiver: None,
-        archive_queue: None,
+        archiver,
+        archive_queue,
         ollama,
         stats_tx,
         actions: crate::stats_counter::LocalActionCounter::default(),
@@ -143,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     // Poll-index on-chain tunnel events (Created/Activated/Closed) into recent_events so the
     // live feed reflects real settlements; without this the stats SSE never emits any.
     sui::spawn_event_indexer(state.clone());
+    archive_worker::spawn_archive_drain(state.clone());
 
     // Clone before `state` is consumed by `.with_state` so we can flush after shutdown.
     let flush_state = state.clone();
