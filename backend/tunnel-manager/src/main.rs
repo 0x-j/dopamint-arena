@@ -8,6 +8,7 @@ mod error;
 mod mp;
 mod ollama;
 mod routes;
+mod s3;
 mod state;
 mod stats;
 mod stats_counter;
@@ -273,5 +274,13 @@ mod flush_tests {
             state.control.snapshot().await.per_game["ttt"].total_actions,
             5
         );
+    }
+}
+
+#[cfg(test)]
+mod test_init {
+    #[ctor::ctor]
+    fn install_ring_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }

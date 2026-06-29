@@ -34,9 +34,17 @@ sui-transaction-builder.workspace = true
 sui-crypto.workspace = true
 bcs.workspace = true
 base64.workspace = true
+aws-config = "1"
+aws-sdk-s3 = "1"
+# Direct rustls dep so we can install `ring` as the process-default CryptoProvider at
+# startup (Task 7), forcing fred/reqwest/sqlx/aws-sdk onto one provider. See Cargo.toml
+# TLS-provider note + ADR-0023.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sqlx.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
 wiremock = "0.6"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["redis"] }
+ctor = "0.2"
