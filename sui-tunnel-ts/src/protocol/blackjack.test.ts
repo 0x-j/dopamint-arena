@@ -178,9 +178,11 @@ test("only the next player may place the bet", () => {
   );
 });
 
-test("a full opening deal lands in player phase with 2+2 cards", () => {
+test("opening deal hides the dealer hole: player phase with 2 player + 1 dealer card", () => {
   let s = placeBet(fresh());
-  for (let i = 0; i < 4; i++) {
+  // Three cards dealt: player, player, dealer up-card. The dealer's hole is NOT
+  // dealt now — it stays hidden until the player stands (no info edge for the player).
+  for (let i = 0; i < 3; i++) {
     assert.equal(
       s.phase,
       "draw_commit",
@@ -190,9 +192,21 @@ test("a full opening deal lands in player phase with 2+2 cards", () => {
   }
   assert.equal(s.phase, "player");
   assert.equal(s.playerHand.length, 2);
-  assert.equal(s.dealerHand.length, 2);
-  assert.equal(s.drawCount, 4n);
+  assert.equal(s.dealerHand.length, 1, "only the dealer's up-card is dealt");
+  assert.equal(s.drawCount, 3n);
   assert.equal(s.draw, null);
+});
+
+test("the dealer's hole is drawn only after the player stands", () => {
+  let s = placeBet(fresh());
+  for (let i = 0; i < 3; i++) s = doDraw(s, secret(i * 2 + 1), secret(i * 2 + 2));
+  assert.equal(s.phase, "player");
+  assert.equal(s.dealerHand.length, 1);
+  const player = actorFor(s);
+  s = proto.applyMove(s, { kind: "stand" }, player!);
+  // The hole card is drawn now (post-stand), not during the deal.
+  assert.equal(s.phase, "draw_commit");
+  assert.deepEqual(s.draw, { forHand: "dealer", reason: "dealer_auto" });
 });
 
 test("a reveal that does not match its commitment is rejected", () => {
@@ -245,8 +259,7 @@ function dealtToPlayer(): BlackjackState {
   const [fa, fb] = secretsForRank(5); // value 5
   s = doDraw(s, ta, tb); // player card 1 = 10
   s = doDraw(s, ta, tb); // player card 2 = 10  (duplicate rank is fine)
-  s = doDraw(s, fa, fb); // dealer card 1 = 5
-  s = doDraw(s, fa, fb); // dealer card 2 = 5  -> dealer 10 (< 17)
+  s = doDraw(s, fa, fb); // dealer up-card = 5  -> player phase (hole still hidden)
   return s;
 }
 
@@ -326,35 +339,19 @@ test("dealer busts -> player (A) wins", () => {
   const [s6a, s6b] = secretsForRank(6); // value 6
   s = doDraw(s, k1, k2); // player 10
   s = doDraw(s, k1, k2); // player 20
-  s = doDraw(s, s6a, s6b); // dealer 6
-  s = doDraw(s, k1, k2); // dealer 16 (< 17)
-  s = standAndResolve(s, 13); // dealer 16 + 10 = 26 -> bust -> A wins
+  s = doDraw(s, s6a, s6b); // dealer up-card 6
+  s = standAndResolve(s, 13); // hole + draws: 6 + 10 + 10 = 26 -> bust -> A wins
   assert.equal(s.phase, "round_over");
   assert.equal(s.balanceA, 1000n + BET);
   assert.equal(s.balanceB, 1000n - BET);
 });
 
 test("equal final totals push (no transfer)", () => {
-  let s = dealtToPlayer(); // player 20, dealer 10
-  s = standAndResolve(s, 10); // dealer 10 -> 20, stops; 20 == 20 -> push
+  let s = dealtToPlayer(); // player 20, dealer up-card 5
+  s = standAndResolve(s, 5); // dealer 5 + 5 + 5 + 5 = 20; 20 == 20 -> push
   assert.equal(s.phase, "round_over");
   assert.equal(s.balanceA, 1000n);
   assert.equal(s.balanceB, 1000n);
-});
-
-test("a dealer already pat (>= 17) draws no card on stand", () => {
-  let s = placeBet(fresh());
-  const [k1, k2] = secretsForRank(13); // value 10
-  const [n9a, n9b] = secretsForRank(9); // value 9
-  s = doDraw(s, k1, k2); // player 10
-  s = doDraw(s, k1, k2); // player 20
-  s = doDraw(s, k1, k2); // dealer 10
-  s = doDraw(s, n9a, n9b); // dealer 19 (>= 17)
-  const before = s.drawCount;
-  s = proto.applyMove(s, { kind: "stand" }, "A");
-  assert.equal(s.phase, "round_over"); // settled immediately, no extra draw
-  assert.equal(s.drawCount, before);
-  assert.equal(s.balanceA, 1000n + BET); // 20 > 19 -> A wins
 });
 
 test("handValue handles soft aces", () => {
@@ -461,12 +458,11 @@ test("settlement transfers exactly the chosen bet", () => {
   });
   s = placeBet(s, 250n);
   const [k1, k2] = secretsForRank(13); // value 10
-  const [f5a, f5b] = secretsForRank(5); // value 5
+  const [n9a, n9b] = secretsForRank(9); // value 9
   s = doDraw(s, k1, k2); // player 10
   s = doDraw(s, k1, k2); // player 20
-  s = doDraw(s, f5a, f5b); // dealer 5
-  s = doDraw(s, f5a, f5b); // dealer 10
-  s = standAndResolve(s, 9); // dealer 10 -> 19; 20 > 19 -> A wins
+  s = doDraw(s, n9a, n9b); // dealer up-card 9
+  s = standAndResolve(s, 10); // hole: 9 + 10 = 19; 20 > 19 -> A wins
   assert.equal(s.balanceA, 1250n);
   assert.equal(s.balanceB, 750n);
   assert.equal(s.balanceA + s.balanceB, s.total);
@@ -532,8 +528,7 @@ test("FIXED_PLAYER_A makes the pinned player win settle to A", () => {
   const [f5a, f5b] = secretsForRank(5); // 5
   s = doDraw(s, k1, k2); // A 10
   s = doDraw(s, k1, k2); // A 20
-  s = doDraw(s, f5a, f5b); // dealer 5
-  s = doDraw(s, f5a, f5b); // dealer 10
+  s = doDraw(s, f5a, f5b); // dealer up-card 5
   s = pinned.applyMove(s, { kind: "stand" }, "A");
   const [n9a, n9b] = secretsForRank(9);
   let guard = 0;
@@ -567,9 +562,8 @@ test("actorFor honors a playerPartyFor override in the player phase", () => {
   const pinned = new BlackjackProtocol(FIXED_PLAYER_A);
   let s: BlackjackState = { ...fresh(), phase: "round_over", round: 2n };
   s = pinned.applyMove(s, { kind: "bet", amount: 100n }, "A"); // round 3
-  // advance to player phase via the opening deal
+  // advance to player phase via the opening deal (2 player + 1 dealer up-card)
   const [k1, k2] = secretsForRank(13);
-  s = doDraw(s, k1, k2);
   s = doDraw(s, k1, k2);
   s = doDraw(s, k1, k2);
   s = doDraw(s, k1, k2);
@@ -585,7 +579,7 @@ test("replaying the same moves yields identical encodeState", () => {
     s = proto.applyMove(s, move, by);
   };
   record({ kind: "bet", amount: BET }, getPlayerParty(s.round + 1n));
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 3; i++) {
     record(commitMove(secret(i + 1)), "A");
     record(commitMove(secret(i + 50)), "B");
     record(revealMove(secret(i + 1)), "A");

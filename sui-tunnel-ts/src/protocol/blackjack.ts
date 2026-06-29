@@ -298,7 +298,11 @@ function afterDraw(
     case "deal": {
       if (playerHand.length < 2)
         return beginDraw(base, { forHand: "player", reason: "deal" });
-      if (dealerHand.length < 2)
+      // Deal ONLY the dealer's up-card now; the hole card stays hidden until the
+      // player stands (drawn in the dealer_auto run-out). Otherwise the player would
+      // see the dealer's full hand before acting — a large information edge, and
+      // impossible to hide in two-party commit-reveal if drawn during the deal.
+      if (dealerHand.length < 1)
         return beginDraw(base, { forHand: "dealer", reason: "deal" });
       return { ...base, phase: "player" };
     }
