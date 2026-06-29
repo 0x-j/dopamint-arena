@@ -29,13 +29,18 @@ export interface BackendArgs {
   ollamaImageTag?: pulumi.Input<string>;
   // Comma-separated list of origins allowed by the CORS layer. Omitted => permissive CORS.
   corsAllowedOrigins?: pulumi.Input<string>;
+  // Secrets Manager ARN holding the Postgres DATABASE_URL (via RDS Proxy). Injected as
+  // DATABASE_URL via ECS `secrets` so the tunnel-manager can use the `pending_s3_archive`
+  // durable retry queue (ADR-0023). Omitted => the env var is absent (fire-and-forget).
+  databaseUrlSecretArn?: pulumi.Input<string>;
+  // S3 bucket for transcript archival. Injected as S3_TRANSCRIPTS_BUCKET plaintext env.
+  // Omitted => archival disabled.
+  s3TranscriptsBucket?: pulumi.Input<string>;
 }
 
 function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
   const repositoryUrl = pulumi.output(args.repositoryUrl);
   const imageTag = pulumi.output(args.imageTag);
-  const pubSubEndpoint = pulumi.output(args.pubSubEndpoint);
-  const cacheEndpoint = pulumi.output(args.cacheEndpoint);
   const logGroupName = pulumi.output(args.logGroupName);
   const settlerKeySecretArn = pulumi.output(
     args.settlerKeySecretArn ?? undefined,
@@ -43,38 +48,48 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
   const corsAllowedOrigins = pulumi.output(
     args.corsAllowedOrigins ?? undefined,
   );
-  const ollamaEnabled = pulumi.output(args.ollamaEnabled ?? false);
-  const ollamaModel = pulumi.output(args.ollamaModel ?? "qwen2.5:1.5b");
-  const ollamaImageTag = pulumi.output(args.ollamaImageTag ?? "0.6.2");
-  // pulumi.all's tuple overloads stop at 8 elements; bundling the ollama trio
-  // into one output keeps the outer all an 8-tuple, so it stays heterogeneously
-  // typed (the boolean enabled flag alongside the string config) rather than
-  // collapsing to the homogeneous-array overload that rejects the boolean.
   const ollama = pulumi
-    .all([ollamaEnabled, ollamaModel, ollamaImageTag])
+    .all([
+      pulumi.output(args.ollamaEnabled ?? false),
+      pulumi.output(args.ollamaModel ?? "qwen2.5:1.5b"),
+      pulumi.output(args.ollamaImageTag ?? "0.6.2"),
+    ])
     .apply(([enabled, model, imageTag]) => ({ enabled, model, imageTag }));
+  // Bundle the two Redis endpoints (related) so the outer tuple stays at 8 typed slots.
+  const redis = pulumi
+    .all([
+      pulumi.output(args.pubSubEndpoint),
+      pulumi.output(args.cacheEndpoint),
+    ])
+    .apply(([pubsub, cache]) => ({ pubsub, cache }));
+  const s3Cfg = pulumi
+    .all([
+      pulumi.output(args.databaseUrlSecretArn ?? undefined),
+      pulumi.output(args.s3TranscriptsBucket ?? undefined),
+    ])
+    .apply(([dbArn, bucket]) => ({ dbArn, bucket }));
 
   return pulumi
     .all([
       repositoryUrl,
       imageTag,
-      pubSubEndpoint,
-      cacheEndpoint,
+      redis,
       logGroupName,
       settlerKeySecretArn,
       corsAllowedOrigins,
       ollama,
+      s3Cfg,
     ])
     .apply(
       ([
         repositoryUrl,
         imageTag,
-        pubSubEndpoint,
-        cacheEndpoint,
+        redis,
         logGroupName,
         settlerKeySecretArn,
         corsAllowedOrigins,
         ollama,
+        s3Cfg,
       ]) => {
         const {
           enabled: ollamaEnabled,
@@ -84,11 +99,11 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
         const backendEnv: Array<{ name: string; value: string }> = [
           {
             name: "REDIS_PUBSUB_URL",
-            value: `rediss://${pubSubEndpoint}:6379`,
+            value: `rediss://${redis.pubsub}:6379`,
           },
           {
             name: "REDIS_CACHE_URL",
-            value: `rediss://${cacheEndpoint}:6379`,
+            value: `rediss://${redis.cache}:6379`,
           },
           {
             name: "SUI_RPC_URL",
@@ -114,6 +129,12 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
             name: "WALRUS_AGGREGATOR_URL",
             value: "https://aggregator.walrus-testnet.walrus.space",
           },
+          ...(s3Cfg.bucket
+            ? [
+                { name: "S3_TRANSCRIPTS_BUCKET", value: s3Cfg.bucket },
+                { name: "AWS_REGION", value: aws.config.region ?? "us-east-1" },
+              ]
+            : []),
           ...(corsAllowedOrigins
             ? [
                 {
@@ -138,16 +159,17 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
           portMappings: [{ containerPort: 8080, protocol: "tcp" }],
           environment: backendEnv,
           // Private key: injected from Secrets Manager, never inlined as plaintext env.
-          ...(settlerKeySecretArn
-            ? {
-                secrets: [
-                  {
-                    name: "SUI_SETTLER_KEY",
-                    valueFrom: settlerKeySecretArn,
-                  },
-                ],
-              }
-            : {}),
+          ...(function () {
+            const secs: { name: string; valueFrom: string }[] = [];
+            if (settlerKeySecretArn)
+              secs.push({
+                name: "SUI_SETTLER_KEY",
+                valueFrom: settlerKeySecretArn,
+              });
+            if (s3Cfg.dbArn)
+              secs.push({ name: "DATABASE_URL", valueFrom: s3Cfg.dbArn });
+            return secs.length ? { secrets: secs } : {};
+          })(),
           logConfiguration: {
             logDriver: "awslogs",
             options: {

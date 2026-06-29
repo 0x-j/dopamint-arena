@@ -215,4 +215,51 @@ describe("backend component", () => {
       "4096",
     );
   });
+
+  it("wires S3 transcript archival and the DATABASE_URL secret when configured", async () => {
+    const backend = createBackend(
+      makeBackendArgs({
+        databaseUrlSecretArn:
+          "arn:aws:secretsmanager:us-east-1:123:secret:test-db-url-AbCdEf",
+        s3TranscriptsBucket: "dopamint-test-transcripts",
+      }),
+    );
+
+    const defs = JSON.parse(
+      await awaitOutput(backend.taskDefinition.containerDefinitions),
+    );
+    const container = defs[0];
+    const backendEnv = container.environment;
+
+    const s3BucketEnv = backendEnv.find(
+      (e: { name: string }) => e.name === "S3_TRANSCRIPTS_BUCKET",
+    );
+    assert.ok(s3BucketEnv, "must receive S3_TRANSCRIPTS_BUCKET");
+    assert.strictEqual(
+      s3BucketEnv.value,
+      "dopamint-test-transcripts",
+      "S3_TRANSCRIPTS_BUCKET must reference the configured bucket",
+    );
+    assert.ok(
+      backendEnv.some((e: { name: string }) => e.name === "AWS_REGION"),
+      "must receive AWS_REGION for S3 SDK",
+    );
+
+    assert.ok(
+      !backendEnv.some((e: { name: string }) => e.name === "DATABASE_URL"),
+      "DATABASE_URL must never be a plaintext environment variable",
+    );
+    const dbSecret = container.secrets?.find(
+      (s: { name: string }) => s.name === "DATABASE_URL",
+    );
+    assert.ok(
+      dbSecret,
+      "DATABASE_URL must be injected via secrets[] from Secrets Manager",
+    );
+    assert.strictEqual(
+      dbSecret.valueFrom,
+      "arn:aws:secretsmanager:us-east-1:123:secret:test-db-url-AbCdEf",
+      "DATABASE_URL valueFrom must reference the secret ARN",
+    );
+  });
 });

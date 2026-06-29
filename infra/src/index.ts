@@ -12,6 +12,7 @@ import { createFrontend } from "./components/Frontend.js";
 import { createDatabase } from "./components/Database.js";
 import { createDatabaseProxy } from "./components/DatabaseProxy.js";
 import { createCache } from "./components/Cache.js";
+import { createTranscriptsBucket } from "./components/TranscriptsBucket.js";
 import { createBackend } from "./components/Backend.js";
 import { createBackendService } from "./components/BackendService.js";
 import { createBackendAlias } from "./components/BackendAlias.js";
@@ -103,6 +104,16 @@ new aws.secretsmanager.SecretVersion(
   },
 );
 
+const cache = createCache(`dopamint-${cfg.environment}`, {
+  subnetIds: network.privateSubnetIds,
+  securityGroupId: sgs.cache.id,
+  nodeType: cfg.cacheNodeType,
+});
+
+const transcriptsBucket = createTranscriptsBucket(
+  `dopamint-${cfg.environment}`,
+);
+
 const iam = createIam(`dopamint-${cfg.environment}`, {
   githubOrg: "CommandOSSLabs",
   githubRepo: "dopamint-arena",
@@ -111,12 +122,7 @@ const iam = createIam(`dopamint-${cfg.environment}`, {
     databaseUrlSecret.arn,
     ...(settlerKeySecretArn ? [settlerKeySecretArn] : []),
   ],
-});
-
-const cache = createCache(`dopamint-${cfg.environment}`, {
-  subnetIds: network.privateSubnetIds,
-  securityGroupId: sgs.cache.id,
-  nodeType: cfg.cacheNodeType,
+  taskRoleTranscriptsBucketArn: transcriptsBucket.bucketArn,
 });
 
 const backend = createBackend({
@@ -129,6 +135,8 @@ const backend = createBackend({
   taskRoleArn: iam.taskRole.arn,
   logGroupName: ecs.logGroupName,
   settlerKeySecretArn,
+  databaseUrlSecretArn: databaseUrlSecret.arn,
+  s3TranscriptsBucket: transcriptsBucket.bucketName,
   ollamaEnabled: cfg.ollamaEnabled,
   ollamaModel: cfg.ollamaModel,
   ollamaImageTag: cfg.ollamaImageTag,
