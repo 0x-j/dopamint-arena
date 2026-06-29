@@ -72,6 +72,17 @@ export type BattleshipMove =
 const DOMAIN = protocolDomain("battleship.v2");
 const COMMIT_BYTES = 32;
 
+// `encodeState` packs each cell index (and the per-board hit counts) into a single
+// byte. That is exact at 10x10 (cells 0..99, fleet 17 hits), but a larger board or
+// fleet would silently truncate and collide co-signed state hashes. Fail loudly at
+// load instead — the wire format must grow to wider integers before the board does.
+if (BATTLESHIP_CELL_COUNT > 256 || FLEET_CELLS > 255) {
+  throw new Error(
+    `battleship wire format assumes <=256 cells and <=255 fleet hits; ` +
+      `got ${BATTLESHIP_CELL_COUNT} cells, ${FLEET_CELLS} fleet cells`,
+  );
+}
+
 const PHASE_CODE: Record<BattleshipPhase, number> = {
   awaitingCommits: 0,
   playing: 1,
@@ -368,6 +379,7 @@ export class BattleshipProtocol implements Protocol<
     const shotBytes = (shots: BattleshipShotResult[]): Uint8Array => {
       const out = new Uint8Array(shots.length * 2);
       for (let i = 0; i < shots.length; i++) {
+        // One byte per cell index — guarded by the load-time invariant above.
         out[i * 2] = shots[i].cell;
         out[i * 2 + 1] = shots[i].isHit ? 1 : 0;
       }

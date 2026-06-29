@@ -228,3 +228,10 @@ test("resign hands the win and stake to the opponent", () => {
   assert.equal(s.balanceA, 1100n);
   assert.equal(s.balanceB, 900n);
 });
+
+test("the state wire format keeps the cell index and hit counts within one byte", () => {
+  // encodeState packs each cell index and per-board hit count into a single byte;
+  // a board/fleet that outgrows a byte would silently collide co-signed state hashes.
+  assert.ok(BATTLESHIP_CELL_COUNT <= 256, "cell index must fit in a byte");
+  assert.ok(FLEET_CELLS_T <= 255, "fleet hit count must fit in a byte");
+});
