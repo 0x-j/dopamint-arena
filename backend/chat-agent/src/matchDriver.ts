@@ -77,7 +77,8 @@ export class ChatMatchDriver {
         this.channel.transport.send(move);
         this.movesSent += 1;
       }
-      await new Promise((r) => setTimeout(r, 500));
+      // Tight poll: act on our turn ASAP (reply latency is bounded by Ollama).
+      await new Promise((r) => setTimeout(r, 150));
     }
   }
 
