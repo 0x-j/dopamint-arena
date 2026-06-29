@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y ca-certificates curl libpq5 && rm -rf /
 COPY --from=builder /app/target/release/tunnel-manager /usr/local/bin/tunnel-manager
 COPY --from=builder /app/target/release/indexer /usr/local/bin/indexer
 COPY --from=builder /app/target/release/api /usr/local/bin/api
+COPY --from=builder /app/target/release/migrate /usr/local/bin/migrate
 EXPOSE 8080
 # CMD (not ENTRYPOINT) so ECS container `command` can select indexer/api instead.
 CMD ["/usr/local/bin/tunnel-manager"]

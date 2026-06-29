@@ -8,8 +8,8 @@ export interface GithubEnvInputs {
   ecrUrl: pulumi.Input<string>;
   ecsCluster: pulumi.Input<string>;
   ecsService: pulumi.Input<string>;
-  migrationTaskDef: pulumi.Input<string>;
-  backendTaskDefArn: pulumi.Input<string>;
+  migrationTaskDefFamily: pulumi.Input<string>;
+  backendTaskDefFamily: pulumi.Input<string>;
   githubDeployRoleArn: pulumi.Input<string>;
   privateSubnetIds: pulumi.Input<string[]>;
   backendSecurityGroupId: pulumi.Input<string>;
@@ -26,8 +26,8 @@ export function githubEnvOutputs(
     ECR_URL: inputs.ecrUrl,
     ECS_CLUSTER: inputs.ecsCluster,
     ECS_SERVICE: inputs.ecsService,
-    ECS_MIGRATION_TASK_DEF: inputs.migrationTaskDef,
-    ECS_BACKEND_TASK_DEF: inputs.backendTaskDefArn,
+    ECS_MIGRATION_TASK_DEF: inputs.migrationTaskDefFamily,
+    ECS_BACKEND_TASK_DEF: inputs.backendTaskDefFamily,
     AWS_DEPLOY_ROLE_ARN: inputs.githubDeployRoleArn,
     PRIVATE_SUBNET_IDS: pulumi
       .output(inputs.privateSubnetIds)

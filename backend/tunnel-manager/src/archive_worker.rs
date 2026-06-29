@@ -220,7 +220,9 @@ mod tests {
         let client = S3Client::new(&aws_cfg);
         let archiver = std::sync::Arc::new(S3Archiver::new(client.clone(), bucket.clone()));
         let queue = std::sync::Arc::new(
-            PgArchiveQueue::connect(&database_url).await.expect("connect to postgres"),
+            PgArchiveQueue::connect(&database_url)
+                .await
+                .expect("connect to postgres"),
         );
 
         let mut state = AppState::in_memory_for_test();
@@ -277,7 +279,10 @@ mod tests {
         archive_or_enqueue(&state2, key2.clone(), bytes.clone(), meta2).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let rows = queue.drain_due(10).await.expect("drain queued row");
-        assert!(rows.iter().any(|r| r.tx_digest == tx_digest2), "row should be queued");
+        assert!(
+            rows.iter().any(|r| r.tx_digest == tx_digest2),
+            "row should be queued"
+        );
 
         // 3. Drain worker retries the queued row against real S3 and deletes it.
         let mut state3 = AppState::in_memory_for_test();

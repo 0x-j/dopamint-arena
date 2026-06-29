@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"dist/**/*.test.js\"",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "preview": "pulumi preview",
     "up": "pulumi up -y",
     "destroy": "pulumi destroy -y",

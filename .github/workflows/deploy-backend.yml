@@ -103,9 +103,54 @@ jobs:
             dopamint:backend-image-tag:
               value: ${{ github.sha }}
 
+  run-migrations:
+    name: Run database migrations
+    needs: update-pulumi
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    timeout-minutes: 20
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Run migrations on Fargate
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_MIGRATION_TASK_DEF: ${{ vars.ECS_MIGRATION_TASK_DEF }}
+          PRIVATE_SUBNET_IDS: ${{ vars.PRIVATE_SUBNET_IDS }}
+          BACKEND_SECURITY_GROUP_ID: ${{ vars.BACKEND_SECURITY_GROUP_ID }}
+        run: |
+          set -euo pipefail
+          FIRST_SUBNET="${PRIVATE_SUBNET_IDS%%,*}"
+          RUN_RESULT=$(aws ecs run-task \
+            --cluster "${ECS_CLUSTER}" \
+            --task-definition "${ECS_MIGRATION_TASK_DEF}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${FIRST_SUBNET}],securityGroups=[${BACKEND_SECURITY_GROUP_ID}],assignPublicIp=DISABLED}")
+          TASK_ARN=$(echo "${RUN_RESULT}" | jq -r '.tasks[0].taskArn // empty')
+          FAILURE=$(echo "${RUN_RESULT}" | jq -c '.failures[0] // empty')
+          if [ -z "${TASK_ARN}" ]; then
+            echo "ECS run-task failed: ${FAILURE}"
+            exit 1
+          fi
+          aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}"
+          TASK_DESC=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --tasks "${TASK_ARN}")
+          EXIT_CODE=$(echo "${TASK_DESC}" | jq -r '.tasks[0].containers[0].exitCode // "null"')
+          STOP_REASON=$(echo "${TASK_DESC}" | jq -r '.tasks[0].stoppedReason // "unknown"')
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "Migration failed: exitCode=${EXIT_CODE}, stoppedReason=${STOP_REASON}"
+            exit 1
+          fi
+          echo "Migration completed successfully"
+
   deploy-service:
     name: Deploy backend ECS service
-    needs: update-pulumi
+    needs: run-migrations
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'dev' }}
     timeout-minutes: 30
