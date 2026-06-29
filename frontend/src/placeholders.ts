@@ -68,7 +68,7 @@ export const PLACEHOLDER_SNAPSHOT: TelemetrySnapshot = {
     },
     {
       id: 3,
-      game: "micro-payments",
+      game: "regular-payments",
       digest: seedDigest(3),
       address: seedAddress(3),
       time: "14:23:50",
@@ -90,7 +90,7 @@ export const PLACEHOLDER_SNAPSHOT: TelemetrySnapshot = {
     },
     {
       id: 5,
-      game: "micro-payments",
+      game: "regular-payments",
       digest: seedDigest(5),
       address: seedAddress(5),
       time: "14:23:49",

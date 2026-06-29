@@ -59,9 +59,11 @@ impl SettlementStore for InMemorySettlementStore {
     }
 
     async fn list(&self, q: &SettlementQuery) -> anyhow::Result<SettlementPage> {
-        // Composite keyset: a row is "before" the cursor when its ts is smaller, OR ts is
-        // equal and its digest sorts lower — matching the (ts DESC, digest DESC) order so
-        // same-millisecond rows are never skipped at a page edge.
+        // Composite keyset over (ts, digest, tunnel_id): a row is "before" the cursor when its ts
+        // is smaller, or ts ties and digest sorts lower, or both tie and tunnel_id sorts lower —
+        // matching the (ts DESC, digest DESC, tunnel_id DESC) order. tunnel_id is in the key because
+        // one tx (PTB) can settle many tunnels (shared ts+digest), else a sibling is skipped at a
+        // page edge.
         let cur = q.cursor.as_deref().and_then(decode_cursor);
         let mut v: Vec<SettlementRow> = self
             .rows
@@ -77,8 +79,12 @@ impl SettlementStore for InMemorySettlementStore {
             })
             .filter(|r| match &cur {
                 None => true,
-                Some((ts, digest)) => {
-                    r.timestamp_ms < *ts || (r.timestamp_ms == *ts && r.tx_digest < *digest)
+                Some((ts, digest, tunnel)) => {
+                    r.timestamp_ms < *ts
+                        || (r.timestamp_ms == *ts && r.tx_digest < *digest)
+                        || (r.timestamp_ms == *ts
+                            && r.tx_digest == *digest
+                            && r.tunnel_id < *tunnel)
                 }
             })
             .cloned()
@@ -87,11 +93,12 @@ impl SettlementStore for InMemorySettlementStore {
             b.timestamp_ms
                 .cmp(&a.timestamp_ms)
                 .then_with(|| b.tx_digest.cmp(&a.tx_digest))
+                .then_with(|| b.tunnel_id.cmp(&a.tunnel_id))
         });
         let limit = q.limit.clamp(1, 1000) as usize;
         let next_cursor = if v.len() > limit {
             let last = &v[limit - 1];
-            Some(encode_cursor(last.timestamp_ms, &last.tx_digest))
+            Some(encode_cursor(last.timestamp_ms, &last.tx_digest, &last.tunnel_id))
         } else {
             None
         };
@@ -199,7 +206,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["c", "b"]
         );
-        assert_eq!(p1.next_cursor.as_deref(), Some("20:b"));
+        assert_eq!(p1.next_cursor.as_deref(), Some("20:b:0xtun"));
         let p2 = s
             .list(&SettlementQuery {
                 cursor: p1.next_cursor,

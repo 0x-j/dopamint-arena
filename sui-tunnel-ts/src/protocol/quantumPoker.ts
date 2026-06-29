@@ -5,10 +5,11 @@
  *   0,1 = A holes; 2,3 = B holes; 4,5,6 = flop; 7 = turn; 8 = river.
  *
  * Each slot is a commit-reveal from both parties. A card is derived by combining the
- * two reveals into a seed, Fisher-Yates shuffling a fresh 52-card deck, and taking
- * deck[0]. There is no traditional dealer deck. Board cards are de-duplicated by
- * re-deriving the slot with a counter; hidden cards may duplicate each other or the
- * board, and hidden cards equal to board cards are burned at showdown.
+ * two reveals into a seed and reducing it modulo 52 (the whitepaper's
+ * `Card = Random() mod 52`) — one hash per card, no shuffle and no hidden dealer deck.
+ * Board cards are de-duplicated by re-deriving the slot with a counter; hidden cards
+ * may duplicate each other or the board, and hidden cards equal to board cards are
+ * burned at showdown.
  */
 
 import { bytesEqual, concatBytes } from "../core/bytes";
@@ -18,7 +19,6 @@ import {
   verifyCommitment,
 } from "../core/commitment";
 import { blake2b256 } from "../core/crypto";
-import { seedFromBytes, shuffle } from "../core/randomness";
 import { u64ToBeBytes } from "../core/wire";
 import type { Balances, Party, Protocol, ProtocolContext } from "./Protocol";
 import { otherParty, protocolDomain } from "./Protocol";
@@ -345,6 +345,16 @@ function validateLocalSecretsForCommit(
 /**
  * Derive a single Quantum Poker card from two slot reveals. Counter 0 is the base
  * slot seed; higher counters are used only to retry board collisions.
+ *
+ * Per the Quantum Games design, every slot is an *independent sample*: combine both
+ * reveals into a 32-byte seed and reduce it modulo 52 — the whitepaper's
+ * `Card = Random() mod 52`. This is one hash per card, not a 51-swap Fisher-Yates over
+ * a fresh 52-card deck. There is no hidden global deck; board uniqueness is enforced by
+ * the caller via `counter`, and the showdown burn rule resolves any hidden/board
+ * collisions. We reduce the *full* 256-bit seed modulo 52 (big-endian, byte-by-byte
+ * Horner fold) so the whole hash contributes its entropy; the residual modulo bias is
+ * bounded by 52 / 2^256 (~2^-250) — unobservable — with no extra hash. Must stay
+ * byte-for-byte identical to Rust `derive_quantum_card`.
  */
 export function deriveQuantumCard(
   revealA: SlotReveal,
@@ -364,9 +374,9 @@ export function deriveQuantumCard(
     counter === 0
       ? slotSeed
       : blake2b256(concatBytes([slotSeed, u64ToBeBytes(counter)]));
-  const deck = Array.from({ length: 52 }, (_, i) => i);
-  shuffle(seedFromBytes(seedBytes), deck);
-  return deck[0];
+  let acc = 0;
+  for (let i = 0; i < seedBytes.length; i++) acc = (acc * 256 + seedBytes[i]) % 52;
+  return acc;
 }
 
 export class QuantumPokerProtocol implements Protocol<PokerState, PokerMove> {

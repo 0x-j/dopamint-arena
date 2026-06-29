@@ -56,7 +56,7 @@ export function createRegularPaymentsKit(
   const protocol = new PaymentsProtocol();
 
   return {
-    id: "micro-payments",
+    id: "regular-payments",
     protocol,
     stateHash: (state) => defaultStateHash(protocol, state),
     createBot: (seat: Party, ctx: BotContext) =>

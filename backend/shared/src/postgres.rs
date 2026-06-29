@@ -62,26 +62,30 @@ impl SettlementStore for PgSettlementStore {
 
     async fn list(&self, q: &SettlementQuery) -> anyhow::Result<SettlementPage> {
         let limit = q.limit.clamp(1, 1000);
-        // Composite keyset cursor: the row-value comparison `(ts, digest) < ($1, $2)` matches
-        // the `(ts DESC, digest DESC)` order, so rows sharing a millisecond are never skipped
-        // at a page edge. Both halves are NULL on page 1 (the `IS NULL` branch lets all rows in).
+        // Composite keyset cursor over (ts, digest, tunnel_id): the row-value comparison
+        // `(ts, digest, tunnel_id) < ($1, $2, $3)` matches the `(ts DESC, digest DESC, tunnel_id DESC)`
+        // order. tunnel_id is in the key because one tx (PTB) can settle many tunnels — those rows
+        // share (ts, digest), so a 2-part key would skip the un-returned siblings at a page edge.
+        // All three halves are NULL on page 1 (the `IS NULL` branch lets all rows in).
         let cur = q.cursor.as_deref().and_then(crate::decode_cursor);
         let cur_ts = cur.as_ref().map(|c| c.0);
         let cur_digest = cur.as_ref().map(|c| c.1.clone());
+        let cur_tunnel = cur.as_ref().map(|c| c.2.clone());
         // Fetch limit+1 to compute next_cursor without a second query.
         let rows = sqlx::query(
             r#"
             SELECT * FROM settlement
-            WHERE ($1::bigint IS NULL OR (timestamp_ms, tx_digest) < ($1, $2))
-              AND ($3::text IS NULL OR tunnel_id = $3)
-              AND ($4::text IS NULL OR kind = $4)
-              AND ($5::text IS NULL OR party_a_addr = $5 OR party_b_addr = $5)
-            ORDER BY timestamp_ms DESC, tx_digest DESC
-            LIMIT $6
+            WHERE ($1::bigint IS NULL OR (timestamp_ms, tx_digest, tunnel_id) < ($1, $2, $3))
+              AND ($4::text IS NULL OR tunnel_id = $4)
+              AND ($5::text IS NULL OR kind = $5)
+              AND ($6::text IS NULL OR party_a_addr = $6 OR party_b_addr = $6)
+            ORDER BY timestamp_ms DESC, tx_digest DESC, tunnel_id DESC
+            LIMIT $7
             "#,
         )
         .bind(cur_ts)
         .bind(cur_digest)
+        .bind(cur_tunnel)
         .bind(&q.tunnel_id)
         .bind(q.kind.map(LifecycleKind::as_str))
         .bind(&q.address)
@@ -96,7 +100,7 @@ impl SettlementStore for PgSettlementStore {
         let next_cursor = if out.len() as i64 > limit {
             out.truncate(limit as usize);
             out.last()
-                .map(|r| crate::encode_cursor(r.timestamp_ms, &r.tx_digest))
+                .map(|r| crate::encode_cursor(r.timestamp_ms, &r.tx_digest, &r.tunnel_id))
         } else {
             None
         };
@@ -154,7 +158,7 @@ mod tests {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS settlement (
-                tx_digest        TEXT PRIMARY KEY,
+                tx_digest        TEXT NOT NULL,
                 kind             TEXT NOT NULL,
                 tunnel_id        TEXT NOT NULL,
                 party_a_addr     TEXT,
@@ -168,7 +172,8 @@ mod tests {
                 checkpoint       BIGINT NOT NULL,
                 timestamp_ms     BIGINT NOT NULL,
                 closed_at_ms     BIGINT,
-                game             TEXT
+                game             TEXT,
+                PRIMARY KEY (tx_digest, tunnel_id)
             )
             "#,
         )
@@ -244,6 +249,57 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed a settled row with an explicit tunnel_id — two tunnels can share one tx_digest.
+    async fn insert_tunnel_row(pool: &PgPool, tx_digest: &str, tunnel_id: &str, ts: i64) {
+        sqlx::query(
+            "INSERT INTO settlement (tx_digest, kind, tunnel_id, party_a_addr, party_b_addr, \
+             party_a_balance, party_b_balance, final_nonce, transcript_root, proof_url, \
+             walrus_blob_id, checkpoint, timestamp_ms, closed_at_ms, game) \
+             VALUES ($1,'settled',$2,'0xa','0xb',60,40,3,'aa',NULL,NULL,7,$3,$3,NULL)",
+        )
+        .bind(tx_digest)
+        .bind(tunnel_id)
+        .bind(ts)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn list_keyset_does_not_drop_same_tx_siblings() {
+        let Some(s) = store().await else { return };
+        // One PTB closing two tunnels => two rows sharing timestamp_ms AND tx_digest, differing only
+        // by tunnel_id. Paginating one-at-a-time must surface BOTH; a keyset on (ts, digest) alone
+        // excludes the un-returned sibling at the page edge.
+        insert_tunnel_row(&s.pool, "batch", "0xtun_a", 10).await;
+        insert_tunnel_row(&s.pool, "batch", "0xtun_b", 10).await;
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..3 {
+            let page = s
+                .list(&SettlementQuery {
+                    limit: 1,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            seen.extend(page.rows.iter().map(|r| r.tunnel_id.clone()));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["0xtun_a".to_string(), "0xtun_b".to_string()],
+            "both tunnels of a single batched tx must paginate, not be dropped at the page edge"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn list_keyset_and_address_filter() {
@@ -265,7 +321,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["c", "b"]
         );
-        assert_eq!(p1.next_cursor.as_deref(), Some("20:b"));
+        assert_eq!(p1.next_cursor.as_deref(), Some("20:b:0xtun"));
         let hit = s
             .list(&SettlementQuery {
                 limit: 10,

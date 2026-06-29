@@ -28,7 +28,7 @@ describe("regularPayments kit", () => {
 
   it("uses the payments.v1 protocol domain and correct id", () => {
     const kit = createRegularPaymentsKit(MICRO);
-    assert.strictEqual(kit.id, "micro-payments");
+    assert.strictEqual(kit.id, "regular-payments");
     assert.strictEqual(kit.protocol.name, "payments.v1");
   });
 

@@ -43,9 +43,13 @@ export function ExplorerPage() {
         setRows((prev) => {
           if (reset) return page.rows;
           // Dedup against live-prepended rows: a settlement returned by both the stream and a later
-          // page must not appear twice (nor collide on the React key={txDigest}).
-          const seen = new Set(prev.map((r) => r.txDigest));
-          return [...prev, ...page.rows.filter((r) => !seen.has(r.txDigest))];
+          // page must not appear twice (nor collide on the React key). Keyed by (txDigest, tunnelId)
+          // because one tx (PTB) can settle many tunnels — those rows share a txDigest.
+          const seen = new Set(prev.map((r) => `${r.txDigest}:${r.tunnelId}`));
+          return [
+            ...prev,
+            ...page.rows.filter((r) => !seen.has(`${r.txDigest}:${r.tunnelId}`)),
+          ];
         });
         setCursor(page.nextCursor);
         setDone(page.nextCursor == null);
@@ -72,7 +76,11 @@ export function ExplorerPage() {
         return;
       }
       setRows((prev) =>
-        prev.some((r) => r.txDigest === row.txDigest) ? prev : [row, ...prev],
+        prev.some(
+          (r) => r.txDigest === row.txDigest && r.tunnelId === row.tunnelId,
+        )
+          ? prev
+          : [row, ...prev],
       );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -131,7 +139,7 @@ export function ExplorerPage() {
               ) : (
                 rows.map((r) => (
                   <tr
-                    key={r.txDigest}
+                    key={`${r.txDigest}:${r.tunnelId}`}
                     className="border-t border-border/60 hover:bg-secondary/40"
                   >
                     <td className="wal-mono px-3 py-2">

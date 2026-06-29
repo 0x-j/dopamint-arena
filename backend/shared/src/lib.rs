@@ -97,15 +97,21 @@ pub struct SettlementQuery {
     pub kind: Option<LifecycleKind>,
 }
 
-/// Decode a `"{ts}:{digest}"` cursor token. Sui digests are base58 (never contain `:`), so
-/// split on the first `:` only.
-pub fn decode_cursor(token: &str) -> Option<(i64, String)> {
-    let (ts, digest) = token.split_once(':')?;
-    Some((ts.parse().ok()?, digest.to_string()))
+/// Decode a `"{ts}:{digest}:{tunnel_id}"` keyset cursor. Sui digests (base58) and tunnel ids
+/// (0x-hex) never contain `:`, so split into at most three. A legacy two-part `"{ts}:{digest}"`
+/// token (in-flight clients across a deploy) decodes with an empty tunnel_id — the minimum in the
+/// DESC keyset, so the transition never re-emits an already-seen row.
+pub fn decode_cursor(token: &str) -> Option<(i64, String, String)> {
+    let mut parts = token.splitn(3, ':');
+    let ts = parts.next()?.parse().ok()?;
+    let digest = parts.next()?.to_string();
+    let tunnel_id = parts.next().unwrap_or("").to_string();
+    Some((ts, digest, tunnel_id))
 }
-/// Build a `"{ts}:{digest}"` keyset cursor token from a timestamp and transaction digest.
-pub fn encode_cursor(ts: i64, digest: &str) -> String {
-    format!("{ts}:{digest}")
+/// Build a `"{ts}:{digest}:{tunnel_id}"` keyset cursor. tunnel_id is part of the key because one
+/// tx (PTB) can settle many tunnels — rows then share (ts, digest) and only tunnel_id breaks the tie.
+pub fn encode_cursor(ts: i64, digest: &str, tunnel_id: &str) -> String {
+    format!("{ts}:{digest}:{tunnel_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

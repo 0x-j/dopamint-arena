@@ -20,7 +20,7 @@ const GAME_FEED: { game: string; type: string }[] = [
   { game: "coin-flip", type: "Coin Flip" },
   { game: "dice", type: "Dice Roll" },
   { game: "slots", type: "Slots Spin" },
-  { game: "micro-payments", type: "Payment" },
+  { game: "regular-payments", type: "Payment" },
   { game: "chat", type: "Tip" },
 ];
 
@@ -70,7 +70,7 @@ const LOCAL_FEED: { game: string; type: string }[] = [
   { game: "coin-flip", type: "Coin Flip" },
   { game: "dice", type: "Dice Roll" },
   { game: "slots", type: "Slots Spin" },
-  { game: "micro-payments", type: "Transfer" },
+  { game: "regular-payments", type: "Transfer" },
   { game: "chat", type: "Tip" },
 ];
 

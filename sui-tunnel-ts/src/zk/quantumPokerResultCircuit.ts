@@ -1,7 +1,7 @@
 /**
  * Quantum Poker result-proof public input schema.
  *
- * This module intentionally does not try to prove the blake2b/Fisher-Yates card
+ * This module intentionally does not try to prove the blake2b mod-52 card
  * derivation inside Circom. The milestone ships the byte-exact public input schema
  * consumed by Sui native Groth16, plus a pluggable prover interface. Real proving
  * artifacts are a deploy-time concern.
@@ -62,7 +62,7 @@ export function quantumPokerRulesDescriptor(): Uint8Array {
       "quantum_poker.v2",
       "heads_up",
       "slots=9",
-      "fisher_yates_52_per_slot",
+      "single_sample_mod52_per_slot",
       "board_unique",
       "hidden_duplicates_allowed",
       "board_duplicate_hidden_burn",
@@ -158,7 +158,7 @@ export const QUANTUM_POKER_RESULT_CIRCOM = `pragma circom 2.1.0;
 //
 // This milestone circuit spec binds the result to the tunnel dispute state and
 // settlement balances. Full card derivation proof is deferred because the live
-// protocol uses blake2b/Fisher-Yates; a deploy-time circuit can add Poseidon
+// protocol uses blake2b mod-52 sampling; a deploy-time circuit can add Poseidon
 // commitments behind the same public input schema.
 template QuantumPokerResult() {
     signal input rulesHash;

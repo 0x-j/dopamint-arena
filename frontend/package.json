@@ -9,7 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test \"src/agent/**/*.test.ts\" \"src/components/**/*.test.ts\" \"src/components/chat/**/*.test.tsx\" \"src/backend/**/*.test.ts\" \"src/lib/**/*.test.ts\" \"src/onchain/**/*.test.ts\" \"src/pvp/**/*.test.ts\" \"src/shell/**/*.test.ts\" \"src/games/blackjack/*.test.ts\" \"src/games/battleship/**/*.test.ts\" \"src/games/bombIt/**/*.test.ts\" \"src/games/chickenCross/**/*.test.ts\" \"src/games/ticTacToe/tttColdLoad.test.ts\" \"src/games/quantumPoker/**/*.test.ts\" \"src/games/worldCanvas/**/*.test.ts\" \"src/games/chat/*.test.ts\" \"src/hooks/useChatSession.test.tsx\"",
+    "test": "node --import tsx --test \"src/agent/**/*.test.ts\" \"src/components/**/*.test.ts\" \"src/components/chat/**/*.test.tsx\" \"src/backend/**/*.test.ts\" \"src/lib/**/*.test.ts\" \"src/onchain/**/*.test.ts\" \"src/pvp/**/*.test.ts\" \"src/shell/**/*.test.ts\" \"src/games/blackjack/*.test.ts\" \"src/games/battleship/**/*.test.ts\" \"src/games/bombIt/**/*.test.ts\" \"src/games/chickenCross/**/*.test.ts\" \"src/games/regularPayments/**/*.test.ts\" \"src/games/ticTacToe/tttColdLoad.test.ts\" \"src/games/quantumPoker/**/*.test.ts\" \"src/games/worldCanvas/**/*.test.ts\" \"src/games/chat/*.test.ts\" \"src/hooks/useChatSession.test.tsx\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\""
   },

@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use tunnel_core::codec::u64_to_be_bytes;
 use tunnel_core::commitment::{combine_reveals, compute_commitment, verify_commitment};
 use tunnel_core::crypto::blake2b256;
-use tunnel_core::randomness::{next_u64_in_range, seed_from_bytes, Seed};
 use tunnel_harness::{Balances, Protocol, ProtocolError, Seat, TunnelContext};
 
 pub mod strategy;
@@ -266,16 +265,19 @@ pub fn commit_slot_secrets(secrets: &[SlotSecret]) -> Result<Vec<[u8; 32]>, Stri
         .collect()
 }
 
-fn shuffle(seed: Seed, deck: &mut [u8]) {
-    let mut current = seed;
-    for i in (1..deck.len()).rev() {
-        let (j, next) =
-            next_u64_in_range(current, 0, (i + 1) as u64).expect("hard-coded valid shuffle range");
-        current = next;
-        deck.swap(i, j as usize);
-    }
-}
-
+/// Derive a single Quantum Poker card from two slot reveals.
+///
+/// Per the Quantum Games design, every slot is an *independent sample*: combine both
+/// reveals into a 32-byte seed and reduce it modulo 52 — the whitepaper's
+/// `Card = Random() mod 52`. This is one hash per card (the `combine_reveals` already
+/// required), not a 51-swap Fisher-Yates over a fresh 52-card deck. There is no hidden
+/// global deck; board uniqueness is enforced by the caller via `counter`, and the
+/// showdown burn rule resolves any hidden/board collisions.
+///
+/// We reduce the *full* 256-bit seed modulo 52 (big-endian, byte-by-byte Horner fold)
+/// so the whole hash contributes its entropy. The residual modulo bias is bounded by
+/// `52 / 2^256` (~2^-250) — unobservable — without the extra hash that rejection
+/// sampling would cost.
 pub fn derive_quantum_card(a: &SlotReveal, b: &SlotReveal, counter: u64) -> u8 {
     let slot_seed = combine_reveals(&a.value, &a.salt, &b.value, &b.salt);
     let seed_bytes = if counter == 0 {
@@ -286,9 +288,11 @@ pub fn derive_quantum_card(a: &SlotReveal, b: &SlotReveal, counter: u64) -> u8 {
         input.extend_from_slice(&u64_to_be_bytes(counter));
         blake2b256(&input)
     };
-    let mut deck: Vec<u8> = (0..52).collect();
-    shuffle(seed_from_bytes(seed_bytes), &mut deck);
-    deck[0]
+    let mut acc: u32 = 0;
+    for &byte in seed_bytes.iter() {
+        acc = (acc * 256 + byte as u32) % 52;
+    }
+    acc as u8
 }
 
 fn same_number_set(a: &[u8], b: &[u8]) -> bool {
@@ -1299,5 +1303,40 @@ mod tests {
         let straight = evaluate5(&[0, 14, 28, 42, 4]).unwrap();
         let flush = evaluate5(&[0, 2, 4, 6, 8]).unwrap();
         assert!(flush > straight);
+    }
+
+    // Locks the single-sample `mod 52` derivation. The same fixed reveal bytes and
+    // expected cards appear in the TS `deriveQuantumCard` parity golden test
+    // (quantumPoker.test.ts), so any TS/Rust divergence fails one side.
+    #[test]
+    fn derive_quantum_card_matches_ts_engine_on_fixed_reveals() {
+        let a = SlotReveal {
+            value: vec![1, 2, 3, 4],
+            salt: vec![5, 6, 7, 8],
+        };
+        let b = SlotReveal {
+            value: vec![9, 10, 11],
+            salt: vec![12, 13],
+        };
+        assert_eq!(derive_quantum_card(&a, &b, 0), 50);
+        assert_eq!(derive_quantum_card(&a, &b, 1), 1);
+        assert_eq!(derive_quantum_card(&a, &b, 2), 18);
+    }
+
+    #[test]
+    fn derive_quantum_card_stays_within_deck_range() {
+        for x in 0..40u8 {
+            for y in 0..40u8 {
+                let a = SlotReveal {
+                    value: vec![x, x.wrapping_add(1)],
+                    salt: vec![x; 8],
+                };
+                let b = SlotReveal {
+                    value: vec![y, y.wrapping_add(2)],
+                    salt: vec![y; 8],
+                };
+                assert!(derive_quantum_card(&a, &b, 0) < 52);
+            }
+        }
     }
 }

@@ -188,7 +188,28 @@ test("deriveQuantumCard is deterministic and counter-sensitive", () => {
   const a = secrets(1)[4];
   const b = secrets(2)[4];
   assert.equal(deriveQuantumCard(a, b), deriveQuantumCard(a, b));
-  assert.notEqual(deriveQuantumCard(a, b, 0), deriveQuantumCard(a, b, 1));
+  // Counters 0/1 may collide (1/52); counter 2 reliably differs for these inputs.
+  assert.notEqual(deriveQuantumCard(a, b, 0), deriveQuantumCard(a, b, 2));
+});
+
+// Locks the single-sample `mod 52` derivation to exact values. The same fixed reveal
+// bytes and expected cards appear in the Rust `derive_quantum_card` parity test, so any
+// divergence between the TS and Rust engines fails one side.
+test("deriveQuantumCard matches the Rust engine on fixed reveals (parity golden)", () => {
+  const a = { value: Uint8Array.from([1, 2, 3, 4]), salt: Uint8Array.from([5, 6, 7, 8]) };
+  const b = { value: Uint8Array.from([9, 10, 11]), salt: Uint8Array.from([12, 13]) };
+  assert.equal(deriveQuantumCard(a, b, 0), 50);
+  assert.equal(deriveQuantumCard(a, b, 1), 1);
+  assert.equal(deriveQuantumCard(a, b, 2), 18);
+});
+
+test("deriveQuantumCard stays within 0..51 across many inputs", () => {
+  for (let x = 0; x < 40; x++) {
+    for (let y = 0; y < 40; y++) {
+      const card = deriveQuantumCard(secrets(x)[x % 9], secrets(y)[y % 9]);
+      assert.ok(card >= 0 && card <= 51, `card ${card} out of range`);
+    }
+  }
 });
 
 test("uneven all-in caps the big stack at the effective stack and stays callable", () => {
