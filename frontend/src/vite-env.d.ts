@@ -2,6 +2,12 @@
 
 interface ImportMetaEnv {
   readonly VITE_BACKEND_URL?: string;
+  // Direct-to-Ollama chat (bypasses the authenticated backend /v1/chat proxy). Set
+  // VITE_OLLAMA_URL to enable; empty = use the backend proxy, a full URL = direct
+  // Ollama access (cross-origin, requires OLLAMA_ORIGINS on the Ollama side).
+  readonly VITE_OLLAMA_URL?: string;
+  readonly VITE_OLLAMA_MODEL?: string;
+  readonly VITE_OLLAMA_MAX_TOKENS?: string;
   readonly VITE_QUANTUM_POKER_SERVER_URL?: string;
   readonly VITE_TUNNEL_PACKAGE_ID?: string;
   // zkLogin (Enoki + Google) sign-in. Public client identifiers; both required to enable it.
