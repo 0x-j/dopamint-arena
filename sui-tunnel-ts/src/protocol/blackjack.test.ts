@@ -263,16 +263,18 @@ function dealtToPlayer(): BlackjackState {
   return s;
 }
 
-test("hit deals one more player card and returns to player phase", () => {
-  let s = dealtToPlayer();
+test("a hit that stays under 21 returns control to the player", () => {
+  let s = placeBet(fresh());
+  const [f5a, f5b] = secretsForRank(5); // value 5
+  s = doDraw(s, f5a, f5b); // player 5
+  s = doDraw(s, f5a, f5b); // player 10
+  s = doDraw(s, f5a, f5b); // dealer up-card 5 -> player phase
   assert.equal(s.phase, "player");
-  s = proto.applyMove(s, { kind: "hit" }, "A");
+  s = proto.applyMove(s, { kind: "hit" }, actorFor(s)!);
   assert.equal(s.phase, "draw_commit");
   assert.deepEqual(s.draw, { forHand: "player", reason: "hit" });
-  // Force the hit card to an Ace (value 11 -> soft, 10+10+11 busts? no: 31 -> aces down -> 21).
-  const [aa, ab] = secretsForRank(1);
-  s = doDraw(s, aa, ab);
-  assert.equal(s.phase, "player"); // 10 + 10 + Ace = 21, not bust
+  s = doDraw(s, f5a, f5b); // 10 + 5 = 15 (< 21) -> still the player's turn
+  assert.equal(s.phase, "player");
   assert.equal(s.playerHand.length, 3);
 });
 
@@ -590,4 +592,14 @@ test("replaying the same moves yields identical encodeState", () => {
   for (const { move, by } of moves) r = proto.applyMove(r, move, by);
   const encoded2 = Buffer.from(proto.encodeState(r)).toString("hex");
   assert.equal(encoded1, encoded2);
+});
+
+test("reaching 21 auto-stands the player (a pat 21 cannot be hit into a bust)", () => {
+  let s = dealtToPlayer(); // player 20, dealer up-card 5
+  s = proto.applyMove(s, { kind: "hit" }, actorFor(s)!);
+  const [aa, ab] = secretsForRank(1); // Ace: 20 + 11 -> soft down -> 21
+  s = doDraw(s, aa, ab);
+  // Pat 21: the player's turn ends automatically and the dealer starts drawing.
+  assert.notEqual(s.phase, "player");
+  assert.deepEqual(s.draw, { forHand: "dealer", reason: "dealer_auto" });
 });

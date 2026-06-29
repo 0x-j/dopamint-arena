@@ -268,6 +268,22 @@ function settle(s: BlackjackState, winner: Party | null): BlackjackState {
   };
 }
 
+/**
+ * Hand control to the player — unless they are already pat at 21, where any hit can only
+ * bust. There we auto-stand straight into the dealer's turn (identical to the `stand` move).
+ */
+function playerTurnOrDealer(
+  s: BlackjackState,
+  playerPartyFor: PlayerPartyFor,
+): BlackjackState {
+  if (handValue(s.playerHand) >= BUST_AT) {
+    if (handValue(s.dealerHand) >= DEALER_STANDS_AT)
+      return resolveShowdown(s, playerPartyFor);
+    return beginDraw(s, { forHand: "dealer", reason: "dealer_auto" });
+  }
+  return { ...s, phase: "player" };
+}
+
 /** Apply a freshly derived rank to the target hand and run the continuation. */
 function afterDraw(
   s: BlackjackState,
@@ -304,12 +320,12 @@ function afterDraw(
       // impossible to hide in two-party commit-reveal if drawn during the deal.
       if (dealerHand.length < 1)
         return beginDraw(base, { forHand: "dealer", reason: "deal" });
-      return { ...base, phase: "player" };
+      return playerTurnOrDealer(base, playerPartyFor);
     }
     case "hit": {
       if (isBust(playerHand))
         return settle(base, dealerPartyForWith(base.round, playerPartyFor));
-      return { ...base, phase: "player" };
+      return playerTurnOrDealer(base, playerPartyFor);
     }
     case "dealer_auto": {
       if (handValue(dealerHand) < DEALER_STANDS_AT)
