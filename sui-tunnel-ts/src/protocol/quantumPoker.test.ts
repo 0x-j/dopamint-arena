@@ -360,3 +360,15 @@ test("split pot (showdown tie) leaves BOTH stacks unchanged — neither loses ch
   }
   assert.ok(ties > 0, "no showdown tie sampled — widen the seed range");
 });
+
+test("a flush is ranked by its high cards, not by a duplicate-rank pair", () => {
+  // Virtual-deck duplicates are legal, so a flush can contain a repeated card.
+  // Both hands are hearts (suit 0). The first has high card K (12) with a low
+  // pair of 5s; the second's high card is only J (11). The K-high flush must win.
+  const kHighFlushWithLowPair = [12, 5, 5, 4, 2];
+  const jHighFlush = [11, 8, 6, 4, 2];
+  assert.ok(
+    evaluate5(kHighFlushWithLowPair) > evaluate5(jHighFlush),
+    "K-high flush must beat J-high flush despite the low pair",
+  );
+});

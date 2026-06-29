@@ -1196,7 +1196,11 @@ export function evaluate5(cards: number[]): number {
   else if (groups[0][0] === 2) category = 1;
   else category = 0;
 
-  const tb = straight ? [straightHigh] : groups.map((g) => g[1]);
+  // A flush (incl. one made with virtual-deck duplicates) is compared by its five
+  // card ranks high-to-low, NOT by group-count order — otherwise a low duplicate
+  // pair would outrank a higher solo card. Paired non-flush hands still tiebreak by
+  // group (pair/trips rank first, then kickers).
+  const tb = straight ? [straightHigh] : flush ? ranks : groups.map((g) => g[1]);
   let score = category;
   for (let i = 0; i < 5; i++) score = score * 13 + (tb[i] ?? 0);
   return score;
