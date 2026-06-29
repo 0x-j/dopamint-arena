@@ -24,9 +24,11 @@ Several games hardcode seat **A** to act first every game/street with **no alter
 
 A losing seat can withhold the reveal/co-signature that settles a loss, leaving the game with no in-protocol terminal state; recovery falls to the on-chain dispute/force-close path. Already analysed for blackjack (finding F1). Recurs in: poker (loser never reveals at showdown), battleship (`battleship.ts:295` — `finalize()` needs both `revealedA && revealedB`), cross (tie-stall), bombIt (stall-to-draw). Tied to the on-chain `penalty`/`force_close` backstop (see the F1 forfeit work).
 
-### Pattern C — Salt `MIN_SALT_LEN` not enforced at reveal
+### Pattern C — Salt `MIN_SALT_LEN` not enforced at reveal — WON'T FIX (deliberate Move parity)
 
-Commit-reveal `verifyCommitment` accepts any salt length; only the commit builder enforces `>= 16`. A client bypassing the builder can commit/reveal with a low-entropy salt and grind a favorable outcome. Occurs in blackjack, poker (slots), battleship (`battleship.ts:281`). **Fix**: enforce `salt.length >= MIN_SALT_LEN` on the reveal/verify path (or at commit acceptance).
+Commit-reveal `verifyCommitment` accepts any salt length; only the commit builder (`computeCommitment`) enforces `>= 16`. Occurs in blackjack, poker (slots), battleship (`battleship.ts:281`).
+
+**Resolution — do not add a reveal-path salt check.** `verifyCommitment` (`commitment.ts:61-66`) intentionally mirrors Move `randomness::verify_commitment`, which never aborts and does not check salt length; the commit/verify asymmetry is by design. Enforcing `salt.length >= MIN_SALT_LEN` on the TS reveal path would make TS reject a reveal that the on-chain Move dispute path accepts — breaking the byte-for-byte TS/Move parity the framework depends on. The committed values (a full board / a card secret) are themselves high-entropy, so a short salt enables no practical grind: a non-compliant client that bypasses the builder only weakens its own secrecy. `commitment.ts` is upstream-authoritative (CLAUDE.md) and must not diverge. Left as-is in poker and blackjack for the same reason.
 
 ### Pattern D — With-replacement card derivation → impossible hands
 
@@ -66,7 +68,7 @@ Pattern A above. Systemic fairness defect across poker, TTT, caro.
 ### M2. Chicken-cross — simultaneous double-arrival tie is not terminal
 `cross.ts:385`. Both chickens cross on the same tick with equal scores → `winner=null`, but `isTerminal` is `winner !== null || tick >= TICK_CAP` → false. The race stalls, re-entering the push branch every tick until `TICK_CAP`. **Fix**: treat a both-arrived state as terminal (push) immediately.
 
-### M3. Salt not enforced at reveal — Pattern C (blackjack, poker, battleship).
+### M3. Salt not enforced at reveal — Pattern C (blackjack, poker, battleship). WON'T FIX — see Pattern C (deliberate Move parity; high-entropy committed values).
 
 ### M4. bombIt — seat-0 positional priority + stall-to-draw dominant
 `bombIt.ts:547` resolves seat 0 before seat 1 each tick, so A wins every contested cell. `bombIt.ts:564`: a passive seat that never bombs and dodges reaches `TICK_CAP` as a draw (stake returned) — stalling is the dominant strategy; the "decisive end" is not forced. **Fix**: resolve contested cells symmetrically (or randomize priority deterministically per tick); add aggression pressure / shrinking arena if a decisive end is desired.
@@ -82,7 +84,7 @@ Pattern A above. Systemic fairness defect across poker, TTT, caro.
 - **Caro overline (≥6) counts as a win** (`caro/board.ts:67`, `>= 5`): free-style gomoku — a rules decision, but unguarded/unconfigurable. If standard Caro/Renju is intended, an overline must not win.
 - **No early series termination** (`caro/protocol.ts:193`): a clinched best-of-N still plays all `maxGames`.
 - **Draw via `movesCount` not cross-checked against board** (`ticTacToe.ts:78`, caro:80): `movesCount` is tracked separately and (in caro) omitted from `encodeState`, so a resumed state must recompute it; a mismatch mis-calls a draw. Ties into the resume work.
-- **Battleship `encodeState` byte-packs the cell index** (`battleship.ts:368`): correct at 10×10 (cells < 256) but no static assert — a >16×16 board or larger fleet silently truncates the signed byte. Add `static_assert BATTLESHIP_CELL_COUNT <= 256 && FLEET_CELLS < 256`.
+- **Battleship `encodeState` byte-packs the cell index** (`battleship.ts:368`): correct at 10×10 (cells < 256) but no static assert — a >16×16 board or larger fleet silently truncates the signed byte. **DONE** — load-time invariant guard + tripwire test (`fix(battleship): guard the single-byte cell-index wire invariant`).
 - **Poker has no minimum-raise rule** (`quantumPoker.ts:732`): 1-chip raises allowed → micro-raise wars / griefing.
 - **Poker `next_hand` has no turn/role check** (`quantumPoker.ts:877`): either party (or a replayed message) can advance `handNo`; add a `by`/idempotency guard.
 - **Poker `deriveUniqueBoardCard` can throw mid-hand** (`quantumPoker.ts:628`): 10 000-retry cap with no settle fallback → a (vanishingly unlikely) degenerate seed leaves a stuck channel.
