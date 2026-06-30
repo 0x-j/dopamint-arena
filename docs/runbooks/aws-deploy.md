@@ -135,11 +135,12 @@ If the migration task exits with a non-zero status, stop and follow the [AWS Rol
    ```bash
    curl -fsS $(pulumi stack output backendUrl)/health/ready
    ```
-3. If the Ollama sidecar is enabled, verify the model is loaded:
+3. If the Ollama sidecar is enabled, verify the model finished loading:
    ```bash
    aws logs tail $(pulumi stack output backendLogGroup) --prefix ollama --follow
-   # In another terminal, check the chat topic endpoint responds:
-   curl -fsS $(pulumi stack output backendUrl)/v1/chat/topic
+   # Wait for a `success` line from `ollama pull` before exiting (Ctrl-C). The
+   # chat routes live under /v1/sessions/:sessionId/chat/* and require a session
+   # bearer token, so there is no unauthenticated endpoint to curl from here.
    ```
 4. Check the frontend is reachable:
    ```bash
