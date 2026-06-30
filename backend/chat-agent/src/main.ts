@@ -11,7 +11,7 @@ import {
 import { MpClient, resolveMpWsUrl } from "./mpClient.ts";
 import {
   OllamaBackendClient,
-  registerChatSession,
+  registerChatSessionWithRetry,
 } from "./ollama.ts";
 
 export function buildMpUrl(backendUrl: string): string {
@@ -38,7 +38,7 @@ export async function main(): Promise<void> {
   console.log("[chat-agent] bob address:", bobAddress);
   const sui = createSuiClient(cfg.suiRpcUrl);
   console.log("[chat-agent] registering chat session...");
-  const chatSession = await registerChatSession(
+  const chatSession = await registerChatSessionWithRetry(
     cfg.backendUrl,
     operatorAddress,
   );

@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type { OllamaSpeedOptions } from "./config.ts";
 
 export interface OllamaMessage {
@@ -34,7 +35,67 @@ export async function registerChatSession(
   if (!resp.ok) {
     throw new Error(`registerChatSession failed: ${resp.status}`);
   }
-  return (await resp.json()) as ChatSessionCredentials;
+  return parseChatSessionCredentials(await resp.json());
+}
+
+/** Reject a 200 body missing either credential field (e.g. an HTML error page). */
+function parseChatSessionCredentials(data: unknown): ChatSessionCredentials {
+  const { sessionId, statsToken } = (data ?? {}) as Record<string, unknown>;
+  if (
+    typeof sessionId !== "string" ||
+    typeof statsToken !== "string" ||
+    !sessionId ||
+    !statsToken
+  ) {
+    throw new Error(
+      `registerChatSession returned malformed credentials: ${JSON.stringify(data)}`,
+    );
+  }
+  return { sessionId, statsToken };
+}
+
+export interface RegisterChatSessionRetryOptions {
+  /** Total attempts, including the first. */
+  attempts?: number;
+  /** Base for exponential backoff; delay is `baseDelayMs * 2 ** (attempt - 1)`. */
+  baseDelayMs?: number;
+  /** Upper bound on a single backoff delay. */
+  maxDelayMs?: number;
+  /** Override the sleep (tests pass a no-op). */
+  delay?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Register a chat session, retrying with exponential backoff. The agent cannot
+ * publish transcripts without credentials, so a transient backend blip at
+ * startup must not be fatal — surface the failure only after the attempt budget
+ * is spent.
+ */
+export async function registerChatSessionWithRetry(
+  backendUrl: string,
+  userAddress: string,
+  opts: RegisterChatSessionRetryOptions = {},
+): Promise<ChatSessionCredentials> {
+  const attempts = opts.attempts ?? 5;
+  const baseDelayMs = opts.baseDelayMs ?? 500;
+  const maxDelayMs = opts.maxDelayMs ?? 10_000;
+  const delay = opts.delay ?? ((ms: number) => sleep(ms));
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await registerChatSession(backendUrl, userAddress);
+    } catch (e) {
+      lastError = e;
+      if (attempt === attempts) break;
+      const backoff = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      console.warn(
+        `[chat-agent] registerChatSession failed (attempt ${attempt}/${attempts}), retrying in ${backoff}ms:`,
+        (e as Error)?.message ?? e,
+      );
+      await delay(backoff);
+    }
+  }
+  throw lastError;
 }
 
 /**

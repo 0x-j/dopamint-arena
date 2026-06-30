@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { OllamaBackendClient } from "./ollama.ts";
+import {
+  OllamaBackendClient,
+  registerChatSession,
+  registerChatSessionWithRetry,
+} from "./ollama.ts";
 import type { OllamaSpeedOptions } from "./config.ts";
 
 const SPEED: OllamaSpeedOptions = {
@@ -110,4 +114,57 @@ test("chat surfaces a non-2xx as an error", async () => {
     "tok_test",
   );
   await assert.rejects(() => client.chat([{ role: "user", content: "hi" }]));
+});
+
+test("registerChatSession surfaces a non-2xx status", async () => {
+  mockFetch(() => new Response("boom", { status: 502 }));
+  await assert.rejects(
+    () => registerChatSession("http://localhost:8080", "0xalice"),
+    /registerChatSession failed: 502/,
+  );
+});
+
+test("registerChatSession rejects a body missing the stats token", async () => {
+  // A misconfigured ALB returning an HTML 200 or a partial JSON body must not
+  // produce a `Bearer undefined` credential that silently fails every publish.
+  mockFetch(
+    () =>
+      new Response(JSON.stringify({ sessionId: "sess_x" }), { status: 200 }),
+  );
+  await assert.rejects(
+    () => registerChatSession("http://localhost:8080", "0xalice"),
+    /malformed credentials/,
+  );
+});
+
+test("registerChatSessionWithRetry retries until the backend recovers", async () => {
+  let calls = 0;
+  mockFetch(() => {
+    calls += 1;
+    if (calls < 3) return new Response("boom", { status: 502 });
+    return new Response(
+      JSON.stringify({ sessionId: "sess_x", statsToken: "tok_x" }),
+      { status: 200 },
+    );
+  });
+  const creds = await registerChatSessionWithRetry(
+    "http://localhost:8080",
+    "0xalice",
+    { attempts: 5, delay: async () => {} },
+  );
+  assert.equal(creds.sessionId, "sess_x");
+  assert.equal(creds.statsToken, "tok_x");
+  assert.equal(calls, 3);
+});
+
+test("registerChatSessionWithRetry gives up after the attempt budget", async () => {
+  mockFetch(() => new Response("boom", { status: 502 }));
+  await assert.rejects(
+    () =>
+      registerChatSessionWithRetry("http://localhost:8080", "0xalice", {
+        attempts: 2,
+        delay: async () => {},
+      }),
+    /registerChatSession failed: 502/,
+  );
 });
