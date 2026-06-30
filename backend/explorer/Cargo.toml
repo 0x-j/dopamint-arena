@@ -14,10 +14,6 @@ path = "src/bin/indexer.rs"
 name = "api"
 path = "src/bin/api.rs"
 
-[[bin]]
-name = "migrate"
-path = "src/bin/migrate.rs"
-
 [dependencies]
 # read side (api binary) — reads via shared::SettlementStore (sqlx) + axum + fred SSE
 shared = { path = "../shared" }

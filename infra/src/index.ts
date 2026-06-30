@@ -207,8 +207,6 @@ export const clusterName = ecs.clusterName;
 export const backendLogGroup = ecs.logGroupName;
 export const backendTaskDefinitionArn = backend.taskDefinitionArn;
 export const migrationTaskDefinitionArn = backend.migrationTaskDefinitionArn;
-export const migrationTaskDefinitionFamily =
-  backend.migrationTaskDefinitionFamily;
 export const backendServiceName = backendService.serviceName;
 export const backendTargetGroupArn = alb.targetGroup.arn;
 export const backendSecurityGroupId = sgs.backend.id;
@@ -229,7 +227,6 @@ export const githubEnv = githubEnvOutputs({
   ecrUrl: ecr.repositoryUrl,
   ecsCluster: ecs.clusterName,
   ecsService: backendService.serviceName,
-  migrationTaskDefFamily: backend.migrationTaskDefinitionFamily,
   backendTaskDefFamily: backend.taskDefinition.family,
   githubDeployRoleArn: iam.githubDeployRoleArn,
   privateSubnetIds: network.privateSubnetIds,

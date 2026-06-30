@@ -108,7 +108,7 @@ Before rolling out a backend release that changes the schema, run the migration 
 ```bash
 aws ecs run-task \
   --cluster $(pulumi stack output clusterName) \
-  --task-definition $(pulumi stack output migrationTaskDefinitionFamily) \
+  --task-definition $(pulumi stack output migrationTaskDefinitionArn) \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[$(pulumi stack output privateSubnetIds --json | jq -r '.[0]')],securityGroups=[$(pulumi stack output backendSecurityGroupId)],assignPublicIp=DISABLED}"
 ```

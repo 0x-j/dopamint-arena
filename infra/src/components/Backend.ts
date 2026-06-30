@@ -6,7 +6,6 @@ export interface BackendOutputs {
   taskDefinitionArn: pulumi.Output<string>;
   migrationTaskDefinition: aws.ecs.TaskDefinition;
   migrationTaskDefinitionArn: pulumi.Output<string>;
-  migrationTaskDefinitionFamily: pulumi.Output<string>;
 }
 
 export interface BackendArgs {
@@ -232,44 +231,28 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
 
 function makeMigrationContainerDefinitions(
   args: BackendArgs,
-  databaseUrlSecretArn?: pulumi.Input<string>,
 ): pulumi.Output<string> {
   const repositoryUrl = pulumi.output(args.repositoryUrl);
   const imageTag = pulumi.output(args.imageTag);
   const logGroupName = pulumi.output(args.logGroupName);
-  const dbSecretArn = pulumi.output(databaseUrlSecretArn ?? undefined);
 
   return pulumi
-    .all([repositoryUrl, imageTag, logGroupName, dbSecretArn])
-    .apply(([repositoryUrl, imageTag, logGroupName, dbSecretArn]) => {
-      const baseContainer = {
-        name: "migrate",
-        image: `${repositoryUrl}:${imageTag}`,
-        essential: true,
-        logConfiguration: {
-          logDriver: "awslogs",
-          options: {
-            "awslogs-group": logGroupName,
-            "awslogs-region": aws.config.region ?? "us-east-1",
-            "awslogs-stream-prefix": "migrate",
-          },
-        },
-      };
-
-      if (dbSecretArn) {
-        return JSON.stringify([
-          {
-            ...baseContainer,
-            command: ["/usr/local/bin/migrate"],
-            secrets: [{ name: "DATABASE_URL", valueFrom: dbSecretArn }],
-          },
-        ]);
-      }
-
+    .all([repositoryUrl, imageTag, logGroupName])
+    .apply(([repositoryUrl, imageTag, logGroupName]) => {
       return JSON.stringify([
         {
-          ...baseContainer,
+          name: "migrate",
+          image: `${repositoryUrl}:${imageTag}`,
+          essential: true,
           command: ["sh", "-c", "echo 'no migration required'"],
+          logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+              "awslogs-group": logGroupName,
+              "awslogs-region": aws.config.region ?? "us-east-1",
+              "awslogs-stream-prefix": "migrate",
+            },
+          },
         },
       ]);
     });
@@ -278,10 +261,7 @@ function makeMigrationContainerDefinitions(
 export function createBackend(args: BackendArgs): BackendOutputs {
   const name = args.name;
   const containerDefinitions = makeContainerDefinitions(args);
-  const migrationContainerDefinitions = makeMigrationContainerDefinitions(
-    args,
-    args.databaseUrlSecretArn,
-  );
+  const migrationContainerDefinitions = makeMigrationContainerDefinitions(args);
 
   const ollamaEnabled = pulumi.output(args.ollamaEnabled ?? false);
   const taskCpu = ollamaEnabled.apply((enabled) => (enabled ? "2048" : "1024"));
@@ -327,6 +307,5 @@ export function createBackend(args: BackendArgs): BackendOutputs {
     taskDefinitionArn: taskDefinition.arn,
     migrationTaskDefinition,
     migrationTaskDefinitionArn: migrationTaskDefinition.arn,
-    migrationTaskDefinitionFamily: migrationTaskDefinition.family,
   };
 }

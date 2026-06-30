@@ -119,45 +119,6 @@ describe("backend component", () => {
     );
   });
 
-  it("runs the migrate binary when DATABASE_URL secret is configured", async () => {
-    const backend = createBackend(
-      makeBackendArgs({
-        databaseUrlSecretArn:
-          "arn:aws:secretsmanager:us-east-1:123:secret:test-db-url-AbCdEf",
-      }),
-    );
-
-    const defs = JSON.parse(
-      await awaitOutput(backend.migrationTaskDefinition.containerDefinitions),
-    );
-    const container = defs[0];
-
-    assert.ok(
-      container.command.some((c: string) =>
-        c.includes("/usr/local/bin/migrate"),
-      ),
-      "migration must run the migrate binary",
-    );
-    const dbSecret = container.secrets?.find(
-      (s: { name: string }) => s.name === "DATABASE_URL",
-    );
-    assert.ok(
-      dbSecret,
-      "DATABASE_URL must be injected via secrets[] from Secrets Manager",
-    );
-    assert.strictEqual(
-      dbSecret.valueFrom,
-      "arn:aws:secretsmanager:us-east-1:123:secret:test-db-url-AbCdEf",
-      "DATABASE_URL valueFrom must reference the secret ARN",
-    );
-    assert.ok(
-      !container.environment?.some(
-        (e: { name: string }) => e.name === "DATABASE_URL",
-      ),
-      "DATABASE_URL must never be a plaintext environment variable",
-    );
-  });
-
   it("omits the settler secret when no ARN is configured, never falling back to plaintext", async () => {
     const backend = createBackend(
       makeBackendArgs({ settlerKeySecretArn: undefined }),
