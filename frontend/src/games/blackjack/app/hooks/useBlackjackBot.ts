@@ -175,6 +175,11 @@ const STEP_MS = 900;
 // Fixing the tick (rather than 30/STEP_MS by mode) lets toggling Auto mid-tunnel resume at full
 // speed immediately, instead of staying at the slow manual cadence until the next tunnel opens.
 const TICK_MS = 20;
+// Auto/MTPS only: per-tick wall-clock budget for the flat-out step batch. ~16ms mirrors quantum
+// poker's flush cadence — long enough to drive the co-signed-update rate toward CPU-bound, short
+// enough to leave the 20ms tick headroom to paint. Manual mode ignores it (one step per tick), so
+// commit-reveal no longer caps blackjack at one update per tick (~50 TPS).
+const AUTO_BATCH_MS = 16;
 // The bot that opens a tunnel funds BOTH seats from its own gas coin, so it must hold at least
 // 2×BUY_IN (both deposits) plus gas to safely play another game; below it, auto-play stops
 // rather than risk a mid-game tx running out of gas and leaving a tunnel open. The funder
@@ -607,10 +612,10 @@ export function useBlackjackBot(): BlackjackBotGame {
           // manual mode. The tick itself always runs at TICK_MS so toggling Auto on mid-tunnel
           // resumes at full speed immediately (the delay is NOT recomputed per mode).
           let lastAutoStepAt = 0;
-          timerRef.current = setInterval(() => {
-            // Hover-paused: freeze on this frame. The same poll-and-bail shape the manual-play
-            // branch below uses while awaiting your Hit/Stand — no timer to stop and re-arm.
-            if (pausedRef.current) return;
+          // One co-signed update (or a manual wait/throttle). Closes over the loop counters; the
+          // scheduler below calls it once per tick in manual mode and in a time-budgeted batch in
+          // auto/MTPS, so the update rate is CPU-bound rather than one-per-tick.
+          const stepTick = () => {
             try {
               if (proto.isTerminal(tunnel.state)) {
                 stopTimer();
@@ -728,6 +733,23 @@ export function useBlackjackBot(): BlackjackBotGame {
               stopTimer();
               reject(err);
             }
+          };
+          timerRef.current = setInterval(() => {
+            // Hover-paused: freeze on this frame (poll-and-bail; no timer to stop and re-arm).
+            if (pausedRef.current) return;
+            // Auto/MTPS: step flat-out for a wall-clock budget per tick so the co-signed-update rate
+            // is CPU-bound (matching quantum poker's flat-out loop) instead of one update per tick.
+            // React 19 batches the per-step setView calls into a single paint per tick. Manual mode
+            // ignores the budget (the do-while runs exactly once) to stay watchable.
+            const budgetEnd =
+              Date.now() + (autoRef.current ? AUTO_BATCH_MS : 0);
+            do {
+              stepTick();
+            } while (
+              autoRef.current &&
+              timerRef.current !== null &&
+              Date.now() < budgetEnd
+            );
           }, TICK_MS);
         });
 
