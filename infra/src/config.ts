@@ -23,6 +23,10 @@ export interface InfraConfig {
   backendMinCapacity?: number;
   backendMaxCapacity?: number;
   backendTargetCpu?: number;
+  // Public sponsor guardrails. Defaults match tunnel-manager's active fallback values.
+  sponsorSenderWindowSecs: number;
+  sponsorSenderMaxPerWindow: number;
+  sponsorGlobalDailyLimit: number;
   // base64 ed25519 settler signing key. Optional: the backend boots without it
   // (Phase 0) and fails loud at settler construction if absent. Sourced from secret
   // config so it lands in Secrets Manager, never in the task definition.
@@ -70,6 +74,12 @@ export function getConfig(): InfraConfig {
     backendMinCapacity: config.getNumber("backend-min-capacity") ?? 2,
     backendMaxCapacity: config.getNumber("backend-max-capacity") ?? 10,
     backendTargetCpu: config.getNumber("backend-target-cpu") ?? 70,
+    sponsorSenderWindowSecs:
+      config.getNumber("sponsor-sender-window-secs") ?? 60,
+    sponsorSenderMaxPerWindow:
+      config.getNumber("sponsor-sender-max-per-window") ?? 120,
+    sponsorGlobalDailyLimit:
+      config.getNumber("sponsor-global-daily-limit") ?? 100_000,
     settlerKey: config.getSecret("settler-key"),
     faucetAdminToken: config.getSecret("faucet-admin-token"),
     enokiApiKey: config.getSecret("enoki-api-key"),

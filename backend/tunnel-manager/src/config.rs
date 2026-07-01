@@ -64,6 +64,13 @@ pub struct Config {
     /// Max settles executing at once on THIS instance. The limit gates before the request body is
     /// read, so worst-case settle-body memory is bounded at this × the /settle body cap. Per-instance.
     pub settle_max_concurrency: usize,
+    /// Sponsor grants allowed per sender within `sponsor_sender_window_secs`. Counts successful
+    /// sponsorship issuance, not invalid/unsponsorable requests.
+    pub sponsor_sender_max_per_window: u32,
+    /// Per-sender sponsor window length in seconds.
+    pub sponsor_sender_window_secs: i64,
+    /// Global rolling-24h cap on successful sponsorship grants.
+    pub sponsor_global_daily_limit: u64,
     pub ollama_url: Option<String>,
     pub ollama_model: Option<String>,
     /// S3 transcript archival (ADR-0023). When set, the settle handler archives the
@@ -138,6 +145,21 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(32),
+            sponsor_sender_max_per_window: std::env::var("SPONSOR_SENDER_MAX_PER_WINDOW")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(120),
+            sponsor_sender_window_secs: std::env::var("SPONSOR_SENDER_WINDOW_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(60),
+            sponsor_global_daily_limit: std::env::var("SPONSOR_GLOBAL_DAILY_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(100_000),
             ollama_url: opt("OLLAMA_URL"),
             ollama_model: opt("OLLAMA_MODEL"),
             s3_bucket: opt("S3_TRANSCRIPTS_BUCKET"),
@@ -300,6 +322,20 @@ mod tests {
         assert_eq!(c.faucet_max_per_window, 5);
         assert!(c.faucet_admin_token.is_none());
         assert!(c.mtps_admin_cap_id.is_none());
+    }
+
+    #[test]
+    fn from_env_reads_sponsor_limit_config() {
+        let _window = EnvGuard("SPONSOR_SENDER_WINDOW_SECS");
+        let _per_sender = EnvGuard("SPONSOR_SENDER_MAX_PER_WINDOW");
+        let _daily = EnvGuard("SPONSOR_GLOBAL_DAILY_LIMIT");
+        std::env::set_var("SPONSOR_SENDER_WINDOW_SECS", "30");
+        std::env::set_var("SPONSOR_SENDER_MAX_PER_WINDOW", "7");
+        std::env::set_var("SPONSOR_GLOBAL_DAILY_LIMIT", "99");
+        let c = Config::from_env().unwrap();
+        assert_eq!(c.sponsor_sender_window_secs, 30);
+        assert_eq!(c.sponsor_sender_max_per_window, 7);
+        assert_eq!(c.sponsor_global_daily_limit, 99);
     }
 
     #[test]

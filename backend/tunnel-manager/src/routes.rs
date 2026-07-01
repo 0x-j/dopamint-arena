@@ -72,6 +72,9 @@ pub(crate) mod test_support {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_sender_max_per_window: 120,
+            sponsor_sender_window_secs: 60,
+            sponsor_global_daily_limit: 100_000,
         })
     }
 }
@@ -691,12 +694,28 @@ pub(crate) async fn sponsor(
     State(state): State<SharedState>,
     Json(req): Json<SponsorRequest>,
 ) -> Response {
+    let SponsorRequest {
+        sender,
+        tx_kind_bytes,
+    } = req;
+    let sender = match crate::sui::canonical_address(&sender) {
+        Ok(a) => a,
+        Err(e) => {
+            return ApiError::resp(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bad_address",
+                &e.to_string(),
+            )
+            .into_response();
+        }
+    };
+
     // Validate FIRST against the shared anti-abuse allowlist; the returned move-call targets feed
     // Enoki's allowedMoveCallTargets. A rejection here means no provider should pay — fail loud.
-    let targets = match state.settler.validate_kind(&req.tx_kind_bytes) {
+    let targets = match state.settler.validate_kind(&tx_kind_bytes) {
         Ok(targets) => targets,
         Err(e) => {
-            tracing::warn!(sender = %req.sender, error = %e, "sponsor refused (validation)");
+            tracing::warn!(%sender, error = %e, "sponsor refused (validation)");
             return ApiError::resp(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "sponsor_refused",
@@ -706,15 +725,49 @@ pub(crate) async fn sponsor(
         }
     };
 
+    match state
+        .control
+        .claim_sponsor_slot(
+            &sender,
+            state.sponsor_sender_window_secs,
+            state.sponsor_sender_max_per_window,
+            state.sponsor_global_daily_limit,
+        )
+        .await
+    {
+        crate::store::SponsorLimitClaim::Allowed => {}
+        crate::store::SponsorLimitClaim::SenderLimited => {
+            let retry = state
+                .control
+                .sponsor_sender_window_ttl(&sender)
+                .await
+                .unwrap_or(state.sponsor_sender_window_secs);
+            return rate_limited(
+                "sponsor_sender_rate_limited",
+                "sponsor rate limit reached for this sender; try again later",
+                retry,
+            );
+        }
+        crate::store::SponsorLimitClaim::GlobalLimited => {
+            let retry = state
+                .control
+                .sponsor_global_window_ttl()
+                .await
+                .unwrap_or(crate::store::SPONSOR_GLOBAL_WINDOW_SECS);
+            return rate_limited(
+                "sponsor_daily_budget_exhausted",
+                "sponsor daily budget exhausted; try again later",
+                retry,
+            );
+        }
+    }
+
     // Enoki first when configured: it owns the gas AND executes, returning a handle the client
     // redeems via /v1/sponsor/execute. On any Enoki error (misconfig, 4xx/5xx, timeout) fall through
     // to the settler — the user's stated order. Execute-step failures are NOT recoverable here (the
     // signed bytes commit to Enoki's gas owner); the client surfaces those.
     if let Some(enoki) = &state.enoki {
-        match enoki
-            .sponsor(&req.sender, &req.tx_kind_bytes, &targets)
-            .await
-        {
+        match enoki.sponsor(&sender, &tx_kind_bytes, &targets).await {
             Ok((tx_bytes, digest)) => {
                 return Json(SponsorResponse {
                     provider: "enoki",
@@ -725,7 +778,7 @@ pub(crate) async fn sponsor(
                 .into_response();
             }
             Err(e) => {
-                tracing::warn!(sender = %req.sender, error = %e, "enoki sponsor failed; falling back to settler");
+                tracing::warn!(%sender, error = %e, "enoki sponsor failed; falling back to settler");
             }
         }
     }
@@ -733,7 +786,7 @@ pub(crate) async fn sponsor(
     // Settler fallback: wrap in settler-owned SIP-58 gas + dry-run; the client submits both sigs.
     match state
         .settler
-        .sponsor_open_fund(&req.sender, &req.tx_kind_bytes)
+        .sponsor_open_fund(&sender, &tx_kind_bytes)
         .await
     {
         Ok((tx_bytes, sponsor_signature)) => Json(SponsorResponse {
@@ -744,7 +797,9 @@ pub(crate) async fn sponsor(
         })
         .into_response(),
         Err(e) => {
-            tracing::warn!(sender = %req.sender, error = %e, "sponsor refused");
+            // Neither provider issued gas, so free the quota slot claimed before provider calls.
+            state.control.release_sponsor_slot(&sender).await;
+            tracing::warn!(%sender, error = %e, "sponsor refused");
             ApiError::resp(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "sponsor_refused",
@@ -753,6 +808,15 @@ pub(crate) async fn sponsor(
             .into_response()
         }
     }
+}
+
+fn rate_limited(code: &'static str, message: &'static str, retry_after_secs: i64) -> Response {
+    let mut resp = ApiError::resp(StatusCode::TOO_MANY_REQUESTS, code, message).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after_secs.max(1).to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
 }
 
 #[derive(Debug, Deserialize)]
@@ -1456,6 +1520,30 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    fn valid_sponsor_kind_b64() -> String {
+        use std::str::FromStr;
+
+        use base64::Engine;
+        use sui_sdk_types::{
+            Address, Command, Identifier, MoveCall, ProgrammableTransaction, TransactionKind,
+            TypeTag,
+        };
+
+        let package = Address::from_str("0x2").unwrap();
+        let coin: TypeTag = "0x2::sui::SUI".parse().unwrap();
+        let kind = TransactionKind::ProgrammableTransaction(ProgrammableTransaction {
+            inputs: vec![],
+            commands: vec![Command::MoveCall(MoveCall {
+                package,
+                module: Identifier::new("tunnel").unwrap(),
+                function: Identifier::new("create").unwrap(),
+                type_arguments: vec![coin],
+                arguments: vec![],
+            })],
+        });
+        base64::engine::general_purpose::STANDARD.encode(bcs::to_bytes(&kind).unwrap())
+    }
+
     // A settler whose faucet is configured (admin cap set) but whose RPC is unreachable — so the
     // config guards pass while any actual mint fails fast (connection refused).
     fn settler_with_admin_cap(rpc_url: &str) -> crate::sui::SuiSettler {
@@ -1465,6 +1553,109 @@ mod tests {
             crate::sui_rpc::GovernedRpc::new(rpc_url.into(), crate::sui_rpc::RpcLimits::default());
         crate::sui::SuiSettler::new(rpc, "0x2", "0x2::sui::SUI", None, None, &key, Some("0x5"))
             .expect("settler with admin cap")
+    }
+
+    #[tokio::test]
+    async fn sponsor_rejects_when_sender_window_exhausted() {
+        let mut state = test_state();
+        {
+            let s = std::sync::Arc::get_mut(&mut state).expect("unique test arc");
+            s.sponsor_sender_max_per_window = 1;
+            s.sponsor_sender_window_secs = 60;
+            s.sponsor_global_daily_limit = 100;
+        }
+        let sender = crate::sui::canonical_address("0x9").unwrap();
+        assert_eq!(
+            state.control.claim_sponsor_slot(&sender, 60, 1, 100).await,
+            crate::store::SponsorLimitClaim::Allowed
+        );
+
+        let resp = sponsor(
+            State(state),
+            Json(SponsorRequest {
+                sender: "0x9".into(),
+                tx_kind_bytes: valid_sponsor_kind_b64(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+            "429 must carry Retry-After"
+        );
+        let body: serde_json::Value = serde_json::from_str(&response_body(resp).await).unwrap();
+        assert_eq!(body["error"]["code"], "sponsor_sender_rate_limited");
+    }
+
+    #[tokio::test]
+    async fn sponsor_rejects_when_global_budget_exhausted() {
+        let mut state = test_state();
+        {
+            let s = std::sync::Arc::get_mut(&mut state).expect("unique test arc");
+            s.sponsor_sender_max_per_window = 100;
+            s.sponsor_sender_window_secs = 60;
+            s.sponsor_global_daily_limit = 1;
+        }
+        let first_sender = crate::sui::canonical_address("0x8").unwrap();
+        assert_eq!(
+            state
+                .control
+                .claim_sponsor_slot(&first_sender, 60, 100, 1)
+                .await,
+            crate::store::SponsorLimitClaim::Allowed
+        );
+
+        let resp = sponsor(
+            State(state),
+            Json(SponsorRequest {
+                sender: "0x9".into(),
+                tx_kind_bytes: valid_sponsor_kind_b64(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: serde_json::Value = serde_json::from_str(&response_body(resp).await).unwrap();
+        assert_eq!(body["error"]["code"], "sponsor_daily_budget_exhausted");
+    }
+
+    #[tokio::test]
+    async fn sponsor_releases_quota_when_all_providers_fail() {
+        let mut state = test_state();
+        {
+            let s = std::sync::Arc::get_mut(&mut state).expect("unique test arc");
+            s.sponsor_sender_max_per_window = 1;
+            s.sponsor_sender_window_secs = 60;
+            s.sponsor_global_daily_limit = 1;
+        }
+        let sender = crate::sui::canonical_address("0x9").unwrap();
+
+        let resp = sponsor(
+            State(state.clone()),
+            Json(SponsorRequest {
+                sender: "0x9".into(),
+                tx_kind_bytes: valid_sponsor_kind_b64(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "noop settler refuses before issuing gas"
+        );
+        assert!(
+            state
+                .control
+                .sponsor_sender_window_ttl(&sender)
+                .await
+                .is_none(),
+            "provider failure releases the claimed sender slot"
+        );
+        assert!(
+            state.control.sponsor_global_window_ttl().await.is_none(),
+            "provider failure releases the claimed global slot"
+        );
     }
 
     // The public faucet is 503 when the on-chain faucet is unconfigured (no AdminCap) — it never

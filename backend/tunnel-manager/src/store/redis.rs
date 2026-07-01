@@ -11,7 +11,7 @@ use fred::prelude::*;
 use futures::TryStreamExt;
 use tokio::sync::mpsc;
 
-use super::{Bus, ConnRef, ControlStore, CtrlMsg, MpStore};
+use super::{Bus, ConnRef, ControlStore, CtrlMsg, MpStore, SponsorLimitClaim};
 use crate::mp::ConnId;
 use crate::state::{GameStat, SessionRecord, StatsSnapshot, TunnelEvent, TunnelStatus};
 
@@ -34,6 +34,31 @@ const CLAIM_FAUCET_SLOT: &str = r#"
 if tonumber(redis.call('GET', KEYS[1]) or '0') >= tonumber(ARGV[2]) then return 0 end
 local n = redis.call('INCR', KEYS[1])
 if n == 1 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+return 1
+"#;
+
+// Atomically claim one sponsor grant. Returns:
+//   0 = allowed, 1 = sender window exhausted, 2 = global window exhausted.
+// KEYS[1]=sponsor:sender:<addr> KEYS[2]=sponsor:global
+// ARGV[1]=sender_window_secs ARGV[2]=sender_max ARGV[3]=global_window_secs ARGV[4]=global_max
+const CLAIM_SPONSOR_SLOT: &str = r#"
+if tonumber(redis.call('GET', KEYS[1]) or '0') >= tonumber(ARGV[2]) then return 1 end
+if tonumber(redis.call('GET', KEYS[2]) or '0') >= tonumber(ARGV[4]) then return 2 end
+local sender_n = redis.call('INCR', KEYS[1])
+if sender_n == 1 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+local global_n = redis.call('INCR', KEYS[2])
+if global_n == 1 then redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3])) end
+return 0
+"#;
+
+// Give back a claimed sponsor grant when both sponsor providers fail before issuing gas. Avoid
+// creating negative counters if the key expired or was already empty.
+// KEYS[1]=sponsor:sender:<addr> KEYS[2]=sponsor:global
+const RELEASE_SPONSOR_SLOT: &str = r#"
+for i, key in ipairs(KEYS) do
+  local n = tonumber(redis.call('GET', key) or '0')
+  if n > 0 then redis.call('DECR', key) end
+end
 return 1
 "#;
 
@@ -406,6 +431,80 @@ impl ControlStore for RedisControlStore {
         let res: Result<i64, _> = self.pool.decr(format!("faucet:count:{address}")).await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "redis release_faucet_slot decr failed");
+        }
+    }
+
+    async fn claim_sponsor_slot(
+        &self,
+        sender: &str,
+        sender_window_secs: i64,
+        sender_max_per_window: u32,
+        global_daily_limit: u64,
+    ) -> SponsorLimitClaim {
+        let res: Result<i64, _> = self
+            .pool
+            .eval(
+                CLAIM_SPONSOR_SLOT,
+                vec![
+                    format!("sponsor:sender:{sender}"),
+                    "sponsor:global".to_string(),
+                ],
+                vec![
+                    sender_window_secs.max(1).to_string(),
+                    sender_max_per_window.to_string(),
+                    crate::store::SPONSOR_GLOBAL_WINDOW_SECS.to_string(),
+                    global_daily_limit.to_string(),
+                ],
+            )
+            .await;
+        match res {
+            Ok(0) => SponsorLimitClaim::Allowed,
+            Ok(1) => SponsorLimitClaim::SenderLimited,
+            Ok(2) => SponsorLimitClaim::GlobalLimited,
+            Ok(other) => {
+                tracing::warn!(
+                    result = other,
+                    "redis claim_sponsor_slot returned unexpected code"
+                );
+                SponsorLimitClaim::GlobalLimited
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "redis claim_sponsor_slot eval failed");
+                SponsorLimitClaim::GlobalLimited
+            }
+        }
+    }
+
+    async fn sponsor_sender_window_ttl(&self, sender: &str) -> Option<i64> {
+        let ttl: Result<i64, _> = self.pool.ttl(format!("sponsor:sender:{sender}")).await;
+        match ttl {
+            Ok(secs) if secs > 0 => Some(secs),
+            _ => None,
+        }
+    }
+
+    async fn sponsor_global_window_ttl(&self) -> Option<i64> {
+        let ttl: Result<i64, _> = self.pool.ttl("sponsor:global").await;
+        match ttl {
+            Ok(secs) if secs > 0 => Some(secs),
+            _ => None,
+        }
+    }
+
+    async fn release_sponsor_slot(&self, sender: &str) {
+        let res: Result<i64, _> = self
+            .pool
+            .eval(
+                RELEASE_SPONSOR_SLOT,
+                vec![
+                    format!("sponsor:sender:{sender}"),
+                    "sponsor:global".to_string(),
+                ],
+                Vec::<String>::new(),
+            )
+            .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "redis release_sponsor_slot eval failed");
         }
     }
 
@@ -1790,6 +1889,51 @@ mod tests {
         assert!(
             s.claim_faucet_slot(&addr, 1800, 3).await,
             "a freed slot can be re-claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sponsor_slot_enforces_sender_and_global_windows() {
+        let (_redis, pool) = redis_fixture().await;
+        let s = RedisControlStore::new(pool.clone());
+        let a = format!("0x{}", uuid::Uuid::new_v4().simple());
+        let b = format!("0x{}", uuid::Uuid::new_v4().simple());
+
+        assert_eq!(
+            s.claim_sponsor_slot(&a, 60, 2, 3).await,
+            SponsorLimitClaim::Allowed
+        );
+        assert_eq!(
+            s.claim_sponsor_slot(&a, 60, 2, 3).await,
+            SponsorLimitClaim::Allowed
+        );
+        assert_eq!(
+            s.claim_sponsor_slot(&a, 60, 2, 3).await,
+            SponsorLimitClaim::SenderLimited
+        );
+        assert!(
+            s.sponsor_sender_window_ttl(&a).await.unwrap_or_default() > 0,
+            "sender window has a ttl"
+        );
+
+        assert_eq!(
+            s.claim_sponsor_slot(&b, 60, 2, 3).await,
+            SponsorLimitClaim::Allowed
+        );
+        assert_eq!(
+            s.claim_sponsor_slot("0xglobal-exhausted", 60, 2, 3).await,
+            SponsorLimitClaim::GlobalLimited
+        );
+        assert!(
+            s.sponsor_global_window_ttl().await.unwrap_or_default() > 0,
+            "global window has a ttl"
+        );
+
+        s.release_sponsor_slot(&a).await;
+        assert_eq!(
+            s.claim_sponsor_slot(&a, 60, 2, 3).await,
+            SponsorLimitClaim::Allowed,
+            "release frees one sender/global grant"
         );
     }
 

@@ -1307,6 +1307,9 @@ mod tests {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_sender_max_per_window: 120,
+            sponsor_sender_window_secs: 60,
+            sponsor_global_daily_limit: 100_000,
         });
 
         let game = format!("hold-{}", uuid::Uuid::new_v4().simple());
@@ -1481,6 +1484,9 @@ mod tests {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_sender_max_per_window: 120,
+            sponsor_sender_window_secs: 60,
+            sponsor_global_daily_limit: 100_000,
         })
     }
 

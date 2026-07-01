@@ -375,6 +375,9 @@ async fn main() -> anyhow::Result<()> {
         faucet_max_per_window: config.faucet_max_per_window,
         faucet_admin_token: config.faucet_admin_token.clone(),
         session_jwt_secret: config.session_jwt_secret.clone(),
+        sponsor_sender_max_per_window: config.sponsor_sender_max_per_window,
+        sponsor_sender_window_secs: config.sponsor_sender_window_secs,
+        sponsor_global_daily_limit: config.sponsor_global_daily_limit,
     });
     if state.session_jwt_secret.is_none() {
         tracing::warn!(

@@ -231,6 +231,9 @@ const backend = createBackend({
   ollamaModel: cfg.ollamaModel,
   ollamaImageTag: cfg.ollamaImageTag,
   corsAllowedOrigins: cfg.corsAllowedOrigins,
+  sponsorSenderWindowSecs: cfg.sponsorSenderWindowSecs,
+  sponsorSenderMaxPerWindow: cfg.sponsorSenderMaxPerWindow,
+  sponsorGlobalDailyLimit: cfg.sponsorGlobalDailyLimit,
 });
 
 const backendService = createBackendService({

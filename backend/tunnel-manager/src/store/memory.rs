@@ -8,7 +8,7 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use super::{Bus, ConnRef, ControlStore, CtrlMsg, MpStore};
+use super::{Bus, ConnRef, ControlStore, CtrlMsg, MpStore, SponsorLimitClaim};
 use crate::mp::{pairing_allowed, Checkpoint, ConnId, DirectedInvite, MatchRecord, Waiting};
 use crate::state::{
     GameStat, SessionRecord, StatsSnapshot, TunnelEvent, TunnelOwner, TunnelStatus,
@@ -36,6 +36,10 @@ pub struct InMemoryControlStore {
     // Per-address faucet rate-limit window: address -> (pulls so far, window deadline). Lazily reset
     // on read/claim (single-process dev/test; the Redis impl uses a TTL'd counter in prod).
     faucet_windows: RwLock<HashMap<String, (u32, std::time::Instant)>>,
+    // Per-sender sponsor window: sender -> (grants so far, window deadline).
+    sponsor_sender_windows: RwLock<HashMap<String, (u32, std::time::Instant)>>,
+    // Global sponsor budget: (grants so far, rolling 24h deadline).
+    sponsor_global_window: RwLock<Option<(u64, std::time::Instant)>>,
 }
 
 #[async_trait]
@@ -220,6 +224,74 @@ impl ControlStore for InMemoryControlStore {
     async fn release_faucet_slot(&self, address: &str) {
         if let Some(entry) = self.faucet_windows.write().unwrap().get_mut(address) {
             entry.0 = entry.0.saturating_sub(1);
+        }
+    }
+
+    async fn claim_sponsor_slot(
+        &self,
+        sender: &str,
+        sender_window_secs: i64,
+        sender_max_per_window: u32,
+        global_daily_limit: u64,
+    ) -> SponsorLimitClaim {
+        let now = std::time::Instant::now();
+        let sender_window = std::time::Duration::from_secs(sender_window_secs.max(1) as u64);
+        let global_window =
+            std::time::Duration::from_secs(super::SPONSOR_GLOBAL_WINDOW_SECS as u64);
+
+        let mut senders = self.sponsor_sender_windows.write().unwrap();
+        let sender_entry = senders
+            .entry(sender.to_owned())
+            .or_insert((0, now + sender_window));
+        if sender_entry.1 <= now {
+            *sender_entry = (0, now + sender_window);
+        }
+        if sender_entry.0 >= sender_max_per_window {
+            return SponsorLimitClaim::SenderLimited;
+        }
+
+        let mut global = self.sponsor_global_window.write().unwrap();
+        let global_entry = global.get_or_insert((0, now + global_window));
+        if global_entry.1 <= now {
+            *global_entry = (0, now + global_window);
+        }
+        if global_entry.0 >= global_daily_limit {
+            return SponsorLimitClaim::GlobalLimited;
+        }
+
+        sender_entry.0 += 1;
+        global_entry.0 += 1;
+        SponsorLimitClaim::Allowed
+    }
+
+    async fn sponsor_sender_window_ttl(&self, sender: &str) -> Option<i64> {
+        let now = std::time::Instant::now();
+        self.sponsor_sender_windows
+            .read()
+            .unwrap()
+            .get(sender)
+            .filter(|(count, deadline)| *count > 0 && *deadline > now)
+            .and_then(|(_, deadline)| deadline.checked_duration_since(now))
+            .map(|d| d.as_secs() as i64)
+    }
+
+    async fn sponsor_global_window_ttl(&self) -> Option<i64> {
+        let now = std::time::Instant::now();
+        self.sponsor_global_window
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|(count, deadline)| *count > 0 && *deadline > now)
+            .and_then(|(_, deadline)| deadline.checked_duration_since(now))
+            .map(|d| d.as_secs() as i64)
+    }
+
+    async fn release_sponsor_slot(&self, sender: &str) {
+        if let Some(entry) = self.sponsor_sender_windows.write().unwrap().get_mut(sender) {
+            entry.0 = entry.0.saturating_sub(1);
+        }
+        if let Some((count, _deadline)) = self.sponsor_global_window.write().unwrap().as_mut() {
+            *count = count.saturating_sub(1);
         }
     }
 

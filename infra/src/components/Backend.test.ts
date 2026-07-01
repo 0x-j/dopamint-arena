@@ -55,6 +55,15 @@ describe("backend component", () => {
       ),
       "must receive REDIS_CACHE_URL",
     );
+    const env = Object.fromEntries(
+      container.environment.map((e: { name: string; value: string }) => [
+        e.name,
+        e.value,
+      ]),
+    );
+    assert.strictEqual(env.SPONSOR_SENDER_WINDOW_SECS, "60");
+    assert.strictEqual(env.SPONSOR_SENDER_MAX_PER_WINDOW, "120");
+    assert.strictEqual(env.SPONSOR_GLOBAL_DAILY_LIMIT, "100000");
 
     // The settler signing key is a private key: it must be injected from Secrets
     // Manager, never baked into the task definition as plaintext (readable via

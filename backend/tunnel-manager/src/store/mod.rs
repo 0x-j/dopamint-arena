@@ -17,6 +17,8 @@ use async_trait::async_trait;
 /// Bounded depth of the recent-events display ring (ADR-0005). Newest-first; older rows
 /// fall off. The durable record lives on-chain + Walrus, so this is display-only.
 pub const RECENT_EVENTS_CAP: usize = 50;
+/// Global sponsor budget window: a rolling 24h cap over successful sponsorship grants.
+pub const SPONSOR_GLOBAL_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Bounded depth of the set-once `tunnel_id → owner` map. Generous vs. the 50-row display
 /// window; on a miss ownership degrades to `None` (no highlight), so a cap is always safe.
@@ -26,6 +28,13 @@ pub const TUNNEL_OWNER_CAP: usize = 2000;
 pub struct ConnRef {
     pub instance_id: String,
     pub conn_id: crate::mp::ConnId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SponsorLimitClaim {
+    Allowed,
+    SenderLimited,
+    GlobalLimited,
 }
 
 #[async_trait]
@@ -66,6 +75,22 @@ pub trait ControlStore: Send + Sync {
     /// Give back a slot for `address` (a claimed pull whose mint then failed), so a transient error
     /// does not burn one of the window's allowed pulls.
     async fn release_faucet_slot(&self, address: &str);
+    /// Claim one sponsor grant for `sender`, enforcing both a per-sender fixed window and a global
+    /// rolling 24h budget. Returns the first exhausted limit without consuming any slot. Store errors
+    /// fail closed as `GlobalLimited`, since the safe behavior is to stop sponsoring gas.
+    async fn claim_sponsor_slot(
+        &self,
+        sender: &str,
+        sender_window_secs: i64,
+        sender_max_per_window: u32,
+        global_daily_limit: u64,
+    ) -> SponsorLimitClaim;
+    /// Seconds until `sender`'s sponsor window resets, or `None` when no active window exists.
+    async fn sponsor_sender_window_ttl(&self, sender: &str) -> Option<i64>;
+    /// Seconds until the global sponsor budget window resets, or `None` when no active window exists.
+    async fn sponsor_global_window_ttl(&self) -> Option<i64>;
+    /// Give back a claimed sponsor grant when all sponsor providers fail before issuing gas.
+    async fn release_sponsor_slot(&self, sender: &str);
     /// PING the cache cluster (for /health/ready). In-memory is always ready.
     async fn ready(&self) -> bool;
 }

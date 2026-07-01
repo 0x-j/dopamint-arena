@@ -43,6 +43,24 @@ describe("config", () => {
     assert.strictEqual(cfg.dbServerless, false);
     assert.strictEqual(cfg.cacheNodeType, "cache.t3.micro");
     assert.strictEqual(cfg.backendImageTag, "test-sha");
+    assert.strictEqual(cfg.sponsorSenderWindowSecs, 60);
+    assert.strictEqual(cfg.sponsorSenderMaxPerWindow, 120);
+    assert.strictEqual(cfg.sponsorGlobalDailyLimit, 100_000);
+  });
+
+  it("reads sponsor limit overrides", () => {
+    setPulumiConfig({
+      ...baseConfig,
+      "dopamint:sponsor-sender-window-secs": "30",
+      "dopamint:sponsor-sender-max-per-window": "7",
+      "dopamint:sponsor-global-daily-limit": "99",
+    });
+
+    const cfg = getConfig();
+
+    assert.strictEqual(cfg.sponsorSenderWindowSecs, 30);
+    assert.strictEqual(cfg.sponsorSenderMaxPerWindow, 7);
+    assert.strictEqual(cfg.sponsorGlobalDailyLimit, 99);
   });
 
   it("leaves backend image tag unset for live resolution", () => {

@@ -94,6 +94,12 @@ pub struct AppState {
     /// HS256 secret for the arena session-JWT gate (auth.rs, B5). `None` disables the gate so
     /// `arena_allocate` stays unauthenticated — the rollout switch; set it to enforce.
     pub session_jwt_secret: Option<String>,
+    /// Sponsor grants allowed per sender within `sponsor_sender_window_secs`.
+    pub sponsor_sender_max_per_window: u32,
+    /// Per-sender sponsor window length in seconds.
+    pub sponsor_sender_window_secs: i64,
+    /// Global rolling-24h cap on successful sponsorship grants.
+    pub sponsor_global_daily_limit: u64,
 }
 
 pub type SharedState = std::sync::Arc<AppState>;
@@ -158,6 +164,9 @@ impl AppState {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_sender_max_per_window: 120,
+            sponsor_sender_window_secs: 60,
+            sponsor_global_daily_limit: 100_000,
         })
     }
 }
