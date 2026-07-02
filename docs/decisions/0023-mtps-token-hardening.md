@@ -28,7 +28,7 @@ are follow-ups.)
 1. **No permissionless mint.** `AdminCap` wraps the `TreasuryCap`; `admin_mint(cap, amount,
    recipient)` is the only mint path, and `burn(cap, coin)` the only burn. No shared faucet, no
    supply cap, no `can_mint` kill switch — the sole authority is who holds the cap. `admin_mint`
-   keeps one per-call sanity bound (`MAX_MINT_PER_CALL` = 1M MTPS, ~100× the biggest real faucet
+   keeps one per-call sanity bound (`MAX_MINT_PER_CALL` = 10B MTPS, ~1M× the biggest real faucet
    pull): **not** an attacker defense (admin-only already covers that) but a guardrail bounding a
    backend bug (a stray large value) minting an absurd amount. The `AdminCap` is `key`-only (no
    `store`) — it cannot be transferred after `init`, so the package **must be published by the

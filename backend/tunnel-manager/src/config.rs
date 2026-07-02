@@ -34,9 +34,9 @@ pub struct Config {
     pub mtps_admin_cap_id: Option<String>,
     /// Whole-token MTPS one public-faucet pull mints (0 decimals; ADR-0023).
     pub faucet_user_amount: u64,
-    /// Whole-token MTPS the internal faucet mints by default (caps at the contract's
-    /// `MAX_MINT_PER_CALL`). The internal endpoint may request less, never more.
-    pub faucet_internal_amount: u64,
+    /// Whole-token MTPS the internal faucet mints by default (capped at the contract's
+    /// `MAX_MINT_PER_CALL` = 10B). The internal endpoint may request less, never more.
+    pub faucet_internal_amount: u64, // Capped at `crate::sui::MAX_MINT_PER_CALL` (10B)
     /// Public-faucet rate-limit window, seconds (the period `faucet_max_per_window` is counted over).
     pub faucet_cooldown_secs: i64,
     /// Max public-faucet pulls allowed per address within one window. Default 5 (per 30 min).

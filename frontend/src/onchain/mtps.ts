@@ -67,7 +67,7 @@ export interface FaucetMintResult {
 
 /** Per-call mint ceiling, mirroring the backend `MAX_MINT_PER_CALL` / `mtps::admin_mint` (ADR-0023).
  *  The internal endpoint rejects an `amount` outside `1..=MTPS_MAX_MINT_PER_CALL`. */
-export const MTPS_MAX_MINT_PER_CALL = 1_000_000;
+export const MTPS_MAX_MINT_PER_CALL = 10_000_000_000;
 
 /**
  * Internal (unlimited, no-cooldown) MTPS faucet for ops use (`POST /v1/faucet/internal`, ADR-0023).

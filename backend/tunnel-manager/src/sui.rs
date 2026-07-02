@@ -45,7 +45,7 @@ const MAX_SETTLE_SPLIT_DEPTH: u32 = 7;
 const SPONSOR_GAS_BUDGET_PER_COMMAND: u64 = 100_000_000;
 /// Per-call mint cap, mirroring `mtps::admin_mint`'s `MAX_MINT_PER_CALL` (ADR-0023). The faucet
 /// pre-checks against this so an over-cap request returns a clean 422 instead of an on-chain abort.
-pub const MAX_MINT_PER_CALL: u64 = 1_000_000;
+pub const MAX_MINT_PER_CALL: u64 = 10_000_000_000;
 /// 0x2 Sui framework — the only non-tunnel package the sponsor allows, for `public_share_object`.
 const SUI_FRAMEWORK_ADDRESS: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002";

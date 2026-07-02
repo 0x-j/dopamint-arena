@@ -145,14 +145,14 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
           {
             name: "TUNNEL_COIN_TYPE",
             value:
-              "0xe0f8eae320959eb7300cb599a6e7a287355c60b299a7e80a808d9196e0aea8ea::mtps::MTPS",
+              "0xf62966a08ab983e10224012bace10d2189ee9af4d67f0640bacb1f6d561ec83b::mtps::MTPS",
           },
           // AdminCap the faucet signs admin_mint with (ADR-0023). Must be owned by the settler
           // key and belong to TUNNEL_COIN_TYPE's package; unset => both faucet routes 503.
           {
             name: "MTPS_ADMIN_CAP_ID",
             value:
-              "0x7cc2d628c6ceeefb1e48502b0900eac5bc77f2dd9d170bdc339053e38b03ceae",
+              "0x097e56a11cee007f947a719ed82811f42f1a903d989e79a21ae5a3dc90a83aac",
           },
           {
             name: "WALRUS_PUBLISHER_URL",

@@ -62,7 +62,7 @@ owns the `AdminCap`). Set on the `tunnel-manager`:
 
 - `MTPS_ADMIN_CAP_ID` = the **`AdminCap`** object id captured in step 1. Unset → both faucet routes
   return 503 (disabled).
-- `FAUCET_USER_AMOUNT` (default 10000) and `FAUCET_COOLDOWN_SECS` (default 1800) — the public
+- `FAUCET_USER_AMOUNT` (default 100000) and `FAUCET_COOLDOWN_SECS` (default 1800) — the public
   faucet's per-pull amount and per-address rate limit.
 - `FAUCET_INTERNAL_AMOUNT` (default 1000000, the contract's `MAX_MINT_PER_CALL`) — the internal
   faucet's default mint.

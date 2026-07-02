@@ -30,8 +30,8 @@ const DECIMALS: u8 = 0;
 
 /// Per-call sanity bound on `admin_mint`. NOT an attacker defense — minting is already
 /// AdminCap-only — but a guardrail bounding a backend bug (a stray large value) minting an
-/// absurd amount. 1M MTPS is ~100x the biggest real faucet pull (10k MTPS).
-const MAX_MINT_PER_CALL: u64 = 1_000_000; // 1M MTPS (0 decimals → whole tokens)
+/// absurd amount. 10B MTPS is ~1M× the biggest real faucet pull (10k MTPS).
+const MAX_MINT_PER_CALL: u64 = 10_000_000_000; // 10B MTPS (0 decimals → whole tokens)
 
 /// `admin_mint` was called with `amount` above `MAX_MINT_PER_CALL`.
 const EAmountTooLarge: u64 = 0;
