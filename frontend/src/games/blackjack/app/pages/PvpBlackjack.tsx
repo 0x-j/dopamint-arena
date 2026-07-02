@@ -533,12 +533,9 @@ export default function PvpBlackjack() {
                       </button>
                     )}
                     <button
-                      onClick={g.queue}
+                      onClick={g.playArena}
                       disabled={
-                        !funded ||
-                        g.stake < BigInt(MIN_BUYIN) ||
-                        g.phase === "queuing" ||
-                        g.phase === "connecting"
+                        g.phase === "queuing" || g.phase === "connecting"
                       }
                       className="qp-btn qp-btn--go w-full !py-5 !text-xl font-black uppercase tracking-widest disabled:opacity-40"
                     >
@@ -622,7 +619,7 @@ export default function PvpBlackjack() {
               <button
                 onClick={() => {
                   g.leave();
-                  g.queue();
+                  g.playArena();
                 }}
                 className="qp-btn qp-btn--go !px-4 !py-2 !text-sm font-black uppercase"
               >

@@ -95,8 +95,11 @@ export function useArenaAutoEnter(): void {
       const r = await signAndExecute({ transaction: tx });
       return { digest: r.digest };
     };
-    // Configure the process-wide batcher before the open-window guard so lazy add-a-game deposits
-    // still have a signer even when no arena window was open at connect (PR #178).
+    // Configure the process-wide batcher with this wallet's signer/sponsor UNCONDITIONALLY on connect —
+    // BEFORE the open-games guard below. `enterArena`'s default `open` (requestTunnelOpen) coalesces
+    // seat-A deposits into ONE PTB (PR #95); the add-a-game lazy path (`requestArenaGame`) rides the
+    // same batcher, so it must be configured even when NO arena window was open at connect — else that
+    // later deposit flushes with null deps and silently fails.
     configureSharedBatcher({
       reads: client as never,
       sponsoredSignExec: sponsored.signExec,

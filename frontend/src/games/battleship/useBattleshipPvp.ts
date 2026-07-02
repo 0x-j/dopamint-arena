@@ -52,6 +52,7 @@ import {
 } from "./engine/fleet";
 import { randomSalts } from "./engine/merkle";
 import type { ArenaAllocation } from "@/onchain/arenaEnter";
+import { runArenaPlay } from "@/onchain/arenaPlay";
 import {
   consumeArenaEntry,
   subscribeArena,
@@ -94,6 +95,8 @@ export interface BattleshipPvp {
   error: string | null;
   /** Commit the placed fleet and join matchmaking. */
   findMatch: (placements: Placement[]) => void;
+  /** Commit the placed fleet and enter an on-demand arena match vs a server bot. */
+  playArena: (placements: Placement[]) => void;
   fire: (cell: number) => void;
   /** True while client-side autopilot fires YOUR shots. Settlement still waits for
    *  the game to end (single-game tunnel); either seat's close finalizes it. */
@@ -680,12 +683,17 @@ class PvpSession {
   };
 
   /** Arena entry (ADR-0028): join a pre-allocated match whose tunnel the fleet already created +
-   *  funded seat B for. This seat (always A) deposits nothing (batched by the caller's `enterArena`,
-   *  one wallet popup) and plays on AUTOPILOT vs the fleet bot — the user placed no ships, so a random
-   *  fleet is generated for the seat (they can toggle Auto off to take over). No "ready" wait: the bot
-   *  enters its loop the instant its tunnel opens and the relay buffers our first frame. `eph` is the
-   *  SAME per-game key baked into the tunnel at allocate (a different key rejects every co-signature). */
-  enterArenaMatch = (allocation: ArenaAllocation, eph: KeyPair) => {
+   *  funded seat B for. This seat (always A) deposits nothing (batched by the caller's `enterArena` /
+   *  `playArena`, one wallet popup). `userPlacements` (arena Play from the placement board) is the
+   *  fleet the user placed — they play it manually; when absent (store-consumer auto-enter) a random
+   *  fleet is generated on AUTOPILOT (they can toggle Auto off). No "ready" wait: the bot enters its
+   *  loop the instant its tunnel opens and the relay buffers our first frame. `eph` is the SAME
+   *  per-game key baked into the tunnel at allocate (a different key rejects every co-signature). */
+  enterArenaMatch = (
+    allocation: ArenaAllocation,
+    eph: KeyPair,
+    userPlacements?: Placement[],
+  ) => {
     const deps = this.deps;
     if (!deps?.account) {
       this.error = "connect a wallet first";
@@ -696,15 +704,16 @@ class PvpSession {
     const wallet = deps.account.address;
     installResumePersistence();
     evictExpiredRecords();
-    // Auto-place a fleet for the user's seat and turn autopilot ON (the seat fires automatically).
-    const placements = placeFleetRandom(Math.random);
+    // User-placed fleet ⇒ play it (Auto per the sticky pref, OFF on a fresh load). No placement ⇒
+    // auto-place a random fleet and turn autopilot ON so the window comes alive without ship placement.
+    const placements = userPlacements ?? placeFleetRandom(Math.random);
     this.placements = placements;
     const secret = makeFleetSecret(
       placementsToBoard(placements),
       randomSalts(),
     );
     this.secret = secret;
-    this.auto = true;
+    this.auto = userPlacements ? defaultAuto("battleship") : true;
 
     void (async () => {
       try {
@@ -774,6 +783,53 @@ class PvpSession {
         this.fail(e);
       }
     })();
+  };
+
+  /**
+   * On-demand arena entry: the "Play" trigger for a battleship window the connect-time batch didn't
+   * allocate. Reserve a bot for battleship + deposit seat A in one wallet popup, then hand off to
+   * enterArenaMatch with the fleet the user just placed. Sets `funding` first so the window shows
+   * progress instead of a dead placement board.
+   */
+  playArena = (placements: Placement[]) => {
+    const deps = this.deps;
+    if (!deps?.account) {
+      this.error = "connect a wallet first";
+      this.status = "error";
+      this.emit();
+      return;
+    }
+    const wallet = deps.account.address;
+    installResumePersistence();
+    evictExpiredRecords();
+
+    const stake: StakeStrategy = {
+      sponsoredSignExec: deps.sponsoredSignExec as never,
+      walletSignExec: deps.signExec as never,
+      prepareStake: deps.prepareStake,
+      selectStakeCoin: deps.selectStakeCoin,
+      ensureStakeBalance: deps.ensureStakeBalance,
+    };
+    void runArenaPlay({
+      arenaGameId: BATTLESHIP_ARENA_GAME_ID,
+      wallet,
+      stake,
+      label: "battleship",
+      stakePerGame: STAKE_BALANCE,
+      setBusy: () => {
+        this.error = null;
+        this.status = "funding";
+        this.emit();
+      },
+      setError: (msg) => {
+        this.error = msg;
+        this.status = "error";
+        this.emit();
+      },
+      onCaught: (e) => this.fail(e),
+      enter: (allocation, keypair) =>
+        this.enterArenaMatch(allocation, keypair, placements),
+    });
   };
 
   fire = (cell: number) => {
@@ -868,6 +924,7 @@ export function useBattleshipPvp(windowId: string): BattleshipPvp {
     opponentWallet: snap.opponentWallet,
     error: snap.error,
     findMatch: session.findMatch,
+    playArena: session.playArena,
     fire: session.fire,
     auto: snap.auto,
     setAuto: session.setAuto,

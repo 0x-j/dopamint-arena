@@ -72,14 +72,14 @@ function Status({ m }: { m: ReturnType<typeof usePvpWorldCanvas> }) {
         {busy && <div style={spinnerStyle} />}
         <div className="sketch-title">{text}</div>
         <p className="sketch-note">
-          Online PvP — co-draw one shared canvas with another human over a
-          genuine 2-party tunnel.
+          Co-draw one shared canvas with a server bot over a genuine 2-party
+          tunnel.
         </p>
         {canPlay && (
           <button
             type="button"
             className="sketch-btn sketch-btn--go"
-            onClick={m.findMatch}
+            onClick={m.playArena}
           >
             {m.status === "error" ? "Try again" : "Play"}
           </button>

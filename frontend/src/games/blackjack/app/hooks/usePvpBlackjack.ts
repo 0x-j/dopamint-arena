@@ -63,6 +63,8 @@ import {
   type BlackjackState,
 } from "sui-tunnel-ts/protocol/blackjack";
 import { blackjackMoveCodec } from "sui-tunnel-ts/protocol/blackjackCodec";
+import { runArenaPlay } from "@/onchain/arenaPlay";
+import type { StakeStrategy } from "@/onchain/stakeTunnel";
 
 /** Backend arena/`profile_for` id (= the FE registry id; single token, same both ways). Single source
  *  of truth for the arena-store consumer (below) and `GameModule.arenaGameId` (index.ts). */
@@ -148,6 +150,8 @@ export interface PvpView {
   fund: () => void;
   setStake: (amount: bigint) => void;
   queue: () => void;
+  /** On-demand arena entry: reserve a server bot for this game and play it now. */
+  playArena: () => void;
   hit: () => void;
   stand: () => void;
   bet: (amount: number) => void; // player places the next round's bet (deals the round)
@@ -1021,6 +1025,53 @@ export function usePvpBlackjack(): PvpView {
     [walletAddress, proto, client, activateSession, finishSettle],
   );
 
+  // On-demand arena entry (ADR-0028): the "Play" trigger for a blackjack window the connect-time batch
+  // didn't allocate (opened mid-session, or its entry was consumed/finished). Reserve a bot + deposit
+  // seat A in one wallet popup, then hand off to enterArenaMatch — the same path the store-consumer
+  // auto-enter uses. Sets `funding` first so the window shows progress instead of a dead lobby.
+  const playArena = useCallback(() => {
+    void (async () => {
+      if (!walletAddress) {
+        setError("Connect a wallet on the menu first");
+        setPhase("error");
+        return;
+      }
+      const signExec = async (
+        tx: Parameters<typeof signAndExecute>[0]["transaction"],
+      ) => {
+        const r = await signAndExecute({ transaction: tx });
+        return { digest: r.digest };
+      };
+      const stakeStrategy: StakeStrategy = {
+        sponsoredSignExec: sponsored.signExec,
+        walletSignExec: signExec as never,
+        prepareStake: sponsored.prepareStake,
+        selectStakeCoin: sponsored.selectStakeCoin,
+        ensureStakeBalance: sponsored.ensureStakeBalance,
+      };
+      await runArenaPlay({
+        arenaGameId: BLACKJACK_ARENA_GAME_ID,
+        wallet: walletAddress,
+        stake: stakeStrategy,
+        label: "blackjack",
+        stakePerGame: stake,
+        setBusy: () => {
+          setError(null);
+          setPhase("funding");
+        },
+        setError: (msg) => {
+          setError(msg);
+          setPhase("error");
+        },
+        onCaught: (e) => {
+          setError(e instanceof Error ? e.message : String(e));
+          setPhase("error");
+        },
+        enter: enterArenaMatch,
+      });
+    })();
+  }, [walletAddress, signAndExecute, sponsored, stake, enterArenaMatch]);
+
   // Centralized batched entry (ADR-0028): the on-connect orchestrator deposited blackjack's seat A in
   // the one batched PTB and published {allocation, keypair} to the arena store. Consume it once and
   // auto-enter — the window comes alive without a "Find match" click. Only from idle (never clobbers a
@@ -1342,6 +1393,7 @@ export function usePvpBlackjack(): PvpView {
     fund,
     setStake,
     queue,
+    playArena,
     hit,
     stand,
     bet,

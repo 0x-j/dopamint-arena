@@ -25,11 +25,14 @@ export async function allocateArenaGameForPlay(opts: {
   arenaGameId: string;
   wallet: string;
   stake: StakeStrategy;
-  /** Deposit label for logs/telemetry — the game's key (e.g. "regular-payments"). */
+  /** Deposit label for logs/telemetry — the game's key (e.g. "quantumPoker"). */
   label: string;
   stakePerGame?: bigint;
 }): Promise<{ allocation: ArenaAllocation; keypair: KeyPair } | null> {
+  // One ephemeral key: its pubkey is baked into the tunnel as party A at allocate, and the SAME key
+  // co-signs every move via `enterArenaMatch` (a different key rejects sigs), so return it to the caller.
   const eph = generateKeyPair();
+  // Deposit seat A into the fleet-pre-created tunnel (seat B already funded by the bot).
   const open = async (req: TunnelOpenRequest): Promise<string> => {
     const tunnelId = req.tunnelId;
     if (!tunnelId) throw new Error("arena deposit missing tunnelId");
@@ -55,4 +58,47 @@ export async function allocateArenaGameForPlay(opts: {
   });
   const allocation = allocations.find((a) => a.game === opts.arenaGameId);
   return allocation ? { allocation, keypair: eph } : null;
+}
+
+/** Shared `playArena` recipe: move the caller into its busy state, allocate via
+ *  `allocateArenaGameForPlay`, surface "no opponent" through the caller's own error state or a
+ *  thrown error through `onCaught`, and otherwise hand the live allocation off to the caller's
+ *  `enterArenaMatch`. Every arena game's on-demand Play trigger is this same shape — this is the
+ *  single place it lives so a game only supplies its wallet-guard, `StakeStrategy`, and
+ *  state-transition closures. */
+export async function runArenaPlay(opts: {
+  arenaGameId: string;
+  wallet: string;
+  stake: StakeStrategy;
+  label: string;
+  stakePerGame?: bigint;
+  /** Move the hook into its "funding/allocating" busy state (+ emit). */
+  setBusy: () => void;
+  /** Surface an error message (+ move to the error state). */
+  setError: (msg: string) => void;
+  /** Surface a caught throwable exactly as this hook does — the class hooks route it through
+   *  `this.fail(e)`, the functional hooks format it inline. Each hook's own formatting is
+   *  preserved here rather than centralized, since a rare non-Error throw formats differently
+   *  between the two (`fail` keeps a `.message`-bearing non-Error; the inline form stringifies it). */
+  onCaught: (e: unknown) => void;
+  /** Wire the live allocation into the match (each hook's enterArenaMatch). */
+  enter: (allocation: ArenaAllocation, keypair: KeyPair) => void;
+}): Promise<void> {
+  try {
+    opts.setBusy();
+    const entry = await allocateArenaGameForPlay({
+      arenaGameId: opts.arenaGameId,
+      wallet: opts.wallet,
+      stake: opts.stake,
+      label: opts.label,
+      stakePerGame: opts.stakePerGame,
+    });
+    if (!entry) {
+      opts.setError("no opponent available — try again in a moment");
+      return;
+    }
+    opts.enter(entry.allocation, entry.keypair);
+  } catch (e) {
+    opts.onCaught(e);
+  }
 }

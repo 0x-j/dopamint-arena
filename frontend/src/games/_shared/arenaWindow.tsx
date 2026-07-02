@@ -8,7 +8,8 @@ interface ArenaPvp {
   error: string | null;
   view: unknown;
   reset: () => void;
-  findMatch: () => void;
+  /** Idle "Play": reserve a server bot for this game and enter its tunnel. See pvpMatchHook.playArena. */
+  playArena: () => void;
   /** Back/Cancel: settles (publishes a half) when a match is live, else resets. See pvpMatchHook. */
   leave: () => void;
 }
@@ -17,7 +18,7 @@ export interface ArenaWindowSpec<Pvp extends ArenaPvp> {
   /** Disposer/label prefix (e.g. "bomb-it"). */
   game: string;
   usePvp: (windowId: string) => Pvp;
-  /** The idle screen: a single "Play" button that joins the relay queue. */
+  /** The idle screen: a single "Play" button that allocates a server bot for this game and enters. */
   Lobby: (props: { onPlay: () => void }) => ReactNode;
   /** Per-game card-chrome theme for the transitional screens. */
   screen: ArenaScreenTheme;
@@ -67,7 +68,7 @@ export function createArenaWindow<Pvp extends ArenaPvp>(
 
     if (pvp.status === "idle") {
       const { Lobby } = spec;
-      return <Lobby onPlay={() => pvp.findMatch()} />;
+      return <Lobby onPlay={() => pvp.playArena()} />;
     }
     if (pvp.status === "error")
       return screen(

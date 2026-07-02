@@ -112,8 +112,8 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
           )}
 
           <button
-            onClick={g.queue}
-            disabled={!funded || locked}
+            onClick={g.playArena}
+            disabled={locked}
             className="qp-btn qp-btn--go ttt-ctl-btn w-full uppercase tracking-widest disabled:opacity-40 flex items-center justify-center gap-2 font-black"
           >
             <span className="material-symbols-outlined text-xl">
@@ -209,7 +209,10 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
       )}
       {g.phase === "done" && (
         <button
-          onClick={g.requeue}
+          onClick={() => {
+            g.leave();
+            g.playArena();
+          }}
           className="qp-btn qp-btn--go ttt-ctl-btn w-full uppercase tracking-wider"
         >
           New match

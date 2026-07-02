@@ -167,7 +167,7 @@ function PvpGame({ windowId }: { windowId: string }) {
     view,
     error,
     opponentWallet,
-    findMatch,
+    playArena,
     fire,
     auto,
     setAuto,
@@ -238,7 +238,7 @@ function PvpGame({ windowId }: { windowId: string }) {
   } else if (status === "error") {
     content = <ErrorPane error={error} onBack={back} />;
   } else if (status === "idle") {
-    content = <PlacementBoard onReady={findMatch} ctaLabel="Play" />;
+    content = <PlacementBoard onReady={playArena} ctaLabel="Play" />;
   } else if (status === "matching" || status === "funding" || !view) {
     content = (
       <Centered>
