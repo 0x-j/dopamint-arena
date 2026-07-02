@@ -1021,16 +1021,19 @@ export class QuantumPokerSeatDriver {
 
   constructor(readonly party: Party) {}
 
-  private secretsFor(state: PokerState): SlotSecret[] | null {
-    const key = secretMapKey(state.handNo);
-    const cached = this.secretsByHand.get(key);
-    if (cached) return cached;
-
-    const localSecrets = localSecretArrayFor(state, this.party);
-    if (!localSecrets || localSecrets.some((secret) => !secret)) return null;
-
-    const secrets = localSecrets.map((secret) => copyReveal(secret!));
-    this.secretsByHand.set(key, secrets.map(copyReveal));
+  /** The seat's own hand secret to REVEAL and PERSIST with — the single source of truth. A resync
+   *  `adoptCheckpoint` swaps in the peer's public state, wiping `state.localSecretsA`; the driver's
+   *  per-hand cache survives that, so both the reveal path and the resume-record persist read HERE
+   *  instead of the adopt-stripped state field. Falls back to the state's own secret (e.g. right
+   *  after a cold-load, before the cache re-warms). Null only when we truly hold no secret. */
+  ownSecretsFor(state: PokerState): SlotSecret[] | null {
+    const cached = this.secretsByHand.get(secretMapKey(state.handNo));
+    if (cached) return cached.map(copyReveal);
+    const own = localSecretArrayFor(state, this.party);
+    if (!own || own.some((secret) => !secret)) return null;
+    const secrets = own.map((secret) => copyReveal(secret!));
+    // Warm the cache from state (cold-load path) so subsequent reads are adopt-proof.
+    this.secretsByHand.set(secretMapKey(state.handNo), secrets.map(copyReveal));
     return secrets;
   }
 
@@ -1046,26 +1049,10 @@ export class QuantumPokerSeatDriver {
     };
   }
 
-  /** Re-anchor this seat's cached hand secrets into `state`. A resync `adoptCheckpoint` swaps in the
-   *  peer's PUBLIC state, which strips our private slot secrets (they never leave this seat); the
-   *  driver still holds them (minted in `makeCommitMove`), so we push them back after any adopt.
-   *  Without this the persisted resume record captures `null` and a later cold-load rebuilds a
-   *  secret-less driver that can never reveal — the "opponent's turn" stall. No-op when we hold none
-   *  for this hand, or when `state` already carries them. */
-  restoreSecretsToState(state: PokerState): void {
-    const cached = this.secretsByHand.get(secretMapKey(state.handNo));
-    if (!cached) return;
-    const current = localSecretArrayFor(state, this.party);
-    if (current && !current.some((secret) => !secret)) return;
-    const restored = cached.map(copyReveal);
-    if (this.party === "A") state.localSecretsA = restored;
-    else state.localSecretsB = restored;
-  }
-
   makeRevealMove(state: PokerState): PokerMove | null {
     const slots = expectedQuantumPokerRevealSlots(state, this.party);
     if (slots.length === 0) return null;
-    const secrets = this.secretsFor(state);
+    const secrets = this.ownSecretsFor(state);
     if (!secrets) return null;
     return {
       kind: "reveal_slots",
@@ -1079,7 +1066,7 @@ export class QuantumPokerSeatDriver {
   }
 
   knownHoleCards(state: PokerState): number[] | null {
-    const secrets = this.secretsFor(state);
+    const secrets = this.ownSecretsFor(state);
     if (!secrets) return null;
     const cards: number[] = [];
     for (const slot of ownHoleSlots(this.party)) {

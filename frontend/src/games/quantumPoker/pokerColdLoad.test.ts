@@ -15,7 +15,7 @@ import {
   type SlotSecret,
 } from "sui-tunnel-ts/protocol/quantumPoker";
 import { pokerMoveCodec } from "sui-tunnel-ts/protocol/quantumPokerCodec";
-import { rebuildTunnel, restoreInto } from "@/pvp/resumeSession";
+import { rebuildTunnel, restoreInto, buildRecord } from "@/pvp/resumeSession";
 import {
   writeResumeRecord,
   flushResumeWrites,
@@ -304,69 +304,155 @@ test("poker mid-commit reload: pending commit keeps slot secrets so the draw can
   );
 });
 
-// Regression guard for the LIVE reconnect "opponent's turn" stall (poker + blackjack shape). On a
-// resync, `adoptCheckpoint` swaps in the peer's PUBLIC state, which strips this seat's private slot
-// secrets — but the driver still holds them (minted at commit). If they aren't pushed back into the
-// adopted state, the persisted resume record captures `null` and the next reveal can never be built
-// (`makeRevealMove` -> null -> pend=false forever). `restoreSecretsToState` re-anchors them.
-test("poker resync-adopt: driver re-anchors its secret so the record isn't wiped", () => {
+// THE decisive guard for the live reconnect stall: the REAL persist path (`buildRecord`) AFTER a
+// resync-adopt must still record the secret. `adoptCheckpoint` swaps in the peer's PUBLIC state
+// (our private slot secrets stripped); if the persist reads that state field it records a null
+// secret, and a later cold-load restores null and can never reveal — the exact field failure
+// (`secret.localSecretsA === null` in the resume record). The persist must read the driver's
+// adopt-proof store (`ownSecretsFor`) instead. Asserts BOTH the bug (state-read → null) and the fix.
+test("poker buildRecord after a resync-adopt keeps the secret (real persist path)", () => {
+  const backend = defaultBackend();
+  const keyA = generateKeyPair(),
+    keyB = generateKeyPair();
+  const tid = `0x${"5d".repeat(32)}`;
+  const BAL = { a: 10_000n, b: 10_000n };
+  const mkProto = () => new QuantumPokerProtocol(4n);
+  const loop = makeLoopback();
+  const dtA = new DistributedTunnel<PokerState, PokerMove>(
+    mkProto(),
+    {
+      tunnelId: tid,
+      self: makeEndpoint(backend, "0xA", keyA, true),
+      opponent: makeEndpoint(backend, "0xB", keyB, false),
+      selfParty: "A",
+      moveCodec: pokerMoveCodec,
+    },
+    loop.a,
+    BAL,
+  );
+  const dtB = new DistributedTunnel<PokerState, PokerMove>(
+    mkProto(),
+    {
+      tunnelId: tid,
+      self: makeEndpoint(backend, "0xB", keyB, true),
+      opponent: makeEndpoint(backend, "0xA", keyA, false),
+      selfParty: "B",
+      moveCodec: pokerMoveCodec,
+    },
+    loop.b,
+    BAL,
+  );
+  const driverA = new QuantumPokerSeatDriver("A");
+  const driverB = new QuantumPokerSeatDriver("B");
+  const rng = mulberry32(7);
+  let ts = 1n;
+  // Drive until A holds a co-signed checkpoint and its committed secret (cache warm).
+  for (let i = 0; i < 400; i++) {
+    if (dtA.latest && dtA.state.localSecretsA) break;
+    for (const party of ["A", "B"] as const) {
+      const dt = party === "A" ? dtA : dtB;
+      const driver = party === "A" ? driverA : driverB;
+      const move = driver.chooseMove(dt.state, rng);
+      if (move) dt.propose(move, ts++);
+    }
+  }
+  assert.ok(
+    dtA.latest && dtA.state.localSecretsA,
+    "drove A to a co-signed checkpoint holding its secret",
+  );
+
+  // The resync adopt: swap in the PUBLIC state (secret stripped) at the SAME checkpoint.
+  const stripped = {
+    ...dtA.state,
+    localSecretsA: null,
+    localSecretsB: null,
+    holeA: null,
+    holeB: null,
+  };
+  (
+    dtA as never as { adoptCheckpoint(s: PokerState, cp: unknown): void }
+  ).adoptCheckpoint(stripped as PokerState, dtA.latest!);
+  assert.ok(!dtA.state.localSecretsA, "adopt stripped our secret from state");
+
+  const identity = {
+    matchId: "m",
+    tunnelId: tid,
+    role: "A" as const,
+    game: "quantum-poker",
+    opponentWallet: "0xB",
+    opponentPubkeyHex: toHex(keyB.publicKey),
+    selfEphemeralSecretHex: toHex(keyA.secretKey),
+  };
+
+  // The bug: a state-reading persist records a null secret after the adopt.
+  const stateOnly = buildRecord(
+    dtA as never,
+    makePokerResumeAdapter({
+      getSecret: () => readSecret(dtA.state),
+      setSecret: () => {},
+    }) as never,
+    identity as never,
+  );
+  assert.equal(
+    (stateOnly!.secret as { localSecretsA: unknown }).localSecretsA,
+    null,
+    "reading state records a null secret (the field failure)",
+  );
+
+  // The fix: reading the driver's adopt-proof store records the real secret.
+  const fixed = buildRecord(
+    dtA as never,
+    makePokerResumeAdapter({
+      getSecret: () => {
+        const own = driverA.ownSecretsFor(dtA.state);
+        return {
+          localSecretsA: own ?? dtA.state.localSecretsA,
+          localSecretsB: dtA.state.localSecretsB,
+          holeA: dtA.state.holeA,
+          holeB: dtA.state.holeB,
+        };
+      },
+      setSecret: () => {},
+    }) as never,
+    identity as never,
+  );
+  const sec = (fixed!.secret as { localSecretsA: unknown[] | null })
+    .localSecretsA;
+  assert.ok(
+    sec && sec.every((x) => x),
+    "persist reads the adopt-proof store → record keeps the secret",
+  );
+});
+
+// The cold-load-then-immediate-adopt hole: a rebuilt driver's cache is empty, so if an adopt strips
+// state before the first reveal warms it, the only copy is lost. Warming the cache from the restored
+// state at rebuild time (the hook does this on activate) makes it adopt-proof from t=0.
+test("poker cold-load: warming the rebuilt cache from restored state survives a later strip", () => {
   const proto = new QuantumPokerProtocol(4n);
   const s0 = proto.initialState({
-    tunnelId: `0x${"5b".repeat(32)}`,
+    tunnelId: `0x${"5e".repeat(32)}`,
     initialBalances: { a: 10_000n, b: 10_000n },
   });
-  const driverA = new QuantumPokerSeatDriver("A");
-  const commitA = driverA.makeCommitMove(s0, mulberry32(3)); // mints + caches A's secret
+  const commitA = new QuantumPokerSeatDriver("A").makeCommitMove(
+    s0,
+    mulberry32(3),
+  );
   const commitB = new QuantumPokerSeatDriver("B").makeCommitMove(
     s0,
     mulberry32(9),
   );
-  assert.equal(commitA?.kind, "commit_slots");
-  const live = proto.applyMove(
+  const restored = proto.applyMove(
     proto.applyMove(s0, commitA!, "A"),
     commitB!,
     "B",
-  );
-  assert.ok(
-    live.commitA && live.localSecretsA,
-    "live state holds A's commit + secret",
-  );
+  ); // state a cold-load restores (holds A's secret, no live driver cache)
 
-  // The resync adopt: the peer advertises only PUBLIC state — our secret is stripped.
-  const adapter = makePokerResumeAdapter({
-    getSecret: () => readSecret(live),
-    setSecret: () => {},
-  });
-  const adopted = adapter.deserializeState(
-    adapter.serializeState(live) as never,
-  );
+  const rebuilt = new QuantumPokerSeatDriver("A"); // fresh driver, empty cache
+  rebuilt.ownSecretsFor(restored); // the activate-time warm
+  restored.localSecretsA = null; // an adopt strips state before any reveal
+  const own = rebuilt.ownSecretsFor(restored);
   assert.ok(
-    !adopted.localSecretsA,
-    "adopt swaps in peer public state — our secret is gone",
-  );
-  // Persisting HERE (the bug) would write a null secret → an unrecoverable cold-load.
-  const capBefore = makePokerResumeAdapter({
-    getSecret: () => readSecret(adopted),
-    setSecret: () => {},
-  }).captureSecret!() as { localSecretsA: unknown };
-  assert.equal(
-    capBefore.localSecretsA,
-    null,
-    "record would be wiped without the fix",
-  );
-
-  // The fix: the driver re-anchors its cached secret into the adopted state.
-  driverA.restoreSecretsToState(adopted);
-  assert.ok(
-    adopted.localSecretsA && adopted.localSecretsA.every((x) => x),
-    "secret re-anchored from the driver's cache",
-  );
-  const capAfter = makePokerResumeAdapter({
-    getSecret: () => readSecret(adopted),
-    setSecret: () => {},
-  }).captureSecret!() as { localSecretsA: unknown[] | null };
-  assert.ok(
-    capAfter.localSecretsA && capAfter.localSecretsA.every((x) => x),
-    "persisted record now keeps the secret across the reconnect",
+    own && own.every((x) => x),
+    "warmed cache survives the adopt-strip (no cold-load-then-adopt hole)",
   );
 });

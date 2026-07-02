@@ -509,6 +509,9 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
 
       dtRef.current = dt;
       driverRef.current = new QuantumPokerSeatDriver(info.role);
+      // Warm the fresh driver's secret cache from the (cold-load-restored) state NOW, so a resync
+      // adopt that fires before our first reveal can't strip the only copy — the cache is adopt-proof.
+      driverRef.current.ownSecretsFor(dt.state);
       autoBotRef.current = makeSeatBot(
         info.role,
         POKER_BUYIN,
@@ -622,10 +625,16 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
         tunnel: dt,
         adapter: makePokerResumeAdapter({
           getSecret: () => {
+            // Persist from the driver's authoritative secret store, NOT the state field: a resync
+            // `adoptCheckpoint` wipes `state.localSecretsA`, so reading state here records a null
+            // secret and a later cold-load can never reveal. `ownSecretsFor` survives the adopt.
             const s = dt.state;
+            const own = driverRef.current?.ownSecretsFor(s) ?? null;
             return {
-              localSecretsA: s.localSecretsA,
-              localSecretsB: s.localSecretsB,
+              localSecretsA:
+                info.role === "A" ? (own ?? s.localSecretsA) : s.localSecretsA,
+              localSecretsB:
+                info.role === "B" ? (own ?? s.localSecretsB) : s.localSecretsB,
               holeA: s.holeA,
               holeB: s.holeB,
             };
@@ -638,13 +647,10 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
             s.holeB = sec.holeB;
           },
           onReconciled: () => {
-            // A resync `adoptCheckpoint` swaps in the peer's PUBLIC state, dropping our private slot
-            // secrets — the driver still holds them, so re-anchor them into the adopted state BEFORE
-            // we try to move. Without this the next reveal can't be built and the record persists a
-            // null secret, so a later cold-load is unrecoverable — the live "opponent's turn" stall.
-            driverRef.current?.restoreSecretsToState(dt.state);
             // A resync may have advanced our state (adopt) — re-fire the plumbing/auto loop so the
             // next move (commit/reveal/next_hand, or the persona bot's bet in Auto) isn't stranded.
+            // The secret needs no re-anchoring: the driver's cache (read by `ownSecretsFor`) survives
+            // the adopt, so both the reveal and the persist stay correct.
             sync();
             maybeAutoPropose();
           },
