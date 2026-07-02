@@ -21,3 +21,5 @@ config:
     secure: AAABALSp5dVUwyAzKkW/6HTn0oMRLUrElfHtuhuCeX7CC3FVIKZW0FgoT+b2sQ+ikEWhaUiW0ROUIUXg2PyF0asVqm9jio3pTvT4A8RoZ/sgAyybMhZnAuMs5+/NMmql4doM+g==
   dopamint:wallet-pool-access-value:
     secure: AAABAK08xLJOMdTyQPKqHJBh2mAb7VNX1kVZ4fmTCo3JpccJSothKrST3kMN1a319kzmmcAxM8bYr6HrlDTiYw==
+  dopamint:session-jwt-secret:
+    secure: AAABACmcbXTw/+7uGE9YjpukLmhE4t/bX4hwExis3Hrax5+WZg93M31pAj2Oh0OqIgYBk9YYuKwV+jeTFD7JAN7PKjTMhkT9ES0gtXU80ARa52sYA3tikhS5lKhupJn/
