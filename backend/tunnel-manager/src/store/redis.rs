@@ -17,6 +17,9 @@ use crate::state::{GameStat, SessionRecord, StatsSnapshot, TunnelEvent, TunnelSt
 
 const SESSION_TTL: i64 = 24 * 3600;
 const MATCH_TTL: i64 = 6 * 3600;
+// Owner/game maps self-expire so they never grow unbounded; horizon must exceed the gap
+// between TunnelCreated and a later Closed for visible (open-ended) tunnels.
+const TUNNEL_OWNER_TTL: i64 = 24 * 3600;
 // Dedup horizon for recent-events: must exceed the indexer's worst-case cursor-replay window.
 const SEEN_TTL: i64 = 24 * 3600;
 // Count-once horizon for settled tunnels: exceeds the indexer cursor-replay window (matches SEEN_TTL).
@@ -126,6 +129,21 @@ impl ControlStore for RedisControlStore {
             .await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "redis put_session incr tunnels failed");
+        }
+        for t in &rec.tunnels {
+            let res: Result<(), _> = self
+                .pool
+                .set(
+                    format!("tunnel:game:{}", t.tunnel_id),
+                    rec.game.clone(),
+                    Some(Expiration::EX(TUNNEL_OWNER_TTL)),
+                    None,
+                    false,
+                )
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "redis put_session set tunnel game failed");
+            }
         }
     }
 
@@ -311,6 +329,69 @@ impl ControlStore for RedisControlStore {
         raws.iter()
             .filter_map(|j| serde_json::from_str(j).ok())
             .collect()
+    }
+
+    // Set-once + TTL: NX gates first-writer-wins (replays no-op); TunnelOwner has no serde derive,
+    // so the three fields are written as an explicit camelCase JSON object and read back by key.
+    async fn set_tunnel_owner(&self, tunnel_id: &str, owner: crate::state::TunnelOwner) {
+        let json = serde_json::json!({
+            "partyA": owner.party_a,
+            "partyB": owner.party_b,
+            "funder": owner.funder,
+        })
+        .to_string();
+        let res: Result<(), _> = self
+            .pool
+            .set(
+                format!("tunnel:owner:{tunnel_id}"),
+                json,
+                Some(Expiration::EX(TUNNEL_OWNER_TTL)),
+                Some(SetOptions::NX),
+                false,
+            )
+            .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "redis set_tunnel_owner set failed");
+        }
+    }
+
+    async fn get_tunnel_owner(&self, tunnel_id: &str) -> Option<crate::state::TunnelOwner> {
+        let raw: Option<String> = self
+            .pool
+            .get(format!("tunnel:owner:{tunnel_id}"))
+            .await
+            .ok()
+            .flatten();
+        let v: serde_json::Value = serde_json::from_str(&raw?).ok()?;
+        Some(crate::state::TunnelOwner {
+            party_a: v["partyA"].as_str().map(str::to_string),
+            party_b: v["partyB"].as_str().map(str::to_string),
+            funder: v["funder"].as_str().map(str::to_string),
+        })
+    }
+
+    async fn tunnel_game(&self, tunnel_id: &str) -> Option<String> {
+        self.pool
+            .get(format!("tunnel:game:{tunnel_id}"))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn set_tunnel_game(&self, tunnel_id: &str, game: &str) {
+        let res: Result<(), _> = self
+            .pool
+            .set(
+                format!("tunnel:game:{tunnel_id}"),
+                game,
+                Some(Expiration::EX(TUNNEL_OWNER_TTL)),
+                None,
+                false,
+            )
+            .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "redis set_tunnel_game set failed");
+        }
     }
 
     async fn claim_faucet_slot(
@@ -1612,6 +1693,10 @@ mod tests {
         let ev = |digest: &str| TunnelEvent {
             tunnel_id: "0xt".into(),
             kind: TunnelEventKind::Settled,
+            party_a: None,
+            party_b: None,
+            funder: None,
+            game: None,
             party_a_balance: Some(1),
             party_b_balance: Some(1),
             transcript_root: None,
@@ -1642,6 +1727,10 @@ mod tests {
         let ev = |digest: &str, p: Option<&str>| TunnelEvent {
             tunnel_id: "0xt".into(),
             kind: TunnelEventKind::Settled,
+            party_a: None,
+            party_b: None,
+            funder: None,
+            game: None,
             party_a_balance: Some(1),
             party_b_balance: Some(1),
             transcript_root: None,
@@ -1682,6 +1771,10 @@ mod tests {
         let ev = crate::state::TunnelEvent {
             tunnel_id: "0xt".into(),
             kind: crate::state::TunnelEventKind::Settled,
+            party_a: None,
+            party_b: None,
+            funder: None,
+            game: None,
             party_a_balance: Some(1),
             party_b_balance: Some(1),
             transcript_root: None,

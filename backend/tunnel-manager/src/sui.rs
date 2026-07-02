@@ -200,6 +200,12 @@ pub struct SuiSettler {
 pub struct RawTunnelEvent {
     pub type_suffix: String,
     pub tunnel_id: String,
+    /// party_a/party_b from a `TunnelCreated`'s `parsedJson`; the indexer folds them into the
+    /// ownership map (other event types carry no addresses).
+    pub party_a: Option<String>,
+    pub party_b: Option<String>,
+    /// Tx sender from the event envelope (`/sender`) — the wallet that opened/funded the tunnel.
+    pub sender: Option<String>,
     pub party_a_balance: Option<u64>,
     pub party_b_balance: Option<u64>,
     pub transcript_root: Option<String>,
@@ -213,6 +219,13 @@ fn parsed_u64(v: &serde_json::Value, field: &str) -> Option<u64> {
     f.as_str()
         .and_then(|s| s.parse().ok())
         .or_else(|| f.as_u64())
+}
+
+/// Read a Sui address string from `parsedJson` (e.g. `party_a` on `TunnelCreated`).
+fn parsed_addr(v: &serde_json::Value, field: &str) -> Option<String> {
+    v.pointer(&format!("/parsedJson/{field}"))?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// `vector<u8>` arrives as an array of byte numbers; render to lowercase hex.
@@ -253,6 +266,12 @@ fn parse_event_row(ev: &serde_json::Value) -> Option<RawTunnelEvent> {
     Some(RawTunnelEvent {
         type_suffix,
         tunnel_id,
+        party_a: parsed_addr(ev, "party_a"),
+        party_b: parsed_addr(ev, "party_b"),
+        sender: ev
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         party_a_balance: parsed_u64(ev, "party_a_balance"),
         party_b_balance: parsed_u64(ev, "party_b_balance"),
         transcript_root: parsed_bytes_hex(ev, "transcript_root"),
@@ -757,26 +776,71 @@ impl SuiSettler {
     }
 }
 
-/// Project a raw event to a displayable Transaction-Log row, or `None` if it is not one
-/// (only activations and closes are shown). `game` is left `None` for v1 — the event carries
-/// no game tag; joining `tunnel_id → game` via the session registry is a deferred follow-up.
+/// Project a raw event to a displayable row, inheriting ownership/game (which its own event does
+/// not carry). Returns `None` for non-display events (e.g. `TunnelCreated`). Missing owner/game →
+/// `None` fields → today's neutral display (no highlight, `—`), never a false attribution.
 #[allow(dead_code)]
-fn to_tunnel_event(raw: &RawTunnelEvent) -> Option<crate::state::TunnelEvent> {
+fn enrich_event_row(
+    raw: &RawTunnelEvent,
+    owner: Option<crate::state::TunnelOwner>,
+    game: Option<String>,
+) -> Option<crate::state::TunnelEvent> {
     let kind = match raw.type_suffix.as_str() {
         "TunnelActivated" => crate::state::TunnelEventKind::Opened,
         "TunnelClosed" | "TunnelClosedWithRoot" => crate::state::TunnelEventKind::Settled,
         _ => return None,
     };
+    let (party_a, party_b, funder) = match owner {
+        Some(o) => (o.party_a, o.party_b, o.funder),
+        None => (None, None, None),
+    };
     Some(crate::state::TunnelEvent {
         tunnel_id: raw.tunnel_id.clone(),
         kind,
+        party_a,
+        party_b,
+        funder,
+        game,
         party_a_balance: raw.party_a_balance,
         party_b_balance: raw.party_b_balance,
         transcript_root: raw.transcript_root.clone(),
         tx_digest: raw.tx_digest.clone(),
         timestamp_ms: raw.timestamp_ms,
-        proof_url: None, // indexer rows are explorer-only; the /settle handler sets this (Task 7)
+        proof_url: None, // indexer rows are explorer-only; the /settle handler sets proofUrl
     })
+}
+
+/// Fold one raw chain event into the store: maintain tunnel status, capture set-once ownership at
+/// `TunnelCreated` (funder = the open tx sender), then inherit owner + the joined game onto the
+/// displayed Opened/Settled row. Extracted from the poll loop so the composition is unit-testable.
+#[allow(dead_code)]
+async fn fold_event(control: &dyn crate::store::ControlStore, raw: &RawTunnelEvent) {
+    let status = match raw.type_suffix.as_str() {
+        "TunnelCreated" => Some(crate::state::TunnelStatus::Created),
+        "TunnelActivated" => Some(crate::state::TunnelStatus::Active),
+        "TunnelClosed" | "TunnelClosedWithRoot" => Some(crate::state::TunnelStatus::Closed),
+        _ => None,
+    };
+    if let Some(s) = status {
+        control.set_tunnel_status(&raw.tunnel_id, s).await;
+    }
+    if raw.type_suffix == "TunnelCreated" {
+        control
+            .set_tunnel_owner(
+                &raw.tunnel_id,
+                crate::state::TunnelOwner {
+                    party_a: raw.party_a.clone(),
+                    party_b: raw.party_b.clone(),
+                    funder: raw.sender.clone(),
+                },
+            )
+            .await;
+    }
+    let owner = control.get_tunnel_owner(&raw.tunnel_id).await;
+    let game = control.tunnel_game(&raw.tunnel_id).await;
+    if let Some(row) = enrich_event_row(raw, owner, game) {
+        control.push_recent_event(row).await;
+    }
 }
 
 /// Poll the chain for this package's tunnel events and fold them into the registry via
@@ -790,20 +854,7 @@ pub fn spawn_event_indexer(state: crate::state::SharedState) {
             match state.settler.query_tunnel_events(cursor.clone()).await {
                 Ok((events, next)) => {
                     for raw in events {
-                        let status = match raw.type_suffix.as_str() {
-                            "TunnelCreated" => Some(crate::state::TunnelStatus::Created),
-                            "TunnelActivated" => Some(crate::state::TunnelStatus::Active),
-                            "TunnelClosed" | "TunnelClosedWithRoot" => {
-                                Some(crate::state::TunnelStatus::Closed)
-                            }
-                            _ => None,
-                        };
-                        if let Some(s) = status {
-                            state.control.set_tunnel_status(&raw.tunnel_id, s).await;
-                        }
-                        if let Some(row) = to_tunnel_event(&raw) {
-                            state.control.push_recent_event(row).await;
-                        }
+                        fold_event(state.control.as_ref(), &raw).await;
                     }
                     if next.is_some() {
                         cursor = next;
@@ -2022,25 +2073,162 @@ mod tests {
         let mut closed = RawTunnelEvent {
             type_suffix: "TunnelClosedWithRoot".into(),
             tunnel_id: "0xt".into(),
+            party_a: None,
+            party_b: None,
+            sender: None,
             party_a_balance: Some(1500),
             party_b_balance: Some(500),
             transcript_root: Some("deadbeef".into()),
             tx_digest: "d1".into(),
             timestamp_ms: 9,
         };
-        let row = to_tunnel_event(&closed).expect("close is displayable");
+        let row = enrich_event_row(&closed, None, None).expect("close is displayable");
         assert_eq!(row.kind, TunnelEventKind::Settled);
         assert_eq!(row.party_a_balance, Some(1500));
         assert_eq!(row.transcript_root.as_deref(), Some("deadbeef"));
 
         closed.type_suffix = "TunnelActivated".into();
         assert_eq!(
-            to_tunnel_event(&closed).expect("activation").kind,
+            enrich_event_row(&closed, None, None)
+                .expect("activation")
+                .kind,
             TunnelEventKind::Opened
         );
 
         closed.type_suffix = "TunnelCreated".into();
-        assert!(to_tunnel_event(&closed).is_none(), "created is not a row");
+        assert!(
+            enrich_event_row(&closed, None, None).is_none(),
+            "created is not a row"
+        );
+    }
+
+    #[test]
+    fn parse_event_row_extracts_parties_and_sender_from_created() {
+        let ev = serde_json::json!({
+            "id": { "txDigest": "DIG1" },
+            "type": "0xpkg::tunnel::TunnelCreated",
+            "sender": "0xfunder",
+            "timestampMs": "1750000000000",
+            "parsedJson": { "tunnel_id": "0xt", "party_a": "0xaaa", "party_b": "0xbbb" }
+        });
+        let raw = parse_event_row(&ev).expect("created row parses");
+        assert_eq!(raw.party_a.as_deref(), Some("0xaaa"));
+        assert_eq!(raw.party_b.as_deref(), Some("0xbbb"));
+        assert_eq!(raw.sender.as_deref(), Some("0xfunder"));
+    }
+
+    #[test]
+    fn parse_event_row_has_no_parties_on_close() {
+        let ev = serde_json::json!({
+            "id": { "txDigest": "DIG2" },
+            "type": "0xpkg::tunnel::TunnelClosed",
+            "sender": "0xsomeone",
+            "timestampMs": "1",
+            "parsedJson": { "tunnel_id": "0xt", "party_a_balance": "5", "party_b_balance": "3" }
+        });
+        let raw = parse_event_row(&ev).expect("close row parses");
+        assert_eq!(raw.party_a, None);
+        assert_eq!(raw.party_b, None);
+        assert_eq!(raw.sender.as_deref(), Some("0xsomeone"));
+        assert_eq!(raw.party_a_balance, Some(5));
+    }
+
+    #[test]
+    fn enrich_inherits_owner_and_game_onto_opened_row() {
+        use crate::state::{TunnelEventKind, TunnelOwner};
+        let raw = RawTunnelEvent {
+            type_suffix: "TunnelActivated".into(),
+            tunnel_id: "0xt".into(),
+            party_a: None,
+            party_b: None,
+            sender: None, // Activated carries no addresses
+            party_a_balance: None,
+            party_b_balance: None,
+            transcript_root: None,
+            tx_digest: "D".into(),
+            timestamp_ms: 7,
+        };
+        let owner = TunnelOwner {
+            party_a: Some("0xaaa".into()),
+            party_b: Some("0xbbb".into()),
+            funder: Some("0xfff".into()),
+        };
+        let row = enrich_event_row(&raw, Some(owner), Some("blackjack".into())).unwrap();
+        assert_eq!(row.kind, TunnelEventKind::Opened);
+        assert_eq!(row.party_a.as_deref(), Some("0xaaa"));
+        assert_eq!(row.funder.as_deref(), Some("0xfff"));
+        assert_eq!(row.game.as_deref(), Some("blackjack"));
+    }
+
+    #[test]
+    fn enrich_degrades_without_owner() {
+        let closed = RawTunnelEvent {
+            type_suffix: "TunnelClosed".into(),
+            tunnel_id: "0xt".into(),
+            party_a: None,
+            party_b: None,
+            sender: None,
+            party_a_balance: Some(2),
+            party_b_balance: Some(1),
+            transcript_root: None,
+            tx_digest: "D2".into(),
+            timestamp_ms: 2,
+        };
+        let row = enrich_event_row(&closed, None, None).unwrap();
+        assert_eq!(row.party_a, None, "no owner → no false attribution");
+        assert_eq!(row.party_a_balance, Some(2));
+    }
+
+    // The fold loop's composition: a [Created, Activated, Closed] batch must capture ownership at
+    // Created (which itself yields no display row) and inherit owner + the session-joined game onto
+    // BOTH the Opened and Settled rows — including when all three arrive in the same poll batch.
+    #[tokio::test]
+    async fn fold_sequence_captures_owner_and_inherits_onto_opened_and_settled() {
+        use crate::state::TunnelEventKind;
+        use crate::store::memory::InMemoryControlStore;
+        use crate::store::ControlStore; // bring trait methods into scope for the concrete store
+        let store = InMemoryControlStore::default();
+        // game is joined from the session registry, as put_session would record it.
+        store
+            .put_session(
+                "s",
+                crate::state::SessionRecord {
+                    game: "blackjack".into(),
+                    tunnels: vec![crate::routes::TunnelRef {
+                        tunnel_id: "0xt".into(),
+                        party_a: "0xa".into(),
+                        party_b: "0xb".into(),
+                    }],
+                    stats_token: "tok".into(),
+                },
+            )
+            .await;
+        let raw = |suffix: &str, dig: &str| RawTunnelEvent {
+            type_suffix: suffix.into(),
+            tunnel_id: "0xt".into(),
+            // only TunnelCreated carries the addresses; the others must inherit them.
+            party_a: (suffix == "TunnelCreated").then(|| "0xaaa".into()),
+            party_b: (suffix == "TunnelCreated").then(|| "0xbbb".into()),
+            sender: (suffix == "TunnelCreated").then(|| "0xfff".into()),
+            party_a_balance: None,
+            party_b_balance: None,
+            transcript_root: None,
+            tx_digest: dig.into(),
+            timestamp_ms: 1,
+        };
+        fold_event(&store, &raw("TunnelCreated", "dC")).await;
+        fold_event(&store, &raw("TunnelActivated", "dA")).await;
+        fold_event(&store, &raw("TunnelClosed", "dZ")).await;
+
+        let rows = store.recent_events().await; // newest-first: [Closed, Activated]
+        assert_eq!(rows.len(), 2, "Created itself yields no display row");
+        assert_eq!(rows[0].kind, TunnelEventKind::Settled);
+        assert_eq!(rows[0].funder.as_deref(), Some("0xfff"));
+        assert_eq!(rows[0].game.as_deref(), Some("blackjack"));
+        assert_eq!(rows[1].kind, TunnelEventKind::Opened);
+        assert_eq!(rows[1].party_a.as_deref(), Some("0xaaa"));
+        assert_eq!(rows[1].party_b.as_deref(), Some("0xbbb"));
+        assert_eq!(rows[1].game.as_deref(), Some("blackjack"));
     }
 
     // The settler key loader must accept both the 32-byte raw secret and the 33-byte

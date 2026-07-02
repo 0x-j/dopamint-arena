@@ -35,6 +35,13 @@ export type TunnelEventKind = "opened" | "settled";
 export interface TunnelEvent {
   tunnelId: string;
   kind: TunnelEventKind;
+  /** On-chain parties (from TunnelCreated); null when ownership was not captured. */
+  partyA: string | null;
+  partyB: string | null;
+  /** Open tx sender (funding wallet) — identifies the owner in self-play (both parties ephemeral). */
+  funder: string | null;
+  /** Game id joined from the session registry; null for PvP/unknown. */
+  game: string | null;
   partyABalance: number | null;
   partyBBalance: number | null;
   transcriptRoot: string | null;

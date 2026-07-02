@@ -12,9 +12,13 @@ export interface TxnRow {
    */
   digest?: string;
   address?: string;
+  /** True when the connected wallet owns this tunnel — drives the "yours" highlight. */
+  mine?: boolean;
   /** Walrus transcript URL, present once a settlement is archived (see the /settle plan). */
   proofUrl?: string;
   time: string;
+  /** Raw event time (ms) for a live "N ago" label; absent on rows that only carry a formatted `time`. */
+  timestampMs?: number;
   bot: string;
   type: string;
   status: "Success" | "Failed";

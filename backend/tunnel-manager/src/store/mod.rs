@@ -18,6 +18,10 @@ use async_trait::async_trait;
 /// fall off. The durable record lives on-chain + Walrus, so this is display-only.
 pub const RECENT_EVENTS_CAP: usize = 50;
 
+/// Bounded depth of the set-once `tunnel_id → owner` map. Generous vs. the 50-row display
+/// window; on a miss ownership degrades to `None` (no highlight), so a cap is always safe.
+pub const TUNNEL_OWNER_CAP: usize = 2000;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConnRef {
     pub instance_id: String,
@@ -40,6 +44,16 @@ pub trait ControlStore: Send + Sync {
     async fn push_recent_event(&self, ev: crate::state::TunnelEvent);
     /// The ring, newest-first, capped at `RECENT_EVENTS_CAP`.
     async fn recent_events(&self) -> Vec<crate::state::TunnelEvent>;
+    // ADR-0014 ownership join: written by the indexer at `TunnelCreated`, read when enriching rows.
+    /// Record tunnel ownership, set-once (first writer wins; replays are no-ops). Bounded.
+    async fn set_tunnel_owner(&self, tunnel_id: &str, owner: crate::state::TunnelOwner);
+    /// Look up captured ownership, or `None` if not seen / evicted.
+    async fn get_tunnel_owner(&self, tunnel_id: &str) -> Option<crate::state::TunnelOwner>;
+    /// The game a tunnel belongs to, joined from the session registry; `None` for PvP/unknown.
+    async fn tunnel_game(&self, tunnel_id: &str) -> Option<String>;
+    /// Tag a tunnel with its game directly — the arena path reserves a match (no `put_session`),
+    /// so it records the join here. Same map `tunnel_game` reads.
+    async fn set_tunnel_game(&self, tunnel_id: &str, game: &str);
     /// Claim one faucet slot for `address` in a fixed `window_secs` window that allows up to
     /// `max_per_window` pulls. Returns `true` when within the limit (a slot is consumed), `false`
     /// when the window is exhausted. The window starts on the first pull and resets `window_secs`

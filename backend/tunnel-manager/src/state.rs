@@ -184,6 +184,14 @@ pub struct GameStat {
 pub struct TunnelEvent {
     pub tunnel_id: String,
     pub kind: TunnelEventKind,
+    /// On-chain parties (from `TunnelCreated`) — `None` when ownership was not captured.
+    pub party_a: Option<String>,
+    pub party_b: Option<String>,
+    /// The open tx sender (the funding wallet) — distinguishes the owner in self-play, where
+    /// both parties are ephemerals. `None` when not captured.
+    pub funder: Option<String>,
+    /// Game id joined from the session registry; `None`/PvP rows have no tag.
+    pub game: Option<String>,
     /// Payout balances — present on `settled` rows.
     pub party_a_balance: Option<u64>,
     pub party_b_balance: Option<u64>,
@@ -204,6 +212,15 @@ pub enum TunnelEventKind {
     Settled,
 }
 
+/// Set-once ownership for a tunnel, captured at `TunnelCreated`. Inherited by the displayed
+/// Opened/Settled rows (whose own events carry no addresses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelOwner {
+    pub party_a: Option<String>,
+    pub party_b: Option<String>,
+    pub funder: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +232,10 @@ mod tests {
         let ev = TunnelEvent {
             tunnel_id: "0xabc".into(),
             kind: TunnelEventKind::Settled,
+            party_a: Some("0xaaa".into()),
+            party_b: Some("0xbbb".into()),
+            funder: Some("0xfff".into()),
+            game: Some("blackjack".into()),
             party_a_balance: Some(1500),
             party_b_balance: Some(500),
             transcript_root: Some("deadbeef".into()),
@@ -225,6 +246,9 @@ mod tests {
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["tunnelId"], "0xabc");
         assert_eq!(j["kind"], "settled");
+        assert_eq!(j["partyA"], "0xaaa");
+        assert_eq!(j["funder"], "0xfff");
+        assert_eq!(j["game"], "blackjack");
         assert_eq!(j["partyABalance"], 1500);
         assert_eq!(j["txDigest"], "DiGeStXyZ");
         assert_eq!(j["proofUrl"], "https://agg/v1/blobs/abc");

@@ -206,9 +206,15 @@ async fn archive_and_publish(
             }),
         None => (String::new(), String::new()),
     };
+    // Attribute the close row to the tunnel's owner (captured at open by the indexer) so it
+    // highlights for the viewer — this push wins the per-digest dedup over the indexer's row.
+    let owner = deps.control.get_tunnel_owner(&close.tunnel_id).await;
+    let game = deps.control.tunnel_game(&close.tunnel_id).await;
     deps.control
         .push_recent_event(crate::routes::settled_event(
             &close.tunnel_id,
+            owner,
+            game,
             close.party_a_balance,
             close.party_b_balance,
             &root_hex,
@@ -318,6 +324,39 @@ mod tests {
             s3_prefix: String::new(),
         };
         (deps, queue, control)
+    }
+
+    // A settled row must carry the tunnel owner captured at open: the settle handler pushes it
+    // before the indexer's next poll and wins the per-digest dedup, so this is what makes the
+    // viewer's CLOSE row highlight (not just the open). Regression guard for that race.
+    #[tokio::test]
+    async fn settled_row_inherits_the_tunnel_owner() {
+        use crate::state::TunnelOwner;
+        let fake = Arc::new(FakeBatchSettler::new());
+        let (deps, queue, control) = deps_with(fake.clone());
+        control
+            .set_tunnel_owner(
+                &tunnel_id_for(1),
+                TunnelOwner {
+                    party_a: Some("0xME".into()),
+                    party_b: Some("0xOPP".into()),
+                    funder: Some("0xME".into()),
+                },
+            )
+            .await;
+        queue
+            .enqueue(&tunnel_id_for(1), header_for(1), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        drain_once(&deps, "w1", 16, 0).await.unwrap();
+        let rows = control.recent_events().await;
+        let row = rows.first().expect("a settled row was pushed");
+        assert_eq!(
+            row.funder.as_deref(),
+            Some("0xME"),
+            "close row inherits owner so it highlights for the viewer"
+        );
+        assert_eq!(row.party_a.as_deref(), Some("0xME"));
     }
 
     #[tokio::test]

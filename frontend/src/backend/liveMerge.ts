@@ -7,9 +7,10 @@ import { recentEventsToTxnRows } from "./recentEvents";
 export function liveOnchainTxns(
   backend: StatsSnapshot | null,
   fallback: TxnRow[],
+  viewer?: string | null,
 ): TxnRow[] {
   if (!backend) return fallback;
-  return recentEventsToTxnRows(backend.recentEvents ?? []);
+  return recentEventsToTxnRows(backend.recentEvents ?? [], viewer);
 }
 
 /** Displayed updates/sec: live local activity should remain visible even while the

@@ -14,6 +14,10 @@ const connected: StatsSnapshot = {
     {
       tunnelId: "0xt",
       kind: "settled",
+      partyA: null,
+      partyB: null,
+      funder: null,
+      game: null,
       partyABalance: 1e9,
       partyBBalance: 1e9,
       transcriptRoot: "ab",

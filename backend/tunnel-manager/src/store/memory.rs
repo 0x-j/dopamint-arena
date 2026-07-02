@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 
 use super::{Bus, ConnRef, ControlStore, CtrlMsg, MpStore};
 use crate::mp::{pairing_allowed, Checkpoint, ConnId, DirectedInvite, MatchRecord, Waiting};
-use crate::state::{GameStat, SessionRecord, StatsSnapshot, TunnelEvent, TunnelStatus};
+use crate::state::{
+    GameStat, SessionRecord, StatsSnapshot, TunnelEvent, TunnelOwner, TunnelStatus,
+};
 
 // ===== ControlStore =====
 
@@ -27,6 +29,10 @@ pub struct InMemoryControlStore {
     per_game_tunnels: RwLock<HashMap<String, u64>>,
     recent_ring: RwLock<VecDeque<TunnelEvent>>,
     seen_digests: RwLock<HashSet<String>>,
+    // ADR-0014 ownership map (set-once, FIFO-bounded); the indexer captures, the display join reads.
+    tunnel_owners: RwLock<HashMap<String, TunnelOwner>>,
+    owner_order: RwLock<VecDeque<String>>, // FIFO eviction keys, bounds tunnel_owners
+    tunnel_games: RwLock<HashMap<String, String>>,
     // Per-address faucet rate-limit window: address -> (pulls so far, window deadline). Lazily reset
     // on read/claim (single-process dev/test; the Redis impl uses a TTL'd counter in prod).
     faucet_windows: RwLock<HashMap<String, (u32, std::time::Instant)>>,
@@ -41,6 +47,12 @@ impl ControlStore for InMemoryControlStore {
             .unwrap()
             .entry(rec.game.clone())
             .or_insert(0) += rec.tunnels.len() as u64;
+        {
+            let mut games = self.tunnel_games.write().unwrap();
+            for t in &rec.tunnels {
+                games.insert(t.tunnel_id.clone(), rec.game.clone());
+            }
+        }
         self.sessions.write().unwrap().insert(id.to_owned(), rec);
     }
 
@@ -146,6 +158,36 @@ impl ControlStore for InMemoryControlStore {
 
     async fn recent_events(&self) -> Vec<TunnelEvent> {
         self.recent_ring.read().unwrap().iter().cloned().collect()
+    }
+
+    async fn set_tunnel_owner(&self, tunnel_id: &str, owner: TunnelOwner) {
+        let mut map = self.tunnel_owners.write().unwrap();
+        if map.contains_key(tunnel_id) {
+            return; // set-once
+        }
+        map.insert(tunnel_id.to_owned(), owner);
+        let mut order = self.owner_order.write().unwrap();
+        order.push_back(tunnel_id.to_owned());
+        while order.len() > super::TUNNEL_OWNER_CAP {
+            if let Some(old) = order.pop_front() {
+                map.remove(&old);
+            }
+        }
+    }
+
+    async fn get_tunnel_owner(&self, tunnel_id: &str) -> Option<TunnelOwner> {
+        self.tunnel_owners.read().unwrap().get(tunnel_id).cloned()
+    }
+
+    async fn tunnel_game(&self, tunnel_id: &str) -> Option<String> {
+        self.tunnel_games.read().unwrap().get(tunnel_id).cloned()
+    }
+
+    async fn set_tunnel_game(&self, tunnel_id: &str, game: &str) {
+        self.tunnel_games
+            .write()
+            .unwrap()
+            .insert(tunnel_id.to_owned(), game.to_owned());
     }
 
     async fn claim_faucet_slot(
@@ -425,6 +467,10 @@ mod tests {
         TunnelEvent {
             tunnel_id: tunnel.into(),
             kind: TunnelEventKind::Settled,
+            party_a: None,
+            party_b: None,
+            funder: None,
+            game: None,
             party_a_balance: Some(1),
             party_b_balance: Some(1),
             transcript_root: None,
@@ -432,6 +478,67 @@ mod tests {
             timestamp_ms: 1,
             proof_url: None,
         }
+    }
+
+    // Ownership is captured once (first writer wins) and the map is bounded: past the cap the
+    // oldest entry is evicted, after which a lookup degrades to None (no attribution, graceful).
+    #[tokio::test]
+    async fn tunnel_owner_is_set_once_and_capped() {
+        use crate::state::TunnelOwner;
+        let s = InMemoryControlStore::default();
+        let owner = |a: &str| TunnelOwner {
+            party_a: Some(a.into()),
+            party_b: Some("0xb".into()),
+            funder: Some("0xf".into()),
+        };
+        s.set_tunnel_owner("0xt", owner("0xa1")).await;
+        s.set_tunnel_owner("0xt", owner("0xLATER")).await; // set-once: ignored
+        assert_eq!(
+            s.get_tunnel_owner("0xt").await.unwrap().party_a.as_deref(),
+            Some("0xa1")
+        );
+        for i in 0..(crate::store::TUNNEL_OWNER_CAP + 10) {
+            s.set_tunnel_owner(&format!("0xc{i}"), owner("0xa")).await;
+        }
+        assert!(
+            s.get_tunnel_owner("0xt").await.is_none(),
+            "oldest evicted past cap"
+        );
+    }
+
+    // The game a tunnel belongs to is joined from the session registry at put_session; an unknown
+    // tunnel (PvP, or not seen) returns None so the display simply skips attribution.
+    #[tokio::test]
+    async fn tunnel_game_indexed_at_put_session() {
+        use crate::routes::TunnelRef;
+        let s = InMemoryControlStore::default();
+        s.put_session(
+            "sess1",
+            SessionRecord {
+                game: "blackjack".into(),
+                tunnels: vec![TunnelRef {
+                    tunnel_id: "0xt1".into(),
+                    party_a: "0xa".into(),
+                    party_b: "0xb".into(),
+                }],
+                stats_token: "tok".into(),
+            },
+        )
+        .await;
+        assert_eq!(s.tunnel_game("0xt1").await.as_deref(), Some("blackjack"));
+        assert_eq!(s.tunnel_game("0xunknown").await, None);
+    }
+
+    // The arena path reserves a match instead of registering a session, so it tags the game
+    // directly — without this the per-game tabs stay empty for every arena (user-vs-bot) row.
+    #[tokio::test]
+    async fn set_tunnel_game_tags_arena_tunnels() {
+        let s = InMemoryControlStore::default();
+        s.set_tunnel_game("0xarena", "quantumPoker").await;
+        assert_eq!(
+            s.tunnel_game("0xarena").await.as_deref(),
+            Some("quantumPoker")
+        );
     }
 
     // The faucet allows up to N pulls per window: the first N succeed, the (N+1)th is refused, and

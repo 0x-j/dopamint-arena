@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import type { ReactNode } from "react";
+import { useCurrentAccount } from "@mysten/dapp-kit";
 import { newCounters, rateReport } from "sui-tunnel-ts/telemetry/metrics";
 import type { Counters } from "sui-tunnel-ts/telemetry/metrics";
 import type { TelemetrySnapshot, TxnRow } from "../panels/types";
@@ -77,6 +78,9 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   );
   const [hasActivity, setHasActivity] = useState(false);
   const { snapshot: backend, status } = useBackendStats();
+  // Real connected wallet only (demo's fake address is never an on-chain party) — attributes
+  // live rows so the viewer's own opens/closes highlight and self-verify.
+  const viewerAddress = useCurrentAccount()?.address ?? null;
 
   const counters = useRef<Counters>(newCounters());
   const startMs = useRef<number>(Date.now());
@@ -173,7 +177,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
         ...localRate,
         updatesPerSec: displayUpdatesPerSec(backend, localRate.updatesPerSec),
       },
-      txns: liveOnchainTxns(backend, hasActivity ? txns : []),
+      txns: liveOnchainTxns(backend, hasActivity ? txns : [], viewerAddress),
       localTxns: hasActivity ? localTxns : [],
       deposits: PLACEHOLDER_SNAPSHOT.deposits,
       tpsSeries,
@@ -184,7 +188,16 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
           ? 100
           : (localRate.updates / (localRate.updates + localRate.errors)) * 100,
     };
-  }, [hasActivity, txns, localTxns, tpsSeries, botsRunning, backend, status]);
+  }, [
+    hasActivity,
+    txns,
+    localTxns,
+    tpsSeries,
+    botsRunning,
+    backend,
+    status,
+    viewerAddress,
+  ]);
 
   // Keep `report` stable across snapshot updates so consumers' callbacks that
   // depend on it (e.g. a game's start/reset) don't churn on every counter bump.

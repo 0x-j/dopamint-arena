@@ -1,6 +1,5 @@
 /** Small shared bits used across the telemetry panels. */
-import { Check, Copy, X } from "lucide-react";
-import { toast } from "sonner";
+import { Check, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import {
@@ -40,10 +39,7 @@ export function StatusIcon({ status }: { status: "Success" | "Failed" }) {
   );
 }
 
-/**
- * A truncated hash/address that links to its SuiVision page, with a copy button.
- * The link opens the explorer; the copy button (separate) yanks the full value.
- */
+/** A truncated hash/address linking to its SuiVision page. */
 export function HashLink({
   value,
   href,
@@ -54,41 +50,19 @@ export function HashLink({
   label: string;
 }) {
   return (
-    <span className="inline-flex items-center gap-1">
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <a
-            href={href}
-            target="_blank"
-            rel="noreferrer noopener"
-            className="wal-mono text-[11px] text-foreground/80 transition-colors hover:text-primary hover:underline"
-          >
-            {truncateMiddle(value)}
-          </a>
-        </TooltipTrigger>
-        <TooltipContent>Open {label} in SuiVision</TooltipContent>
-      </Tooltip>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            aria-label={`Copy ${label}`}
-            onClick={() => {
-              navigator.clipboard
-                ?.writeText(value)
-                .then(() =>
-                  toast(`${label[0].toUpperCase()}${label.slice(1)} copied`),
-                )
-                .catch(() => toast.error("Copy failed"));
-            }}
-            className="grid size-5 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-          >
-            <Copy className="size-3" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>Copy {label}</TooltipContent>
-      </Tooltip>
-    </span>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <a
+          href={href}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="wal-mono text-[11px] text-foreground/80 transition-colors hover:text-primary hover:underline"
+        >
+          {truncateMiddle(value)}
+        </a>
+      </TooltipTrigger>
+      <TooltipContent>Open {label} in SuiVision</TooltipContent>
+    </Tooltip>
   );
 }
 
