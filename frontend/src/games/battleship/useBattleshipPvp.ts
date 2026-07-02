@@ -182,7 +182,7 @@ class PvpSession {
     view: null,
     opponentWallet: null,
     error: null,
-    auto: defaultAuto("battleship"),
+    auto: defaultAuto("battleship", true),
   };
   private listeners = new Set<() => void>();
 
@@ -195,7 +195,7 @@ class PvpSession {
   private lastEnemyShot: number | null = null;
   // Client-side autopilot: when on, fire YOUR shots automatically (one tunnel = one
   // game in PvP, so the loop doesn't rematch — it just plays this game out).
-  private auto = defaultAuto("battleship");
+  private auto = defaultAuto("battleship", true);
   // Monotonic id for "My Activity" rows pushed per finished match.
   private txnId = 0;
   /** Set per live match to `settle(publishOnly)`; lets `endMatch()` publish a half outside `onConfirmed`. */

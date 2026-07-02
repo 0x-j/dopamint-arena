@@ -57,8 +57,10 @@ import {
   readResumeRecord,
   listActiveTunnels,
   clearResumeRecord,
+  flushResumeWrites,
 } from "@/pvp/resume";
 import { makePokerResumeAdapter } from "./pokerResumeAdapter";
+import { requestArenaGame } from "@/onchain/arenaLazyEntry";
 import {
   makeSeatBot,
   randomPokerPersona,
@@ -276,7 +278,7 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
   const [endRequested, setEndRequested] = useState(false);
   // Auto is OFF on a fresh page load (you play your own seat), then sticky to your last toggle —
   // tick it on and new hands let a persona bot play your seat. See autoPreference.
-  const [auto, setAutoState] = useState(() => defaultAuto(GAME_ID));
+  const [auto, setAutoState] = useState(() => defaultAuto(GAME_ID, true));
 
   const mpRef = useRef<MpClient | null>(null);
   const dtRef = useRef<PokerTunnel | null>(null);
@@ -288,9 +290,11 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
   // Auto mode: a persona bot drives this seat's BETTING. `autoRef` mirrors `auto` for use inside
   // the imperative move loop (closures that read it after toggles); `autoBotRef` is the stateless
   // kit bot built once per match.
-  const autoRef = useRef(defaultAuto(GAME_ID));
+  const autoRef = useRef(defaultAuto(GAME_ID, true));
   const autoBotRef = useRef<PokerSeatBot | null>(null);
   const channelRef = useRef<PvpChannel | null>(null);
+  const resumeRetryRef = useRef(0);
+  const arenaEnteredRef = useRef(false);
   const detachResumeRef = useRef<(() => void) | null>(null);
   // Early-end: once either seat asks to settle, stop dealing new hands and close at the next clean
   // hand boundary. `settlingRef` guards the single close; `settleNowRef` lets the button/peer
@@ -324,7 +328,7 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
     selfPartyRef.current = null;
     autoNonceRef.current = -1n;
     // Reset Auto to the session default (ON the first time, else your last toggle).
-    autoRef.current = defaultAuto(GAME_ID);
+    autoRef.current = defaultAuto(GAME_ID, true);
     autoBotRef.current = null;
     setAutoState(autoRef.current);
     channelRef.current = null;
@@ -1092,8 +1096,56 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
           opponentPubkeyHex: rec.opponentPubkeyHex,
           selfEphemeralSecretHex: rec.selfEphemeralSecretHex!,
         });
-        await mp.connect();
+        try {
+          await mp.connect();
+        } catch (connErr) {
+          // Resume connect failed — commonly a 2nd socket for this wallet racing the relay's
+          // routing right after a freeze/reconnect. Preserve the resume record and retry with
+          // backoff so the relay can clean up the old session. Only clear after exhausting retries.
+          console.warn("[poker:resume] connect failed, will retry", connErr);
+          const tid = tunnel.tunnelId;
+          reset();
+          const attempt = resumeRetryRef.current;
+          if (attempt < 2) {
+            resumeRetryRef.current = attempt + 1;
+            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+            resume();
+            return;
+          }
+          resumeRetryRef.current = 0;
+          clearResumeRecord(tid);
+          console.warn(
+            "[poker:resume] exhausted, requesting fresh arena allocation",
+          );
+          // reset() already set status to "idle" above; re-arm the arena guard so the
+          // lazy allocation's entry can be consumed by the arena-entry subscriber.
+          arenaEnteredRef.current = false;
+          if (account?.address)
+            requestArenaGame(ARENA_GAME_ID, account.address);
+          return;
+        }
         maybeAutoPropose();
+        // Resume watchdog (mirrors the shared kit's armResumeWatchdog): if the co-located bot
+        // never answers the resync — it exited past its grace, or the displayState!==state guard
+        // suppressed the auto-kick — don't hang at "playing". Drop the record and start a fresh
+        // match (poker's own natural-end recovery). Disarms on the first confirmed frame; a stale
+        // timer is ignored once a newer mp has replaced this one.
+        {
+          const resumed = tunnel;
+          let answered = false;
+          const prevConfirmed = resumed.onConfirmed;
+          resumed.onConfirmed = (u) => {
+            answered = true;
+            resumed.onConfirmed = prevConfirmed;
+            prevConfirmed?.(u);
+          };
+          setTimeout(() => {
+            if (answered || mpRef.current !== mp) return;
+            clearResumeRecord(resumed.tunnelId);
+            reset();
+            findMatchRef.current?.();
+          }, 10_000);
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
         setStatus("error");
@@ -1112,11 +1164,24 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
     resume();
   }, [resume]);
 
+  // Close the relay on unmount so the desktop freeze (which unmounts the game while frozen)
+  // actually stops self-play, and a normal window close doesn't leak the socket. ttt/blackjack
+  // already close mp on unmount; poker was missing this.
+  useEffect(
+    () => () => {
+      flushResumeWrites();
+      detachResumeRef.current?.();
+      mpRef.current?.close();
+      mpRef.current = null;
+    },
+    [],
+  );
+
   // Centralized batched entry (ADR-0028): the on-connect orchestrator deposited this game's seat A in
   // the one batched PTB and published {allocation, keypair} to the arena store. Consume it once and
   // auto-`enterArenaMatch` — so the window comes alive without a "Play" click. Guarded against
   // double-entry; only enters from idle (never clobbers a resumed match).
-  const arenaEnteredRef = useRef(false);
+
   useEffect(() => {
     const tryEnter = () =>
       consumeArenaEntry(

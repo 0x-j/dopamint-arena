@@ -26,3 +26,13 @@ test("one game's choice does not change another game's default", () => {
   rememberAuto("game-a", true);
   assert.equal(defaultAuto("game-b"), false);
 });
+
+test("an untoggled arena game defaults to the ON fallback", () => {
+  assert.equal(defaultAuto("arena-fresh", true), true);
+  assert.equal(defaultAuto("player-driven-fresh"), false);
+});
+
+test("an explicit toggle overrides the fallback", () => {
+  rememberAuto("arena-opted-out", false);
+  assert.equal(defaultAuto("arena-opted-out", true), false);
+});

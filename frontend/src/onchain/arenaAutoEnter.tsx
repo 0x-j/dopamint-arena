@@ -65,16 +65,22 @@ function arenaGameIdsForOpenWindows(): string[] {
     const arenaId = arenaGameIdForModule(m.id);
     if (arenaId) ids.push(arenaId);
   }
-  // Skip any game the resume flow will restore: on a reload each open window's PvP hook resumes its
-  // persisted IN-FLIGHT tunnel, so re-allocating (and depositing a fresh stake into) a second tunnel
-  // for the same game would strand that stake in an abandoned match. A FINISHED (terminal) record is
-  // excluded from this suppression so a settle+reload allocates a new game instead of stalling on the
-  // settled board — resume clears that record, but this read has no protocol to judge terminality, so
-  // it trusts the record's stamped flag (keeping allocate and resume consistent order-independently).
-  const resumingGameKeys = resumingGameKeysOf(
-    listActiveTunnels().map((id) => readResumeRecord(id)),
+  const activeTunnels = listActiveTunnels();
+  const records = activeTunnels.map((id) => readResumeRecord(id));
+  const resumingGameKeys = resumingGameKeysOf(records);
+  console.log(
+    "[arenaAutoEnter] activeTunnels",
+    activeTunnels,
+    "records",
+    records?.map((r) => (r ? { game: r.game, terminal: r.terminal } : null)),
+    "resumingKeys",
+    resumingGameKeys,
+    "idsBeforeSkip",
+    ids,
   );
-  return arenaIdsExcludingResuming(ids, resumingGameKeys);
+  const result = arenaIdsExcludingResuming(ids, resumingGameKeys);
+  console.log("[arenaAutoEnter] idsAfterSkip (will allocate)", result);
+  return result;
 }
 
 export function useArenaAutoEnter(): void {
@@ -87,7 +93,14 @@ export function useArenaAutoEnter(): void {
   const entered = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!owner) return;
+    if (!owner) {
+      // Re-arm on disconnect so a reconnect re-runs the batched entry, giving open windows
+      // that can't resume a fresh auto-mode match (freeze-on-disconnect). Reconnect then
+      // behaves like a reload; arenaGameIdsForOpenWindows() still excludes windows whose
+      // in-flight tunnel will resume, so only non-resuming windows re-allocate.
+      entered.current = null;
+      return;
+    }
 
     const signExec = async (
       tx: Parameters<typeof signAndExecute>[0]["transaction"],

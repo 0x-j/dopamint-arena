@@ -40,9 +40,11 @@ import {
   installResumePersistence,
   readResumeRecord,
   hasResumableMatch,
+  flushResumeWrites,
 } from "@/pvp/resume";
 import { attachResume, resumeActiveTunnels } from "@/pvp/resumeSession";
 import { coSignCloseFromPeerRoot } from "@/pvp/settleClose";
+import { requestArenaGame } from "@/onchain/arenaLazyEntry";
 import {
   useCurrentAccount,
   useSignAndExecuteTransaction,
@@ -173,9 +175,9 @@ export function usePvpBlackjack(): PvpView {
   const [role, setRole] = useState<"A" | "B" | null>(null);
   const [state, setState] = useState<BlackjackState | null>(null);
   const [rounds, setRounds] = useState<RoundResult[]>([]);
-  // Auto is OFF on a fresh page load (you play your own seat), then sticky to your last toggle —
-  // tick it on and new games keep a bot playing for you. See autoPreference.
-  const [auto, setAutoState] = useState(() => defaultAuto("blackjack"));
+  // Arena games autopilot by default (fallback true) so a resume/reload keeps playing; your
+  // explicit toggle still sticks for the session. See autoPreference.
+  const [auto, setAutoState] = useState(() => defaultAuto("blackjack", true));
   const [stake, setStakeState] = useState<bigint>(DEFAULT_STAKE);
   const [walletBalance, setWalletBalance] = useState<bigint>(0n);
   const [digests, setDigests] = useState<{
@@ -187,12 +189,16 @@ export function usePvpBlackjack(): PvpView {
   const mpRef = useRef<MpClient | null>(null);
   const channelRef = useRef<PvpChannel | null>(null);
   const detachResumeRef = useRef<(() => void) | null>(null);
+  const resumeRetryRef = useRef(0);
+  const arenaEnteredRef = useRef(false);
   const tunnelRef = useRef<core.DistributedTunnel<
     BlackjackState,
     BlackjackMove
   > | null>(null);
   const roleRef = useRef<"A" | "B" | null>(null);
-  const autoRef = useRef(defaultAuto("blackjack"));
+  const autoRef = useRef(defaultAuto("blackjack", true));
+  // Points at the latest requeue() so finishSettle (defined earlier) can recover on a settle throw.
+  const requeueRef = useRef<(() => void) | null>(null);
   const autoKickedRef = useRef(false);
   const lastBetRef = useRef<number>(DEFAULT_BET); // remembered bet for auto rounds; set on every player bet
   const stakeRef = useRef<bigint>(DEFAULT_STAKE); // chosen buy-in, read inside onMatch without stale closures
@@ -399,7 +405,12 @@ export function usePvpBlackjack(): PvpView {
         }
         if (stoppingRef.current) return; // a stop/settle is in progress
         if (proto.isTerminal(st)) {
-          void finishSettle(t, channel, info.matchId);
+          // On a settle throw, don't strand at "settling" — recover into the next match (these
+          // arena games self-play); the on-chain grace floor still protects the stake.
+          finishSettle(t, channel, info.matchId).catch((e) => {
+            console.error("[blackjack pvp] settle failed:", e);
+            requeueRef.current?.();
+          });
           return;
         }
         const owed = actorFor(st, getPlayerParty); // PvP: default rotation
@@ -581,7 +592,7 @@ export function usePvpBlackjack(): PvpView {
       setRounds([]);
       autoKickedRef.current = false;
       // Fresh match resets Auto to the session default (ON the first time, else your last toggle).
-      autoRef.current = defaultAuto("blackjack");
+      autoRef.current = defaultAuto("blackjack", true);
       setAutoState(autoRef.current);
       bufferedSettleRef.current = null;
       bufferedStakeRef.current = null;
@@ -597,7 +608,59 @@ export function usePvpBlackjack(): PvpView {
         mpRef.current = mp;
         // Cold-load: rebuild any persisted in-flight blackjack match before joining a queue.
         if (tryResume(mp)) {
-          await mp.connect();
+          try {
+            await mp.connect();
+          } catch (connErr) {
+            // Resume connect failed — commonly a 2nd socket for this wallet racing the relay's
+            // routing right after a freeze/reconnect. Preserve the resume record and retry with
+            // backoff so the relay can clean up the old session. Only clear after exhausting retries.
+            console.warn(
+              "[blackjack:queue] resume connect failed, will retry",
+              connErr,
+            );
+            const resumedTid = tunnelRef.current?.tunnelId;
+            mp.close();
+            mpRef.current = null;
+            tunnelRef.current = null;
+            const attempt = resumeRetryRef.current;
+            if (attempt < 2) {
+              resumeRetryRef.current = attempt + 1;
+              await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+              queue();
+              return;
+            }
+            resumeRetryRef.current = 0;
+            if (resumedTid) clearResumeRecord(resumedTid);
+            console.warn(
+              "[blackjack:queue] resume exhausted, requesting fresh arena allocation",
+            );
+            setPhase("idle");
+            arenaEnteredRef.current = false;
+            if (walletAddress)
+              requestArenaGame(BLACKJACK_ARENA_GAME_ID, walletAddress);
+            return;
+          }
+          // Resume watchdog (mirrors the shared kit's armResumeWatchdog): the auto-kick fires
+          // before connect on this path, so if it's our turn the proposal is dropped; and if the
+          // co-located bot exited past its grace, nothing re-kicks. Rather than hang at "playing",
+          // drop the record and requeue a fresh match. Disarms on the first confirmed frame.
+          {
+            const resumed = tunnelRef.current;
+            if (resumed) {
+              let answered = false;
+              const prevConfirmed = resumed.onConfirmed;
+              resumed.onConfirmed = (u) => {
+                answered = true;
+                resumed.onConfirmed = prevConfirmed;
+                prevConfirmed?.(u);
+              };
+              setTimeout(() => {
+                if (answered || mpRef.current !== mp) return;
+                clearResumeRecord(resumed.tunnelId);
+                requeueRef.current?.();
+              }, 10_000);
+            }
+          }
           return; // skip quickMatch — continuing an in-flight match
         }
         await mp.connect();
@@ -618,26 +681,13 @@ export function usePvpBlackjack(): PvpView {
   const resume = useCallback(() => {
     if (mpRef.current) return;
     if (!walletAddress) return;
-    // installResumePersistence + evictExpiredRecords already ran in the mount effect above, and
-    // tryResume → resumeActiveTunnels re-runs both — no need to repeat them here.
     if (!hasResumableMatch("blackjack")) return;
-    void (async () => {
-      try {
-        const connEph = core.generateKeyPair();
-        const mp = new MpClient(resolveMpWsUrl(MP_URL), walletAddress, connEph);
-        mpRef.current = mp;
-        if (!tryResume(mp)) {
-          mpRef.current = null;
-          mp.close();
-          return;
-        }
-        await mp.connect();
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-        setPhase("error");
-      }
-    })();
-  }, [walletAddress, tryResume]);
+    // Route cold-load resume through queue(): its resume branch (tryResume) restores the in-flight
+    // match WITH the connect-error recovery + resume watchdog, and a stale/terminal record falls
+    // through to a fresh match instead of stranding at the lobby. The hasResumableMatch guard keeps
+    // a FRESH load on the arena-entry path (no auto public-queue join).
+    queue();
+  }, [walletAddress, queue]);
   useEffect(() => {
     resume();
   }, [resume]);
@@ -1076,7 +1126,7 @@ export function usePvpBlackjack(): PvpView {
   // the one batched PTB and published {allocation, keypair} to the arena store. Consume it once and
   // auto-enter — the window comes alive without a "Find match" click. Only from idle (never clobbers a
   // live/resumed match); `clearArenaEntry` consumes it so a remount can't re-enter a closed match.
-  const arenaEnteredRef = useRef(false);
+
   useEffect(() => {
     const tryEnter = () =>
       consumeArenaEntry(
@@ -1244,7 +1294,7 @@ export function usePvpBlackjack(): PvpView {
     settledRef.current = false;
     stoppingRef.current = false;
     autoKickedRef.current = false;
-    autoRef.current = defaultAuto("blackjack");
+    autoRef.current = defaultAuto("blackjack", true);
     setAutoState(autoRef.current);
     openedResolveRef.current = null;
     bufferedOpenedRef.current = null;
@@ -1302,18 +1352,23 @@ export function usePvpBlackjack(): PvpView {
     })();
   }, [queue]);
 
-  // After a match settles ("done"), auto-find the next match when Auto is on. A short pause lets
-  // the result show before re-queuing.
   useEffect(() => {
-    if (phase !== "done" || !autoRef.current) return;
-    const id = setTimeout(() => {
-      if (autoRef.current) requeue();
-    }, AUTO_REQUEUE_MS);
+    requeueRef.current = requeue;
+  }, [requeue]);
+
+  // After a match settles ("done"), always auto-find the next match — these are self-playing
+  // arena games (parity with poker); an explicit Leave() → "idle" stops the loop. Auto only
+  // governs whether the bot or you plays, not whether one is found. A short pause lets the result
+  // show before re-queuing.
+  useEffect(() => {
+    if (phase !== "done") return;
+    const id = setTimeout(() => requeue(), AUTO_REQUEUE_MS);
     return () => clearTimeout(id);
   }, [phase, requeue]);
 
   useEffect(
     () => () => {
+      flushResumeWrites();
       detachResumeRef.current?.();
       mpRef.current?.close();
     },

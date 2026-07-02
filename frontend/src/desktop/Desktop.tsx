@@ -57,6 +57,11 @@ import { SystemDashboard } from "../panels/SystemDashboard";
 import { TpsChart } from "../panels/TpsChart";
 import { GameWindow } from "./GameWindow";
 import { GameContent } from "./GameContent";
+import { FrozenContext } from "./frozenContext";
+import {
+  classifyWalletTransition,
+  collectGameWindowIds,
+} from "./freezeOnDisconnect";
 import { GameTpsBadge } from "./GameTpsBadge";
 import { OverviewFloor, type OverviewGroup } from "./OverviewFloor";
 import { MobileFloor } from "./MobileFloor";
@@ -351,6 +356,30 @@ export function ArenaView() {
     Record<Workspace, Record<string, FloatState>>
   >("mtps.desktop.floatings.v1", emptyFloating);
   const floatZ = useRef(100);
+  // Freeze every game session when the wallet disconnects; thaw when it reconnects.
+  // `dispose()` (via disposeWindow) closes each game's socket/tunnel but preserves
+  // its localStorage resume record, so the per-window resume() effect re-attaches the
+  // SAME match on reconnect; windows that can't resume fall to idle where arena
+  // auto-enter starts a fresh auto-mode match. Floors are read through a ref so a mere
+  // layout change never re-runs the freeze — only an address change does.
+  const [frozen, setFrozen] = useState(false);
+  const floorsRef = useRef({ layouts, hiddens, floatings });
+  floorsRef.current = { layouts, hiddens, floatings };
+  const prevOwnerRef = useRef(arenaOwner);
+  useEffect(() => {
+    const prev = prevOwnerRef.current;
+    prevOwnerRef.current = arenaOwner;
+    const transition = classifyWalletTransition(prev, arenaOwner);
+    if (transition === "none") return;
+    if (transition === "freeze" || transition === "switch") {
+      const { layouts: l, hiddens: h, floatings: f } = floorsRef.current;
+      // Scope to wallet-gated (arena) games — the same set the scrim covers — so a
+      // disconnect never tears down chat/payment sessions (which have no resume path).
+      for (const id of collectGameWindowIds(l, h, f))
+        if (arenaGameIdForModule(gameOf(id))) disposeWindow(id);
+    }
+    setFrozen(transition === "freeze");
+  }, [arenaOwner]);
   const [addOpen, setAddOpen] = useState(false);
   const [removeOpen, setRemoveOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
@@ -1013,7 +1042,7 @@ export function ArenaView() {
   );
 
   return (
-    <>
+    <FrozenContext.Provider value={frozen}>
       {isDesktop ? (
         <div className="flex h-full min-h-0 flex-col">
           {workspaceTabs}
@@ -1144,6 +1173,6 @@ export function ArenaView() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </>
+    </FrozenContext.Provider>
   );
 }

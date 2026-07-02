@@ -232,7 +232,9 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
 
   constructor(private readonly spec: PvpMatchSpec<State, Move, Intent, View>) {
     this.intent = spec.idleIntent;
-    this.auto = defaultAuto(spec.game);
+    // Arena (self-playing) games autopilot by default so a resume/reload keeps playing; a
+    // player-driven game (no arenaGameId) defaults OFF. An explicit toggle still overrides.
+    this.auto = defaultAuto(spec.game, !!spec.arenaGameId);
     this.snap = {
       status: "idle",
       role: null,
@@ -354,7 +356,7 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
     this.dt = null;
     this.role = null;
     this.intent = this.spec.idleIntent;
-    this.auto = defaultAuto(this.spec.game);
+    this.auto = defaultAuto(this.spec.game, !!this.spec.arenaGameId);
     this.winner = null as State["winner"];
     this.status = "idle";
     this.view = null;
