@@ -638,6 +638,11 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
             s.holeB = sec.holeB;
           },
           onReconciled: () => {
+            // A resync `adoptCheckpoint` swaps in the peer's PUBLIC state, dropping our private slot
+            // secrets — the driver still holds them, so re-anchor them into the adopted state BEFORE
+            // we try to move. Without this the next reveal can't be built and the record persists a
+            // null secret, so a later cold-load is unrecoverable — the live "opponent's turn" stall.
+            driverRef.current?.restoreSecretsToState(dt.state);
             // A resync may have advanced our state (adopt) — re-fire the plumbing/auto loop so the
             // next move (commit/reveal/next_hand, or the persona bot's bet in Auto) isn't stranded.
             sync();

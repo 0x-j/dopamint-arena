@@ -1046,6 +1046,22 @@ export class QuantumPokerSeatDriver {
     };
   }
 
+  /** Re-anchor this seat's cached hand secrets into `state`. A resync `adoptCheckpoint` swaps in the
+   *  peer's PUBLIC state, which strips our private slot secrets (they never leave this seat); the
+   *  driver still holds them (minted in `makeCommitMove`), so we push them back after any adopt.
+   *  Without this the persisted resume record captures `null` and a later cold-load rebuilds a
+   *  secret-less driver that can never reveal — the "opponent's turn" stall. No-op when we hold none
+   *  for this hand, or when `state` already carries them. */
+  restoreSecretsToState(state: PokerState): void {
+    const cached = this.secretsByHand.get(secretMapKey(state.handNo));
+    if (!cached) return;
+    const current = localSecretArrayFor(state, this.party);
+    if (current && !current.some((secret) => !secret)) return;
+    const restored = cached.map(copyReveal);
+    if (this.party === "A") state.localSecretsA = restored;
+    else state.localSecretsB = restored;
+  }
+
   makeRevealMove(state: PokerState): PokerMove | null {
     const slots = expectedQuantumPokerRevealSlots(state, this.party);
     if (slots.length === 0) return null;

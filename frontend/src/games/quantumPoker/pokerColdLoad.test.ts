@@ -303,3 +303,70 @@ test("poker mid-commit reload: pending commit keeps slot secrets so the draw can
     "restored commit repopulates localSecretsA, unblocking the reveal",
   );
 });
+
+// Regression guard for the LIVE reconnect "opponent's turn" stall (poker + blackjack shape). On a
+// resync, `adoptCheckpoint` swaps in the peer's PUBLIC state, which strips this seat's private slot
+// secrets — but the driver still holds them (minted at commit). If they aren't pushed back into the
+// adopted state, the persisted resume record captures `null` and the next reveal can never be built
+// (`makeRevealMove` -> null -> pend=false forever). `restoreSecretsToState` re-anchors them.
+test("poker resync-adopt: driver re-anchors its secret so the record isn't wiped", () => {
+  const proto = new QuantumPokerProtocol(4n);
+  const s0 = proto.initialState({
+    tunnelId: `0x${"5b".repeat(32)}`,
+    initialBalances: { a: 10_000n, b: 10_000n },
+  });
+  const driverA = new QuantumPokerSeatDriver("A");
+  const commitA = driverA.makeCommitMove(s0, mulberry32(3)); // mints + caches A's secret
+  const commitB = new QuantumPokerSeatDriver("B").makeCommitMove(
+    s0,
+    mulberry32(9),
+  );
+  assert.equal(commitA?.kind, "commit_slots");
+  const live = proto.applyMove(
+    proto.applyMove(s0, commitA!, "A"),
+    commitB!,
+    "B",
+  );
+  assert.ok(
+    live.commitA && live.localSecretsA,
+    "live state holds A's commit + secret",
+  );
+
+  // The resync adopt: the peer advertises only PUBLIC state — our secret is stripped.
+  const adapter = makePokerResumeAdapter({
+    getSecret: () => readSecret(live),
+    setSecret: () => {},
+  });
+  const adopted = adapter.deserializeState(
+    adapter.serializeState(live) as never,
+  );
+  assert.ok(
+    !adopted.localSecretsA,
+    "adopt swaps in peer public state — our secret is gone",
+  );
+  // Persisting HERE (the bug) would write a null secret → an unrecoverable cold-load.
+  const capBefore = makePokerResumeAdapter({
+    getSecret: () => readSecret(adopted),
+    setSecret: () => {},
+  }).captureSecret!() as { localSecretsA: unknown };
+  assert.equal(
+    capBefore.localSecretsA,
+    null,
+    "record would be wiped without the fix",
+  );
+
+  // The fix: the driver re-anchors its cached secret into the adopted state.
+  driverA.restoreSecretsToState(adopted);
+  assert.ok(
+    adopted.localSecretsA && adopted.localSecretsA.every((x) => x),
+    "secret re-anchored from the driver's cache",
+  );
+  const capAfter = makePokerResumeAdapter({
+    getSecret: () => readSecret(adopted),
+    setSecret: () => {},
+  }).captureSecret!() as { localSecretsA: unknown[] | null };
+  assert.ok(
+    capAfter.localSecretsA && capAfter.localSecretsA.every((x) => x),
+    "persisted record now keeps the secret across the reconnect",
+  );
+});
