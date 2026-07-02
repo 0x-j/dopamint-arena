@@ -372,6 +372,8 @@ export async function openAndFundSelfPlay(opts: {
   stakeFromBalance?: StakeFromBalance;
   /** Coin type `T` for the tunnels; defaults to SUI. Pass MTPS to stake the faucet token. */
   coinType?: string;
+  /** Called with the committed PTB digest as soon as it is known, before waiting for effects. */
+  onDigest?: (digest: string) => void;
 }): Promise<string> {
   const { digest } = await submitRebuildingOnStale(
     () => {
@@ -397,6 +399,7 @@ export async function openAndFundSelfPlay(opts: {
     opts.signExec,
     "openAndFundSelfPlay",
   );
+  opts.onDigest?.(digest);
   await opts.reads.waitForTransaction({ digest });
   const txb = await opts.reads.getTransactionBlock({
     digest,
@@ -435,6 +438,8 @@ export async function openAndFundMany(opts: {
   coinType?: string;
   stakeFromBalance?: StakeFromBalance;
   stakeCoinId?: string;
+  /** Called with the committed PTB digest as soon as it is known, before waiting for effects. */
+  onDigest?: (digest: string) => void;
 }): Promise<Map<string, string>> {
   const { digest } = await submitRebuildingOnStale(
     () => {
@@ -458,6 +463,7 @@ export async function openAndFundMany(opts: {
     opts.signExec,
     "openAndFundMany",
   );
+  opts.onDigest?.(digest);
   // POST-COMMIT: everything below runs after the PTB has already landed on-chain. Any failure here
   // means the N tunnels exist and their stake is consumed — callers must not retry the open.
   try {
@@ -509,6 +515,8 @@ export async function depositSeatAMany(opts: {
   coinType?: string;
   stakeFromBalance?: StakeFromBalance;
   stakeCoinId?: string;
+  /** Called with the committed PTB digest as soon as it is known, before waiting for effects. */
+  onDigest?: (digest: string) => void;
 }): Promise<Map<string, string>> {
   const { digest } = await submitRebuildingOnStale(
     () => {
@@ -525,6 +533,7 @@ export async function depositSeatAMany(opts: {
     opts.signExec,
     "depositSeatAMany",
   );
+  opts.onDigest?.(digest);
   // POST-COMMIT: the PTB has landed; the N seat-A deposits are consumed. Any failure below must NOT
   // retry (would double-deposit) — surface it as BatchCommittedError. The tunnel ids are known
   // inputs, so resolution needs no object-change read.

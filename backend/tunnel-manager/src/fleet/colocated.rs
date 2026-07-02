@@ -18,7 +18,7 @@ use tunnel_harness::Signer;
 
 use fleet_core::match_channel::MatchChannel;
 use fleet_core::play_match::{
-    play_battleship, play_blackjack_v2, play_bomb_it, play_caro, play_chicken_cross,
+    play_battleship, play_blackjack_v2, play_bomb_it, play_caro, play_chicken_cross, play_flash,
     play_quantum_poker, play_regular_payments, play_tic_tac_toe, play_world_canvas,
 };
 use fleet_core::signer_durable::DurableSigner;
@@ -300,6 +300,7 @@ async fn play_game(
         "caro" => play!(play_caro),
         "battleship" => play!(play_battleship),
         "regular_payments" => play!(play_regular_payments),
+        "flash" => play!(play_flash),
         other => bail!("co-located fleet has no protocol wired for game '{other}'"),
     };
     Ok(outcome.moves)

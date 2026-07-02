@@ -116,6 +116,52 @@ test("enterArena sends the user eph pubkey, deposits seat A into the pre-opened 
       tunnelId: TUNNEL,
       botAddress: BOT_ADDR,
       botEphPubkey: BOT_EPH,
+      depositDigest: undefined,
     },
+  ]);
+});
+
+test("enterArena surfaces the deposit digest via onDepositDigest and the returned allocation", async () => {
+  const captured: { allocate?: unknown; opened?: unknown } = {};
+  const digests: Array<{ game: string; digest: string }> = [];
+
+  const opened = await enterArena({
+    games: ["blackjack"],
+    userAddress: "0xuser",
+    stakePerGame: 100n,
+    apiBase: "",
+    fetchFn: fakeFetch(captured),
+    makeUserParty: async () => ({ address: "0xuser", publicKey: USER_EPH }),
+    open: async (req) => {
+      req.onDigest?.("0xdepositdigest");
+      return req.tunnelId!;
+    },
+  });
+
+  assert.equal(opened.length, 1);
+  assert.equal(
+    opened[0].depositDigest,
+    "0xdepositdigest",
+    "allocation carries the deposit digest",
+  );
+  assert.deepEqual(digests, []);
+
+  // Also verify the explicit callback path.
+  await enterArena({
+    games: ["blackjack"],
+    userAddress: "0xuser",
+    stakePerGame: 100n,
+    apiBase: "",
+    fetchFn: fakeFetch(captured),
+    makeUserParty: async () => ({ address: "0xuser", publicKey: USER_EPH }),
+    open: async (req) => {
+      req.onDigest?.("0xexplicitdigest");
+      return req.tunnelId!;
+    },
+    onDepositDigest: (game, digest) => digests.push({ game, digest }),
+  });
+
+  assert.deepEqual(digests, [
+    { game: "blackjack", digest: "0xexplicitdigest" },
   ]);
 });

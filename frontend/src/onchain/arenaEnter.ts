@@ -28,6 +28,8 @@ export interface ArenaAllocation {
    *  seat B with exactly this; the user's batched deposit funds seat A with the SAME amount, and the
    *  off-chain tunnel inits both balances to it. Single source of truth — the FE never hardcodes it. */
   stakeEach: number;
+  /** Digest of the committed seat-A deposit PTB, once the batched open lands. */
+  depositDigest?: string;
 }
 
 /** One opened arena game: the bot to play, the relay match, and the live tunnel. */
@@ -109,6 +111,8 @@ export async function enterArena(
     open?: (req: TunnelOpenRequest) => Promise<string>;
     coinType?: string;
     usesAddressBalance?: boolean;
+    /** Called with the committed deposit PTB digest for each game once the batched open lands. */
+    onDepositDigest?: (game: string, digest: string) => void;
   } & ArenaApi,
 ): Promise<ArenaAllocation[]> {
   // A fresh ephemeral key per game, BEFORE allocate — its pubkey is baked into the tunnel at create.
@@ -146,11 +150,14 @@ export async function enterArena(
           `arena: no stake for ${alloc.game} (allocation.stakeEach + stakePerGame both unset)`,
         );
       // Deposit seat A into the fleet-pre-created tunnel. `alloc.tunnelId` is authoritative — the
-      // deposit goes INTO it and cannot change its id — so keep it and never adopt the batcher's
-      // returned id. The address-keyed batcher map collides when a batch shares one party-A address
-      // (all arena games use the same wallet), which would cross games onto a single tunnel and make
-      // the co-signed `tunnel_id` disagree with the bot's reservation → every move rejected.
-      await open({
+      // deposit goes INTO it and cannot change its id. The batcher resolves deposit-mode requests via
+      // the request's input `tunnelId`, NOT its address-keyed map (which collides when a batch shares
+      // one party-A address — all arena games use the same wallet — and would cross games onto a
+      // single tunnel, making the co-signed `tunnel_id` disagree with the bot's reservation → every
+      // move rejected). So the returned id equals `alloc.tunnelId`; capture it plus the deposit digest
+      // to thread into the activity feed.
+      let depositDigest: string | undefined;
+      const tunnelId = await open({
         mode: "deposit",
         tunnelId: alloc.tunnelId,
         partyA,
@@ -159,8 +166,12 @@ export async function enterArena(
         bAmount: 0n, // the fleet already funded seat B; unused in deposit mode
         coinType: opts.coinType,
         usesAddressBalance: opts.usesAddressBalance ?? true,
+        onDigest: (digest) => {
+          depositDigest = digest;
+          opts.onDepositDigest?.(alloc.game, digest);
+        },
       });
-      return alloc;
+      return { ...alloc, tunnelId, depositDigest };
     }),
   );
   await reportArenaOpened(

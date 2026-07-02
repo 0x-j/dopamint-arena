@@ -57,6 +57,9 @@ pub(crate) mod test_support {
             pair_hold_ms: 750,
             pairing: crate::stats_counter::MatchPairingMetrics::default(),
             chat: crate::chat_store::ChatTranscriptStore::new(),
+            flash: std::sync::Arc::new(crate::flash_store::FlashTranscriptStore::new()),
+            flash_sui_anchor: None,
+            flash_loop: crate::flash_loop::FlashLoop::new(None),
             fleet: crate::fleet::BotPool::default(),
             arena_opener: std::sync::Arc::new(crate::fleet::arena_opener::NoopArenaOpener),
             arena_fleet_count: 0,
@@ -845,6 +848,37 @@ pub(crate) async fn chat_live(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+pub(crate) async fn flash_live(
+    State(state): State<SharedState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.flash.subscribe()).filter_map(|msg| {
+        msg.ok()
+            .map(|json| Ok::<_, Infallible>(Event::default().data(json)))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+pub(crate) async fn flash_start(State(state): State<SharedState>) -> StatusCode {
+    let started = crate::flash_loop::start(&state.flash_loop, state.flash_store()).await;
+    if started {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::CONFLICT
+    }
+}
+
+pub(crate) async fn flash_stop(State(state): State<SharedState>) -> StatusCode {
+    let _ = crate::flash_loop::stop(&state.flash_loop).await;
+    StatusCode::NO_CONTENT
+}
+
+/// Whether the bot-vs-bot loop is running, so the Spectator tab can render Start/Stop correctly even
+/// when it opens onto a loop someone else already started.
+pub(crate) async fn flash_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let running = crate::flash_loop::is_running(&state.flash_loop).await;
+    Json(serde_json::json!({ "running": running }))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SponsorExecuteRequest {
@@ -1469,6 +1503,149 @@ mod tests {
 
         let resp = chat_topic(axum::extract::State(state)).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // Flash self-play loop start/stop routes are idempotent and stop is a no-op
+    // when already idle.
+    #[tokio::test]
+    async fn flash_start_and_stop_routes() {
+        let state = test_state();
+        assert_eq!(
+            flash_start(axum::extract::State(state.clone())).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            flash_start(axum::extract::State(state.clone())).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            flash_stop(axum::extract::State(state.clone())).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            flash_stop(axum::extract::State(state.clone())).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    // The Spectator tab reads `running` from here to gate Start/Stop; it must track the loop state so
+    // a tab opening onto an already-running loop shows Stop (not Start) enabled.
+    #[tokio::test]
+    async fn flash_status_reflects_running_state() {
+        let state = test_state();
+        let running = |v: Json<serde_json::Value>| v.0["running"].as_bool().unwrap();
+        assert!(
+            !running(flash_status(axum::extract::State(state.clone())).await),
+            "idle before start"
+        );
+        flash_start(axum::extract::State(state.clone())).await;
+        assert!(
+            running(flash_status(axum::extract::State(state.clone())).await),
+            "running after start"
+        );
+        flash_stop(axum::extract::State(state.clone())).await;
+        assert!(
+            !running(flash_status(axum::extract::State(state.clone())).await),
+            "idle again after stop"
+        );
+    }
+
+    // End-to-end HTTP test of the flash Mode 2 pipeline: POST /v1/flash/start,
+    // GET /v1/flash/live (SSE), read co-signed bot moves, POST /v1/flash/stop.
+    // Multi-thread runtime so the spawned self-play loop makes progress on its own worker while the
+    // test reads the SSE stream — a current-thread runtime starves the loop on a slow CI box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flash_mode2_sse_end_to_end() {
+        use axum::routing::{get, post};
+        use axum::Router;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let state = test_state();
+        let app = Router::new()
+            .route("/v1/flash/live", get(flash_live))
+            .route("/v1/flash/start", post(flash_start))
+            .route("/v1/flash/stop", post(flash_stop))
+            .with_state(state.clone());
+
+        // Start the self-play loop.
+        let start_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/flash/start")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_resp.status(), StatusCode::ACCEPTED);
+
+        // Open the SSE stream.
+        let sse_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/flash/live")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+
+        // Read chunks from the SSE body with a timeout and parse `data:` lines.
+        let mut stream = sse_resp.into_body().into_data_stream();
+        let mut collected = 0;
+        let mut buf = String::new();
+        // Generous deadline so a slow/loaded CI runner still delivers the 2 messages we assert on;
+        // fast machines exit early once `collected` reaches 4.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while collected < 4 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, tokio_stream::StreamExt::next(&mut stream))
+                .await
+            {
+                Ok(Some(Ok(chunk))) => {
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some((line, rest)) = buf.split_once('\n') {
+                        let line = line.trim_end();
+                        if let Some(payload) = line.strip_prefix("data: ") {
+                            if !payload.is_empty() {
+                                let msg: serde_json::Value =
+                                    serde_json::from_str(payload).expect("valid JSON SSE payload");
+                                let sender = msg["sender"].as_str().expect("sender field");
+                                assert!(sender == "A" || sender == "B", "sender is A or B");
+                                assert!(msg["moveNo"].as_u64().is_some(), "moveNo field");
+                                assert!(msg["text"].as_str().is_some(), "text field");
+                                collected += 1;
+                            }
+                        }
+                        buf = rest.to_string();
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            collected >= 2,
+            "expected at least 2 SSE messages, got {collected}"
+        );
+
+        // Stop the loop and verify idempotence.
+        let stop_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/flash/stop")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop_resp.status(), StatusCode::NO_CONTENT);
     }
 }
 

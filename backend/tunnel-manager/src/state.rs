@@ -48,6 +48,16 @@ pub struct AppState {
     pub pairing: crate::stats_counter::MatchPairingMetrics,
     /// Shared transcript for the bot-vs-bot live chat feed, fanned out via SSE.
     pub chat: crate::chat_store::ChatTranscriptStore,
+    /// Shared transcript for the bot-vs-bot flash game, fanned out via SSE.
+    pub flash: std::sync::Arc<crate::flash_store::FlashTranscriptStore>,
+    /// On-chain anchor for flash spectator mode. `None` keeps the loop on the
+    /// in-memory dev path; `Some` opens and settles real Sui tunnels per cycle.
+    /// Kept on `AppState` for observability/debugging even though the loop owns
+    /// the active reference.
+    #[allow(dead_code)]
+    pub flash_sui_anchor: Option<std::sync::Arc<sui_tunnel_anchor::SuiSponsoredAnchor>>,
+    /// Handle for the flash bot-vs-bot self-play loop (start/stop/idempotent).
+    pub flash_loop: crate::flash_loop::FlashLoop,
     /// Arena bot pool for one-signature allocation (ADR-0026), backing on-demand co-located seat-fill.
     /// Per-instance, in-memory.
     pub fleet: crate::fleet::BotPool,
@@ -80,6 +90,12 @@ pub struct AppState {
 }
 
 pub type SharedState = std::sync::Arc<AppState>;
+
+impl AppState {
+    pub(crate) fn flash_store(&self) -> std::sync::Arc<crate::flash_store::FlashTranscriptStore> {
+        std::sync::Arc::clone(&self.flash)
+    }
+}
 
 #[cfg(any(test, feature = "test-util"))]
 impl AppState {
@@ -120,6 +136,9 @@ impl AppState {
             pair_hold_ms: 750,
             pairing: crate::stats_counter::MatchPairingMetrics::default(),
             chat: crate::chat_store::ChatTranscriptStore::new(),
+            flash: std::sync::Arc::new(crate::flash_store::FlashTranscriptStore::new()),
+            flash_sui_anchor: None,
+            flash_loop: crate::flash_loop::FlashLoop::new(None),
             fleet: crate::fleet::BotPool::default(),
             arena_opener: Arc::new(crate::fleet::arena_opener::NoopArenaOpener),
             arena_fleet_count: count,

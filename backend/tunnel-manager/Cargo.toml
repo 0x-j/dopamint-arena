@@ -12,6 +12,7 @@ test-util = []
 [dependencies]
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util = "0.7"
 axum = { workspace = true, features = ["ws"] }
 tower.workspace = true
 tower-http.workspace = true
@@ -49,11 +50,16 @@ tunnel-harness = { path = "../../rust/engine/tunnel-harness" }
 # `transcript-store` = the S3 chunk store; `transcript-stream` = the recorder + bounded uploader.
 transcript-store = { path = "../transcript-store" }
 transcript-stream = { path = "../transcript-stream" }
+# Flash self-play loop (Mode 2): drives the flash protocol in-process with both seats.
+tunnel-core = { path = "../../rust/engine/tunnel-core" }
+tunnel-flash = { path = "../../rust/protocols/flash" }
 # Funded seat-B identities for on-demand arena bots (PR #124): the 1M-member pool, opened once at
 # startup, gives each bot a real on-chain address from `get_member_key`. Gated by WALLET_POOL_ID.
 wallet-pool = { path = "../../wallet-pool" }
 wallet-pool-core = { path = "../../wallet-pool/core" }
 wallet-pool-s3 = { path = "../../wallet-pool/s3" }
+sui-tunnel-anchor = { path = "../../rust/engine/sui-tunnel-anchor" }
+bech32.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

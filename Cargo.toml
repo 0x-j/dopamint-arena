@@ -11,6 +11,7 @@ members = [
   "rust/protocols/caro",
   "rust/protocols/chat", "rust/protocols/payments",
   "rust/protocols/cross",
+  "rust/protocols/flash",
   "rust/protocols/quantum-poker",
   "rust/protocols/tic-tac-toe",
   "rust/protocols/world-canvas",
@@ -75,6 +76,7 @@ clap = { version = "4.5", features = ["derive"] }
 sysinfo = "0.32"
 getrandom = "0.2"
 thiserror = "1"
+rand = "0.8"
 
 [profile.release]
 lto = "thin"

@@ -5,6 +5,8 @@ mod chat_store;
 mod config;
 mod enoki;
 mod error;
+mod flash_loop;
+mod flash_store;
 mod fleet;
 mod mp;
 mod ollama;
@@ -27,6 +29,8 @@ use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine;
+use bech32::ToBase32;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -34,6 +38,23 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::state::{AppState, SharedState};
+
+/// Convert the base64 Ed25519 seed stored in `SUI_SETTLER_KEY` into a bech32
+/// Sui private key (`suiprivkey1...`) that `sui-tunnel-anchor` accepts.
+fn base64_seed_to_sui_bech32(base64_seed: &str) -> anyhow::Result<String> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(base64_seed)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("settler key seed must be 32 bytes, got {}", bytes.len());
+    }
+    // Sui bech32 private key: 1 scheme flag byte (0x00 = Ed25519) + 32 secret bytes.
+    let mut key = vec![0u8; 33];
+    key[1..].copy_from_slice(&bytes);
+    Ok(bech32::encode(
+        "suiprivkey",
+        key.to_base32(),
+        bech32::Variant::Bech32,
+    )?)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -259,6 +280,47 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(settle_queue::InMemorySettleQueue::default())
         };
 
+    // On-chain anchor for the flash spectator bot-vs-bot loop. Optional: if the
+    // settler key is missing or invalid the loop falls back to in-memory self-play.
+    let flash_sui_anchor = match config.settler_key.as_deref() {
+        Some(seed) => match base64_seed_to_sui_bech32(seed) {
+            Ok(priv_key) => {
+                let sui_config = sui_tunnel_anchor::SuiSponsoredAnchorConfig {
+                    rpc_url: config.sui_rpc_url.clone().unwrap_or_default(),
+                    backend_url: String::new(), // direct open/settle; backend endpoint unused
+                    package_id: config.package_id.clone().unwrap_or_default(),
+                    tunnel_coin_type: config.coin_type.clone(),
+                    open_mode: sui_tunnel_anchor::SuiOpenMode::DirectCreateAndFund,
+                    settle_mode: sui_tunnel_anchor::SuiSettleMode::DirectSettle,
+                    funding_profile: sui_tunnel_anchor::SuiFundingProfile::SingleFunder {
+                        priv_key,
+                        stake_source: sui_tunnel_anchor::SuiStakeSource::AddressBalance,
+                    },
+                    open_batching: sui_tunnel_anchor::SuiOpenBatchingConfig::default(),
+                    settle_batching: sui_tunnel_anchor::SuiOpenBatchingConfig::default(),
+                };
+                match sui_tunnel_anchor::SuiSponsoredAnchor::new(sui_config) {
+                    Ok(a) => {
+                        tracing::info!("flash spectator on-chain anchor enabled");
+                        Some(Arc::new(a))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "flash spectator on-chain anchor disabled");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "flash spectator on-chain anchor disabled: invalid settler key");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("flash spectator on-chain anchor disabled: SUI_SETTLER_KEY unset");
+            None
+        }
+    };
+
     let state: SharedState = Arc::new(AppState {
         control,
         mp,
@@ -277,6 +339,9 @@ async fn main() -> anyhow::Result<()> {
         pair_hold_ms,
         pairing: crate::stats_counter::MatchPairingMetrics::default(),
         chat: crate::chat_store::ChatTranscriptStore::new(),
+        flash: std::sync::Arc::new(crate::flash_store::FlashTranscriptStore::new()),
+        flash_sui_anchor: flash_sui_anchor.clone(),
+        flash_loop: crate::flash_loop::FlashLoop::new(flash_sui_anchor),
         fleet: crate::fleet::BotPool::default(),
         arena_opener,
         arena_fleet_count: config.colocated_fleet_count,
@@ -369,6 +434,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/chat/topic", get(routes::chat_topic))
         .route("/v1/chat/live/publish", post(routes::chat_publish))
         .route("/v1/chat/live", get(routes::chat_live))
+        .route("/v1/flash/live", get(routes::flash_live))
+        .route("/v1/flash/status", get(routes::flash_status))
+        .route("/v1/flash/start", post(routes::flash_start))
+        .route("/v1/flash/stop", post(routes::flash_stop))
         .route("/v1/stats/live", get(routes::stats_live))
         .route("/v1/sponsor/execute", post(routes::sponsor_execute))
         .route("/v1/mp", get(crate::mp::ws::mp_upgrade))

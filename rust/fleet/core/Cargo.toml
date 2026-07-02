@@ -20,6 +20,7 @@ tunnel-tic-tac-toe = { path = "../../protocols/tic-tac-toe" }
 tunnel-caro = { path = "../../protocols/caro" }
 tunnel-battleship = { path = "../../protocols/battleship" }
 tunnel-payments = { path = "../../protocols/payments" }
+tunnel-flash = { path = "../../protocols/flash" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

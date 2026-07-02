@@ -362,3 +362,100 @@ test("requests arriving within the debounce window share one flush", async () =>
   await Promise.all([p1, p2]);
   assert.equal(signs, 1, "staggered-but-close requests coalesce into one PTB");
 });
+
+test("onDigest is invoked with the batch digest for correlated requests", async () => {
+  const digests: string[] = [];
+  const deps = fakeDeps({ onSign: () => {} });
+  (deps.reads as any).getTransactionBlock = async () => ({
+    objectChanges: ["0xA", "0xB"].map((a) => ({
+      type: "created",
+      objectType: "0xpkg::tunnel::Tunnel<0x2::sui::SUI>",
+      objectId: "tunnel-for-" + a,
+    })),
+  });
+  (deps.reads as any).getObject = async (i: { id: string }) => ({
+    data: {
+      content: {
+        fields: {
+          party_a: { fields: { address: i.id.replace("tunnel-for-", "") } },
+        },
+      },
+    },
+  });
+  const batcher = new TunnelOpenBatcher(() => deps, {
+    flushDelayMs: 0,
+    maxBatch: 16,
+  });
+  await Promise.all([
+    batcher.request({ ...req("0xA"), onDigest: (d) => digests.push(d) }),
+    batcher.request({ ...req("0xB"), onDigest: (d) => digests.push(d) }),
+  ]);
+  assert.equal(
+    digests.length,
+    2,
+    "onDigest called for both correlated requests",
+  );
+  assert.ok(
+    digests.every((d) => typeof d === "string" && d.length > 0),
+    "digests are non-empty strings",
+  );
+  assert.equal(
+    new Set(digests).size,
+    1,
+    "same batch digest for every correlated request",
+  );
+});
+
+test("onDigest is not invoked when correlation fails in the batch path", async () => {
+  let digests = 0;
+  const deps = fakeDeps({ onSign: () => {} });
+  // Default getTransactionBlock returns [] → no tunnel can be correlated, so openAndFundMany throws
+  // BatchCommittedError and every pending request rejects without onDigest firing.
+  const batcher = new TunnelOpenBatcher(() => deps, {
+    flushDelayMs: 0,
+    maxBatch: 16,
+  });
+  await assert.rejects(
+    () =>
+      batcher.request({
+        ...req("0xA"),
+        onDigest: () => (digests += 1),
+      }),
+    BatchCommittedError,
+  );
+  assert.equal(digests, 0, "onDigest skipped when tunnel id is not correlated");
+});
+
+test("onDigest is invoked in the single-open fallback path", async () => {
+  const digests: string[] = [];
+  const deps = fakeDeps({ onSign: () => {}, failOpens: 1 });
+  // Make the batch sender-pays path fail too so openChunk throws entirely.
+  (deps as any).signExec = async () => {
+    throw new Error("wallet rejected (test)");
+  };
+  (deps.reads as any).getTransactionBlock = async () => ({
+    objectChanges: [
+      {
+        type: "created",
+        objectType: "0xpkg::tunnel::Tunnel<0x2::sui::SUI>",
+        objectId: "tunnel-for-0xA",
+      },
+    ],
+  });
+  (deps.reads as any).getObject = async () => ({
+    data: { content: { fields: { party_a: { fields: { address: "0xA" } } } } },
+  });
+  const batcher = new TunnelOpenBatcher(() => deps, {
+    flushDelayMs: 0,
+    maxBatch: 16,
+  });
+  await batcher.request({
+    ...req("0xA"),
+    onDigest: (d) => digests.push(d),
+  });
+  assert.equal(digests.length, 1, "onDigest called in fallback path");
+  assert.ok(
+    typeof digests[0] === "string" && digests[0].length > 0,
+    "fallback digest is a non-empty string",
+  );
+});

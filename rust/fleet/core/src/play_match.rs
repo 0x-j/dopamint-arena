@@ -16,6 +16,7 @@ use tunnel_blackjack::{Blackjack, BlackjackStrategy};
 use tunnel_bomb_it::{BombIt, BombItStrategy};
 use tunnel_caro::{CaroSeries, CaroSeriesStrategy, CaroStrength};
 use tunnel_cross::{Cross, CrossStrategy};
+use tunnel_flash::{Flash, FlashStrategy};
 use tunnel_harness::{
     Balances, DriverOutcome, DriverRunControl, MoveStrategy, PartyDriver, Protocol, SeatParts,
     Signer, TranscriptRecorder, TunnelAnchor,
@@ -125,6 +126,12 @@ pub const REGULAR_PAYMENTS: GameProfile = GameProfile {
     stake_each: 500,
 };
 
+/// Flash profile: stake 1, `flash.v1`.
+pub const FLASH: GameProfile = GameProfile {
+    game_id: "flash",
+    stake_each: 1,
+};
+
 /// Caro's pinned board size — the FE canonical (`PvpScene` default). The arena path can't negotiate
 /// it (joins by match id), so both the bot and the FE arena consumer must use this exact size.
 const CARO_BOARD_SIZE: usize = 15;
@@ -143,6 +150,7 @@ pub fn profile_for(game: &str) -> Option<GameProfile> {
         "caro" => Some(CARO),
         "battleship" => Some(BATTLESHIP),
         "regular_payments" => Some(REGULAR_PAYMENTS),
+        "flash" => Some(FLASH),
         _ => None,
     }
 }
@@ -559,6 +567,38 @@ where
         Battleship::new(BATTLESHIP.stake_each),
         BattleshipStrategy::new(fleet_seed(role)),
         &BATTLESHIP,
+        &info,
+        channel,
+        anchor,
+        signer,
+        recorder,
+    )
+    .await
+}
+
+/// Flash: `flash.v1`, deterministic strategy with no per-role seed.
+pub async fn play_flash<T, A, R>(
+    channel: MatchChannel<T>,
+    anchor: A,
+    signer: DurableSigner,
+    role: Role,
+    opponent_wallet: &str,
+    recorder: R,
+) -> Result<DriverOutcome>
+where
+    T: RelayTransport,
+    A: TunnelAnchor + Send + Sync,
+    R: TranscriptRecorder<<Flash as Protocol>::Move> + Send + Sync,
+{
+    let info = MatchInfo {
+        match_id: String::new(),
+        role,
+        opponent_wallet: opponent_wallet.to_owned(),
+    };
+    play_match(
+        Flash,
+        FlashStrategy::new(),
+        &FLASH,
         &info,
         channel,
         anchor,

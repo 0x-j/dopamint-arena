@@ -1,0 +1,18 @@
+[package]
+name = "tunnel-flash"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tunnel-core = { path = "../../engine/tunnel-core" }
+tunnel-harness = { path = "../../engine/tunnel-harness" }
+markov_str = "0.3"
+rand = { workspace = true }
+regex = "1"
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -12,6 +12,7 @@ export * from "./blackjackCodec";
 export * from "./bombIt";
 export * from "./chat";
 export * from "./cross";
+export * from "./flash";
 export * from "./multiGameBombIt";
 export * from "./multiGameCross";
 export * from "./payments";

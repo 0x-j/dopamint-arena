@@ -23,6 +23,7 @@ tunnel-bomb-it = { path = "../../protocols/bomb-it" }
 tunnel-caro = { path = "../../protocols/caro" }
 tunnel-chat = { path = "../../protocols/chat" }
 tunnel-cross = { path = "../../protocols/cross" }
+tunnel-flash = { path = "../../protocols/flash" }
 tunnel-payments = { path = "../../protocols/payments" }
 tunnel-quantum-poker = { path = "../../protocols/quantum-poker" }
 tunnel-tic-tac-toe = { path = "../../protocols/tic-tac-toe" }

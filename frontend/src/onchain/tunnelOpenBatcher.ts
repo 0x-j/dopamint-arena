@@ -36,6 +36,8 @@ export interface TunnelOpenRequest {
   usesAddressBalance?: boolean;
   timeoutMs?: bigint;
   penaltyAmount?: bigint;
+  /** Called with the committed PTB digest as soon as the chunk's transaction lands. */
+  onDigest?: (digest: string) => void;
 }
 
 /** Wallet-bound capabilities the batcher needs at flush time (latest values, read lazily). */
@@ -78,6 +80,14 @@ function chunk<T>(items: T[], size: number): T[][] {
   for (let i = 0; i < items.length; i += size)
     out.push(items.slice(i, i + size));
   return out;
+}
+
+/** `onDigest` is only invoked for requests whose tunnel id was successfully correlated to the
+ *  batch/single result. If a PTB lands but correlation fails, the digest is not surfaced per-request
+ *  (the error path still carries it for diagnostics). */
+function requireDigest(digest: string | undefined): string {
+  if (!digest) throw new Error("expected digest after open/fund PTB");
+  return digest;
 }
 
 const specOf = (req: TunnelOpenRequest): TunnelOpenManySpec => ({
@@ -195,7 +205,7 @@ export class TunnelOpenBatcher {
       0n,
     );
     try {
-      const map = deposit
+      const result = deposit
         ? await this.depositChunk(
             deps,
             mode,
@@ -219,12 +229,17 @@ export class TunnelOpenBatcher {
         // upfront (its tunnels are created by this PTB), so it still resolves via the map.
         const id = deposit
           ? p.req.tunnelId
-          : map.get(normalizeSuiAddress(p.req.partyA.address));
-        if (id) p.resolve(id);
-        else
+          : result.map.get(normalizeSuiAddress(p.req.partyA.address));
+        // Fire `onDigest` only for a successfully correlated tunnel id, so the activity feed never
+        // attributes a batch digest to a request whose tunnel we couldn't resolve.
+        if (id) {
+          p.resolve(id);
+          p.req.onDigest?.(result.digest);
+        } else {
           p.reject(
             new Error(`no tunnel matched party-A ${p.req.partyA.address}`),
           );
+        }
       }
     } catch (batchErr) {
       // POST-COMMIT failure: the batch PTB already landed on-chain — tunnels exist and stake is
@@ -243,10 +258,20 @@ export class TunnelOpenBatcher {
       await Promise.all(
         chunkPending.map(async (p) => {
           try {
-            const id = deposit
+            const result = deposit
               ? await this.depositSingle(deps, mode, coinType, p.req)
               : await this.openSingle(deps, mode, coinType, p.req);
-            p.resolve(id);
+            const id = result.map.get(
+              normalizeSuiAddress(p.req.partyA.address),
+            );
+            if (id) {
+              p.resolve(id);
+              p.req.onDigest?.(result.digest);
+            } else {
+              p.reject(
+                new Error(`no tunnel matched party-A ${p.req.partyA.address}`),
+              );
+            }
           } catch (singleErr) {
             p.reject(singleErr);
           }
@@ -261,9 +286,13 @@ export class TunnelOpenBatcher {
     coinType: string | undefined,
     specs: TunnelOpenManySpec[],
     total: bigint,
-  ): Promise<Map<string, string>> {
+  ): Promise<{ map: Map<string, string>; digest: string }> {
+    let digest: string | undefined;
+    const onDigest = (d: string) => {
+      digest = d;
+    };
     if (mode === "balance") {
-      return openAndFundMany({
+      const map = await openAndFundMany({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec,
         specs,
@@ -272,18 +301,21 @@ export class TunnelOpenBatcher {
           amount: total,
           coinType: coinType ?? MTPS_COIN_TYPE,
         },
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     }
     if (mode === "mtps-coin") {
-      return deps.prepareStake(total).then((stakeCoinId) =>
-        openAndFundMany({
-          reads: deps.reads,
-          signExec: deps.sponsoredSignExec,
-          specs,
-          coinType,
-          stakeCoinId,
-        }),
-      );
+      const stakeCoinId = await deps.prepareStake(total);
+      const map = await openAndFundMany({
+        reads: deps.reads,
+        signExec: deps.sponsoredSignExec,
+        specs,
+        coinType,
+        stakeCoinId,
+        onDigest,
+      });
+      return { map, digest: requireDigest(digest) };
     }
     // SUI: sponsored open off a user coin, falling back to a wallet-signed gas-funded open.
     // We inline the sponsor fallback here (rather than delegating to withSponsorFallback) so that
@@ -291,13 +323,15 @@ export class TunnelOpenBatcher {
     // retrying via sender-pays would double-open and double-consume stake.
     let sponsorErr: unknown;
     try {
-      return await openAndFundMany({
+      const map = await openAndFundMany({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec,
         specs,
         coinType,
         stakeCoinId: await deps.selectStakeCoin(total),
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     } catch (err) {
       if (err instanceof BatchCommittedError) throw err; // committed: never retry
       sponsorErr = err;
@@ -306,13 +340,16 @@ export class TunnelOpenBatcher {
       `[sponsor] batched open/fund: sponsor failed, falling back to sender-pays`,
       sponsorErr,
     );
+    digest = undefined;
     try {
-      return await openAndFundMany({
+      const map = await openAndFundMany({
         reads: deps.reads,
         signExec: deps.signExec,
         specs,
         coinType,
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     } catch (payErr) {
       if (payErr instanceof BatchCommittedError) throw payErr; // committed: never retry
       throw new Error(
@@ -330,9 +367,13 @@ export class TunnelOpenBatcher {
     coinType: string | undefined,
     specs: TunnelDepositSeatASpec[],
     total: bigint,
-  ): Promise<Map<string, string>> {
+  ): Promise<{ map: Map<string, string>; digest: string }> {
+    let digest: string | undefined;
+    const onDigest = (d: string) => {
+      digest = d;
+    };
     if (mode === "balance") {
-      return depositSeatAMany({
+      const map = await depositSeatAMany({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec,
         specs,
@@ -341,29 +382,35 @@ export class TunnelOpenBatcher {
           amount: total,
           coinType: coinType ?? MTPS_COIN_TYPE,
         },
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     }
     if (mode === "mtps-coin") {
       const stakeCoinId = await deps.prepareStake(total);
-      return depositSeatAMany({
+      const map = await depositSeatAMany({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec,
         specs,
         coinType,
         stakeCoinId,
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     }
     // SUI: sponsored deposit off a user coin, else wallet-signed gas-funded. BatchCommittedError
     // propagates immediately — a committed PTB must never retry (double-deposit).
     let sponsorErr: unknown;
     try {
-      return await depositSeatAMany({
+      const map = await depositSeatAMany({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec,
         specs,
         coinType,
         stakeCoinId: await deps.selectStakeCoin(total),
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     } catch (err) {
       if (err instanceof BatchCommittedError) throw err;
       sponsorErr = err;
@@ -372,13 +419,16 @@ export class TunnelOpenBatcher {
       `[sponsor] arena batched deposit: sponsor failed, falling back to sender-pays`,
       sponsorErr,
     );
+    digest = undefined;
     try {
-      return await depositSeatAMany({
+      const map = await depositSeatAMany({
         reads: deps.reads,
         signExec: deps.signExec,
         specs,
         coinType,
+        onDigest,
       });
+      return { map, digest: requireDigest(digest) };
     } catch (payErr) {
       if (payErr instanceof BatchCommittedError) throw payErr;
       throw new Error(
@@ -393,17 +443,14 @@ export class TunnelOpenBatcher {
     mode: FundingMode,
     coinType: string | undefined,
     req: TunnelOpenRequest,
-  ): Promise<string> {
-    const map = await this.depositChunk(
+  ): Promise<{ map: Map<string, string>; digest: string }> {
+    return this.depositChunk(
       deps,
       mode,
       coinType,
       [depositSpecOf(req)],
       req.aAmount,
     );
-    const id = map.get(normalizeSuiAddress(req.partyA.address));
-    if (!id) throw new Error(`deposit did not resolve tunnel ${req.tunnelId}`);
-    return id;
   }
 
   private async openSingle(
@@ -411,10 +458,19 @@ export class TunnelOpenBatcher {
     mode: FundingMode,
     coinType: string | undefined,
     req: TunnelOpenRequest,
-  ): Promise<string> {
+  ): Promise<{ map: Map<string, string>; digest: string }> {
     const total = req.aAmount + req.bAmount;
+    let digest: string | undefined;
+    const onDigest = (d: string) => {
+      digest = d;
+    };
+    const makeMap = (id: string): Map<string, string> => {
+      const map = new Map<string, string>();
+      map.set(normalizeSuiAddress(req.partyA.address), id);
+      return map;
+    };
     if (mode === "balance") {
-      return openAndFundSelfPlay({
+      const id = await openAndFundSelfPlay({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec as never,
         partyA: req.partyA,
@@ -426,10 +482,12 @@ export class TunnelOpenBatcher {
           amount: total,
           coinType: coinType ?? MTPS_COIN_TYPE,
         },
+        onDigest,
       });
+      return { map: makeMap(id), digest: requireDigest(digest) };
     }
     if (mode === "mtps-coin") {
-      return openAndFundSelfPlay({
+      const id = await openAndFundSelfPlay({
         reads: deps.reads,
         signExec: deps.sponsoredSignExec as never,
         partyA: req.partyA,
@@ -438,9 +496,11 @@ export class TunnelOpenBatcher {
         bAmount: req.bAmount,
         coinType,
         stakeCoinId: await deps.prepareStake(total),
+        onDigest,
       });
+      return { map: makeMap(id), digest: requireDigest(digest) };
     }
-    return withSponsorFallback(
+    const id = await withSponsorFallback(
       async () =>
         openAndFundSelfPlay({
           reads: deps.reads,
@@ -450,6 +510,7 @@ export class TunnelOpenBatcher {
           aAmount: req.aAmount,
           bAmount: req.bAmount,
           stakeCoinId: await deps.selectStakeCoin(total),
+          onDigest,
         }),
       () =>
         openAndFundSelfPlay({
@@ -459,8 +520,10 @@ export class TunnelOpenBatcher {
           partyB: req.partyB,
           aAmount: req.aAmount,
           bAmount: req.bAmount,
+          onDigest,
         }),
       "single open/fund fallback",
     );
+    return { map: makeMap(id), digest: requireDigest(digest) };
   }
 }

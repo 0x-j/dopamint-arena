@@ -6,7 +6,7 @@ use crate::party_driver::{SuiSponsoredBenchContext, TunnelOutcome};
 use tunnel_core::protocol_id::{
     API_CREDITS_V1, BATTLESHIP_SERIES_V1, BATTLESHIP_V1, BLACKJACK_BET_V1, BLACKJACK_DUEL_V1,
     BLACKJACK_V2, BOMB_IT_SERIES_V1, BOMB_IT_V1, CARO_SERIES_V1, CARO_V1, CHAT_V1, CROSS_SERIES_V1,
-    CROSS_V1, PAYMENTS_V1, QUANTUM_POKER_V2, TIC_TAC_TOE_SERIES_V1, TIC_TAC_TOE_V1,
+    CROSS_V1, FLASH_V1, PAYMENTS_V1, QUANTUM_POKER_V2, TIC_TAC_TOE_SERIES_V1, TIC_TAC_TOE_V1,
     WORLD_CANVAS_CELL_V1, WORLD_CANVAS_STROKE_V1,
 };
 use tunnel_harness::{
@@ -21,6 +21,7 @@ pub(crate) mod bomb_it;
 pub(crate) mod caro;
 pub(crate) mod chat;
 pub(crate) mod cross;
+pub(crate) mod flash;
 pub(crate) mod payments;
 pub(crate) mod quantum_poker;
 pub(crate) mod tic_tac_toe;
@@ -344,6 +345,18 @@ pub(crate) async fn play_tunnel_for(request: PlayTunnelRequest<'_>) -> TunnelOut
                                         }
                                         CHAT_V1 => {
                                             chat::play(
+                                                codec,
+                                                card_seed,
+                                                kit,
+                                                tunnel_id,
+                                                anchor_mode,
+                                                sui_context,
+                                                telemetry,
+                                            )
+                                            .await
+                                        }
+                                        FLASH_V1 => {
+                                            flash::play(
                                                 codec,
                                                 card_seed,
                                                 kit,

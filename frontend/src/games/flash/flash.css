@@ -1,0 +1,115 @@
+.flash-root {
+  --sketch-ink: #23221f;
+  --sketch-accent: #e8920c; /* amber */
+  --sketch-accent-fill: #ffe9bd;
+  --sketch-blue: #1971c2;
+  --sketch-red: #e03131;
+  --flash-paper: #fbf9f3;
+  color: var(--sketch-ink);
+  background: var(--flash-paper);
+  background-image: linear-gradient(
+    transparent 31px,
+    #bcd9ff55 32px,
+    transparent 33px
+  );
+  background-size: 100% 33px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  font-family: "Kalam", cursive;
+}
+.flash-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 2px solid var(--sketch-ink);
+  font-family: "Permanent Marker", cursive;
+  font-size: 18px;
+}
+.flash-counter {
+  font-family: "Kalam", cursive;
+  font-size: 14px;
+  opacity: 0.75;
+}
+.flash-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.flash-row {
+  display: flex;
+}
+.flash-row.b {
+  justify-content: flex-end;
+}
+.flash-bubble {
+  max-width: 64%;
+  padding: 7px 13px;
+  font-size: 17px;
+  line-height: 1.3;
+  border: 2px solid var(--sketch-ink);
+  background: #fff;
+  box-shadow: 4px 4px 0 var(--sketch-accent);
+}
+.flash-row.b .flash-bubble {
+  background: #ffe1f3;
+  box-shadow: 4px 4px 0 var(--sketch-red);
+}
+.flash-bubble__sender {
+  font-size: 12px;
+  opacity: 0.7;
+}
+.flash-foot {
+  display: flex;
+  gap: 8px;
+  padding: 9px 13px;
+  border-top: 2px solid var(--sketch-ink);
+}
+.flash-input {
+  flex: 1;
+  border: 2px dashed var(--sketch-ink);
+  background: var(--flash-paper);
+  color: var(--sketch-ink);
+  padding: 6px 11px;
+  font-family: "Kalam", cursive;
+  font-size: 16px;
+  outline: none;
+}
+.flash-btn {
+  font-family: "Permanent Marker", cursive;
+  background: var(--sketch-accent);
+  color: var(--sketch-ink);
+  border: 2px solid var(--sketch-ink);
+  padding: 5px 14px;
+  font-size: 15px;
+  cursor: pointer;
+}
+.flash-btn--stop {
+  background: var(--sketch-red);
+  color: #fffefb;
+}
+.flash-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 6px 10px 0;
+}
+.flash-btn--ghost {
+  background: transparent;
+  color: var(--sketch-ink);
+}
+.flash-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.flash-idle {
+  padding: 12px 14px;
+}
+.flash-idle__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}

@@ -19,6 +19,7 @@ pub const CARO_SERIES_V1: &str = "caro.series.v1";
 pub const CHAT_V1: &str = "chat.v1";
 pub const CROSS_V1: &str = "cross.v1";
 pub const CROSS_SERIES_V1: &str = "cross.series.v1";
+pub const FLASH_V1: &str = "flash.v1";
 pub const PAYMENTS_V1: &str = "payments.v1";
 pub const QUANTUM_POKER_V2: &str = "quantum_poker.v2";
 pub const TIC_TAC_TOE_V1: &str = "tic_tac_toe.v1";
@@ -40,6 +41,7 @@ pub const PORTED_PROTOCOL_IDS: &[&str] = &[
     CHAT_V1,
     CROSS_V1,
     CROSS_SERIES_V1,
+    FLASH_V1,
     PAYMENTS_V1,
     QUANTUM_POKER_V2,
     TIC_TAC_TOE_V1,
