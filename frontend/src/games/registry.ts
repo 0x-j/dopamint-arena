@@ -30,6 +30,24 @@ export function arenaGameIdForModule(id: string): string | undefined {
   return Array.isArray(arenaGameId) ? arenaGameId[0] : arenaGameId;
 }
 
+/** Canonicalize a transaction-feed row's game id to its MODULE id, so a per-game tab (keyed by
+ *  module id) can filter rows from both feeds. The live on-chain feed labels rows with the backend
+ *  ARENA id (underscore, e.g. `quantum_poker`); the local "My Activity" feed already uses the module
+ *  id. A module id passes through unchanged; an arena id maps to its owning module (a module hosting
+ *  several protocols matches any of them); an unclaimed id returns itself (matching only "All"). */
+export function moduleIdForGame(gameId: string): string {
+  if (modules.has(gameId)) return gameId;
+  for (const m of modules.values()) {
+    const arena = m.arenaGameId;
+    if (!arena) continue;
+    const matches = Array.isArray(arena)
+      ? arena.includes(gameId)
+      : arena === gameId;
+    if (matches) return m.id;
+  }
+  return gameId;
+}
+
 /** Every module in a workspace, catalog flag aside — the Add dialog groups by this.
  *  Modules default to the `games` workspace, so games stay together while the
  *  `payment`/`chat` widgets surface under their own headings. */

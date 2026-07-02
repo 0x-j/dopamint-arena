@@ -4,9 +4,10 @@ import { Link } from "@tanstack/react-router";
 
 import { Panel, PanelHeader, PanelTitle } from "@/components/ui/panel";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { list } from "@/games/registry";
+import { list, moduleIdForGame } from "@/games/registry";
 import { suivisionAccountUrl, suivisionTxUrl } from "@/lib/suivision";
 import { formatRelativeTime } from "@/lib/relativeTime";
+import { gameLabel } from "@/lib/gameLabel";
 import type { TxnRow } from "./types";
 import { HashLink } from "./atoms";
 
@@ -29,11 +30,15 @@ export function TransactionsFeed({
 }) {
   const [tab, setTab] = useState("all");
   const { network } = useSuiClientContext();
-  const rows = tab === "all" ? allRows : allRows.filter((t) => t.game === tab);
+  // Tabs are keyed by module id; the live feed's rows carry the backend arena id (underscore),
+  // the local feed's rows the module id. Resolve both to a module id so either feed filters right.
+  const rows =
+    tab === "all"
+      ? allRows
+      : allRows.filter((t) => moduleIdForGame(t.game) === tab);
   // On "All", rows span every game — show a GAME column so each is identifiable. On a
   // per-game tab it's redundant (the tab already names the game), so it's hidden.
   const showGame = tab === "all";
-  const gameNames = new Map(list().map((g) => [g.id, g.name]));
   const colCount = (onchain ? 5 : 2) + (showGame ? 1 : 0);
   // One reference instant for every row's relative label; the ~1/s SSE re-render keeps it fresh.
   const now = Date.now();
@@ -146,7 +151,7 @@ export function TransactionsFeed({
                     )}
                     {showGame && (
                       <td className="px-2.5 py-1.5 text-foreground">
-                        {gameNames.get(t.game) ?? t.game}
+                        {gameLabel(t.game)}
                       </td>
                     )}
                     <td

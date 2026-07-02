@@ -211,8 +211,23 @@ pub(crate) async fn register_session(
     Json(req): Json<RegisterSessionRequest>,
 ) -> Json<RegisterSessionResponse> {
     tracing::info!(user = %req.user_address, game = %req.game, tunnels = req.tunnels.len(), "register session");
+    // Capture ownership at registration (write-time) so a settled row attributes to the wallet
+    // without waiting on the chain indexer. funder = the connected wallet; an empty seat string
+    // degrades to None rather than rendering an empty-address row.
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
     for t in &req.tunnels {
         tracing::debug!(tunnel = %t.tunnel_id, party_a = %t.party_a, party_b = %t.party_b, "registered tunnel");
+        state
+            .control
+            .set_tunnel_owner(
+                &t.tunnel_id,
+                crate::state::TunnelOwner {
+                    party_a: non_empty(&t.party_a),
+                    party_b: non_empty(&t.party_b),
+                    funder: non_empty(&req.user_address),
+                },
+            )
+            .await;
     }
     let session_id = format!("sess_{}", Uuid::new_v4().simple());
     let stats_token = Uuid::new_v4().to_string();
@@ -409,6 +424,22 @@ pub(crate) async fn arena_allocate(
             // Tag the tunnel's game so the live feed's per-game tabs light up: the arena path
             // reserves (above) rather than calling register_session, which is the other writer.
             state.control.set_tunnel_game(&open.tunnel_id, game).await;
+            // Attribute the tunnel to the player at open (write-time, single-writer) so the settled
+            // row highlights as theirs with their address. The chain indexer would only ever capture
+            // the ephemeral seats + the bot as tx sender, and races the settle — so it never fills
+            // this in time. funder = the wallet (drives the "yours" highlight); party_b = the bot
+            // seat, so the counterparty renders as the OPPONENT.
+            state
+                .control
+                .set_tunnel_owner(
+                    &open.tunnel_id,
+                    crate::state::TunnelOwner {
+                        party_a: Some(req.user_address.clone()),
+                        party_b: Some(slot.bot_address.clone()),
+                        funder: Some(req.user_address.clone()),
+                    },
+                )
+                .await;
             allocations.push(ArenaAllocation {
                 game: game.clone(),
                 match_id: slot.match_id.clone(),
@@ -1029,6 +1060,34 @@ fn render_metrics(snap: &StatsSnapshot, colocated: u64, split: u64) -> String {
 mod tests {
     use super::test_support::test_state;
     use super::*;
+
+    // register_session captures each tunnel's owner at write time so a later settled row attributes
+    // to the wallet (the funder) without waiting on the chain indexer — the same write-time capture
+    // the arena path does. party_a/party_b carry the on-chain seats for the OPPONENT rendering.
+    #[tokio::test]
+    async fn register_session_captures_owner_for_each_tunnel() {
+        let state = test_state();
+        let _ = register_session(
+            State(state.clone()),
+            Json(RegisterSessionRequest {
+                user_address: "0xwallet".into(),
+                game: "blackjack".into(),
+                tunnels: vec![TunnelRef {
+                    tunnel_id: "0xtun".into(),
+                    party_a: "0xwallet".into(),
+                    party_b: "0xopp".into(),
+                }],
+            }),
+        )
+        .await;
+        let owner =
+            state.control.get_tunnel_owner("0xtun").await.expect(
+                "registration captures ownership so a settled row attributes to the wallet",
+            );
+        assert_eq!(owner.funder.as_deref(), Some("0xwallet"));
+        assert_eq!(owner.party_a.as_deref(), Some("0xwallet"));
+        assert_eq!(owner.party_b.as_deref(), Some("0xopp"));
+    }
 
     // The binary /settle body the SDK codec (`encodeSettleBody`) emits — byte-identical to
     // the TS golden vector (settleBinary.test.ts). Pasting it here pins TS↔Rust wire parity: a
@@ -1786,5 +1845,31 @@ mod arena_tests {
                 "stake comes from the game profile"
             );
         }
+    }
+
+    // Ownership is captured at open (write-time), not by the chain indexer — so a settled row can
+    // attribute to the player without racing the indexer's genesis-ascending poll. funder = the
+    // player's wallet (drives the "yours" highlight + the account link); party_b = the bot seat, so
+    // the counterparty renders as the OPPONENT rather than the player.
+    #[tokio::test]
+    async fn allocate_captures_owner_so_the_feed_attributes_to_the_player() {
+        let state = AppState::in_memory_with_arena_fleet(1, vec!["blackjack".into()]);
+        let resp = arena_allocate(
+            State(state.clone()),
+            Json(ArenaAllocateRequest {
+                user_address: "0xuser".into(),
+                games: vec![game_req("blackjack")],
+            }),
+        )
+        .await;
+        let alloc = &resp.0.allocations[0];
+        let owner = state
+            .control
+            .get_tunnel_owner(&alloc.tunnel_id)
+            .await
+            .expect("ownership is captured at open so the settled row can attribute to the player");
+        assert_eq!(owner.funder.as_deref(), Some("0xuser"));
+        assert_eq!(owner.party_a.as_deref(), Some("0xuser"));
+        assert_eq!(owner.party_b.as_deref(), Some(alloc.bot_address.as_str()));
     }
 }
