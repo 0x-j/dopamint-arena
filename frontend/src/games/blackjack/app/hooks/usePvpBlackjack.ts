@@ -10,6 +10,7 @@ import {
   parseTunnelId,
 } from "@/games/blackjack/app/lib/bjPvpOnchain";
 import { makeBlackjackResumeAdapter } from "@/games/blackjack/blackjackResumeAdapter";
+import { BlackjackSecretStore } from "@/games/blackjack/blackjackSecretStore";
 import {
   consumeArenaEntry,
   subscribeArena,
@@ -196,6 +197,9 @@ export function usePvpBlackjack(): PvpView {
     BlackjackMove
   > | null>(null);
   const roleRef = useRef<"A" | "B" | null>(null);
+  // Adopt-proof store for this seat's per-draw commit secret (blackjack keeps it only in state, which
+  // a resync adopt wipes) — see blackjackSecretStore.
+  const secretStoreRef = useRef<BlackjackSecretStore | null>(null);
   const autoRef = useRef(defaultAuto("blackjack", true));
   // Points at the latest requeue() so finishSettle (defined earlier) can recover on a settle throw.
   const requeueRef = useRef<(() => void) | null>(null);
@@ -380,6 +384,10 @@ export function usePvpBlackjack(): PvpView {
     ) => {
       tunnelRef.current = t;
       channelRef.current = channel;
+      secretStoreRef.current = new BlackjackSecretStore(info.role);
+      // Warm the store from the (possibly cold-load-restored) state so an adopt before the next
+      // commit can't lose the in-flight draw secret.
+      secretStoreRef.current.own(t.state);
       // Per-round log: record the player's (party A) result's updates.
       let lastLoggedRound = 0;
       // Initialize from the live checkpoint so the first delta is correct for both the live
@@ -387,6 +395,9 @@ export function usePvpBlackjack(): PvpView {
       let lastBalanceA = Number(t.state.balanceA);
       const onAdvance = () => {
         const st = t.state;
+        // Re-anchor our draw secret into state first: a resync adopt wiped it, but the reveal
+        // (`randomMove`) reads it back from state, so restore it from the adopt-proof store.
+        secretStoreRef.current?.anchorInto(st);
         setState({ ...st });
         if (st.phase === "round_over" && Number(st.round) > lastLoggedRound) {
           const balA = Number(st.balanceA);
@@ -430,6 +441,8 @@ export function usePvpBlackjack(): PvpView {
               () => {
                 try {
                   t.propose(mv, BigInt(Date.now()));
+                  if (mv.kind === "commit" && mv.localSecret)
+                    secretStoreRef.current?.remember(t.state, mv.localSecret);
                 } catch {
                   /* in flight */
                 }
@@ -483,10 +496,16 @@ export function usePvpBlackjack(): PvpView {
         channel,
         tunnel: t,
         adapter: makeBlackjackResumeAdapter({
-          getSecret: () => ({
-            localSecretA: t.state.localSecretA,
-            localSecretB: t.state.localSecretB,
-          }),
+          getSecret: () => {
+            // Persist from the adopt-proof store, NOT the raw state field: a resync adopt wipes
+            // `state.localSecret`, so reading state here records a null secret and a cold-load can't
+            // reveal. `own` returns the held draw secret when state was stripped.
+            const own = secretStoreRef.current?.own(t.state) ?? null;
+            return {
+              localSecretA: info.role === "A" ? own : t.state.localSecretA,
+              localSecretB: info.role === "B" ? own : t.state.localSecretB,
+            };
+          },
           setSecret: (sec) => {
             t.state.localSecretA = sec.localSecretA;
             t.state.localSecretB = sec.localSecretB;
@@ -1212,6 +1231,8 @@ export function usePvpBlackjack(): PvpView {
           setTimeout(() => {
             try {
               t.propose(mv, BigInt(Date.now()));
+              if (mv.kind === "commit" && mv.localSecret)
+                secretStoreRef.current?.remember(t.state, mv.localSecret);
             } catch {
               /* ignore */
             }

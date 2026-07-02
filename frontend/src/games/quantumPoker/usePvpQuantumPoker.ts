@@ -1205,6 +1205,17 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
     state.toAct === self;
   const legal = myTurnToBet && state && self ? legalFor(state, self) : null;
 
+  // Reliable, STATE-driven trigger for this seat's auto-driven moves — the plumbing (commit/reveal/
+  // next_hand, always) and, in Auto mode, the persona bot's betting. The imperative triggers
+  // (`onConfirmed`/`onReconciled`) can race the per-nonce debounce after a reconnect and drop an owed
+  // move, stranding the seat until a fallback timeout (or, for plumbing, forever). `sync()` sets a
+  // fresh `state` on every settle, so this re-fires `maybeAutoPropose` whenever the board advances;
+  // every debounce-cancel reason also advances the state, so it always retries with the fresh nonce.
+  // `maybeAutoPropose` is fully guarded, so redundant calls are no-ops.
+  useEffect(() => {
+    maybeAutoPropose();
+  }, [state, maybeAutoPropose]);
+
   // Per-turn countdown: if this seat doesn't act within TURN_SECONDS, auto check (else fold)
   // so an idle/away player can't stall the hand. Each seat times only its own decision.
   useEffect(() => {
