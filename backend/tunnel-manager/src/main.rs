@@ -432,6 +432,14 @@ async fn main() -> anyhow::Result<()> {
     // live feed reflects real settlements; without this the stats SSE never emits any.
     sui::spawn_event_indexer(state.clone());
 
+    // Watch the settler's SIP-58 gas pot: when it nears 0, every sponsored open/close/mint fails
+    // (a recurring dev incident). `SETTLER_GAS_LOW_SUI` is the warn threshold in whole SUI.
+    let settler_gas_low_mist = std::env::var("SETTLER_GAS_LOW_SUI")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map_or(20_000_000_000, |sui| (sui * 1e9) as u64);
+    sui::spawn_settler_gas_monitor(state.clone(), settler_gas_low_mist);
+
     // Clone before `state` is consumed by `.with_state` so we can flush after shutdown.
     let flush_state = state.clone();
     let app = Router::new()

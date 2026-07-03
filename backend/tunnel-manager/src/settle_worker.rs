@@ -120,6 +120,9 @@ pub(crate) async fn drain_once(
     for ((q, close), res) in work.into_iter().zip(results) {
         match res {
             Ok(digest) => {
+                // Success beacon for the `settle-success-count` metric filter (pairs with the
+                // settle-failure filters to give a settle success rate in CloudWatch).
+                tracing::info!(%digest, tunnel_id = %close.tunnel_id, "settle closed");
                 deps.control
                     .set_tunnel_status(&close.tunnel_id, TunnelStatus::Closed)
                     .await;

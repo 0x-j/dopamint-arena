@@ -228,6 +228,23 @@ fn parsed_addr(v: &serde_json::Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract the SIP-58 `fundsInAddressBalance` (MIST) from a `suix_getBalance` result.
+/// This is deliberately NOT `totalBalance`: sponsored gas is a `FundsWithdrawal` from the
+/// address balance alone, so SUI held in ordinary owned coins is unreachable and must not
+/// count toward the settler's spendable gas. The two fields diverge exactly when the pot is
+/// drained (owned SUI can look healthy while address-balance is 0), so reading the wrong one
+/// blinds the low-gas alarm during the incident it exists to catch.
+fn parse_funds_in_address_balance(getbalance_result: &serde_json::Value) -> anyhow::Result<u64> {
+    getbalance_result
+        .pointer("/fundsInAddressBalance")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow!("suix_getBalance missing fundsInAddressBalance: {getbalance_result}")
+        })?
+        .parse::<u64>()
+        .context("fundsInAddressBalance is not a u64")
+}
+
 /// `vector<u8>` arrives as an array of byte numbers; render to lowercase hex.
 /// NOTE: the exact `vector<u8>` JSON encoding is confirmed against a live event during the
 /// e2e milestone (see spec "Dependencies & readiness"); array-of-bytes is the documented shape.
@@ -617,6 +634,20 @@ impl SuiSettler {
             .with_context(|| format!("rpc {method}"))
     }
 
+    /// The settler's SIP-58 address-balance in SUI MIST — the pot every sponsored open, close,
+    /// and mint draws gas from. Reads `fundsInAddressBalance` (see `parse_funds_in_address_balance`
+    /// for why not `totalBalance`). When this nears 0 the whole fleet's sponsoring fails even though
+    /// the settler may still hold plenty of SUI in owned coins; this is the canonical health probe.
+    pub async fn settler_gas_balance_mist(&self) -> anyhow::Result<u64> {
+        let r = self
+            .rpc(
+                "suix_getBalance",
+                serde_json::json!([self.sender.to_string(), "0x2::sui::SUI"]),
+            )
+            .await?;
+        parse_funds_in_address_balance(&r)
+    }
+
     /// Resolve many tunnels' shared refs in ONE round-trip per ≤50-id chunk via
     /// `sui_multiGetObjects` (ADR-0029) — so a K-close batch costs ~K/50 reads, not K. Returns refs
     /// in the same order as `ids`. `initial_shared_version` is immutable for a shared object, so this
@@ -863,6 +894,31 @@ pub fn spawn_event_indexer(state: crate::state::SharedState) {
                 Err(e) => tracing::warn!(error = %e, "tunnel event poll failed; retrying"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+    });
+}
+
+/// Poll the settler's SIP-58 gas pot every 60s and log its level, warning when it falls below
+/// `low_threshold_mist`. This pot pays ALL sponsored gas (opens/closes/mints/user-sponsors); at ~0
+/// the whole fleet's sponsoring fails while `totalBalance` can still look healthy — so it is the
+/// canonical "sponsoring is about to break" signal. A CloudWatch metric filter on the
+/// "settler gas balance low" line drives the alarm; the info heartbeat is for history/inspection.
+pub fn spawn_settler_gas_monitor(state: crate::state::SharedState, low_threshold_mist: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            match state.settler.settler_gas_balance_mist().await {
+                Ok(mist) if mist < low_threshold_mist => tracing::warn!(
+                    funds_in_address_balance_mist = mist,
+                    threshold_mist = low_threshold_mist,
+                    "settler gas balance low"
+                ),
+                Ok(mist) => {
+                    tracing::info!(funds_in_address_balance_mist = mist, "settler gas balance")
+                }
+                Err(e) => tracing::warn!(error = %e, "settler gas balance query failed"),
+            }
         }
     });
 }
@@ -2030,6 +2086,25 @@ mod tests {
     fn validate_kind_rejects_undecodable_bytes() {
         let pkg = Address::from_str("0xabc").unwrap();
         assert!(validate_kind_targets(&[0xff, 0xff, 0xff], pkg, &sui_coin()).is_err());
+    }
+
+    // The settler gas probe must read the SIP-58 address-balance pot, never `totalBalance` —
+    // the two diverge exactly when the pot is drained (owned SUI stays, address-balance hits 0),
+    // and reading `totalBalance` would leave the low-gas alarm blind during that incident. Shape
+    // is a real `suix_getBalance` response from the dev settler.
+    #[test]
+    fn gas_probe_reads_address_balance_not_total() {
+        let resp = serde_json::json!({
+            "coinType": "0x2::sui::SUI",
+            "coinObjectCount": 3,
+            "totalBalance": "353499599498",
+            "lockedBalance": {},
+            "fundsInAddressBalance": "348072829876"
+        });
+        assert_eq!(
+            super::parse_funds_in_address_balance(&resp).unwrap(),
+            348_072_829_876
+        );
     }
 
     // The indexer must lift payout + transcript root + tx digest out of a real suix_queryEvents
