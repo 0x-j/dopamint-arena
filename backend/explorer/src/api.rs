@@ -231,6 +231,80 @@ pub(crate) fn peak_tps_points(
     buckets.into_values().collect()
 }
 
+/// The sharpest 1-second-resolution rate in `rows` (`(ts_secs, total_actions)`, ascending): the max
+/// counter derivative between adjacent buckets. This is the PEAK measure — a 1s burst reads at full
+/// strength here, whereas `current_tps`'s trailing window averages it down. Reuses `peak_tps_points`
+/// at stride 1, so live "Peak TPS" matches `/v1/stats/history`'s peak exactly.
+pub fn peak_1s_rate(rows: &[(i64, i64)], gap_max_secs: i64) -> f64 {
+    peak_tps_points(rows, 1, gap_max_secs)
+        .into_iter()
+        .map(|(_, v)| v)
+        .fold(0.0, f64::max)
+}
+
+/// Current TPS: the counter derivative over the trailing `window_secs`, from ascending
+/// `(ts_secs, total_actions)` rows. A pure function of the rows, so every reader of the same
+/// `metric_bucket` slice agrees — no per-instance in-memory state to diverge. An isolated recent
+/// sample (all prior rows older than the window) yields 0: a rate needs two points inside the
+/// window, so a data gap can't smear the pre-gap accrual into a fake spike. A backwards counter
+/// (Redis flush / restart) clamps to 0, never a negative rate.
+pub(crate) fn current_tps(rows: &[(i64, i64)], window_secs: i64) -> f64 {
+    let Some(&(t_last, v_last)) = rows.last() else {
+        return 0.0;
+    };
+    // Oldest row still inside the trailing window (rows are ascending, so scan from the newest).
+    let anchor = rows
+        .iter()
+        .rev()
+        .take_while(|&&(t, _)| t_last - t <= window_secs)
+        .last();
+    let Some(&(t0, v0)) = anchor else {
+        return 0.0;
+    };
+    let dt = t_last - t0;
+    if dt <= 0 {
+        return 0.0;
+    }
+    (v_last - v0).max(0) as f64 / dt as f64
+}
+
+/// One canonical live-stats frame for `/v1/stats/live`. Same camelCase wire shape the frontend
+/// already consumes as `StatsSnapshot`. `per_game` is empty in v1 (per-game rates need a per-game
+/// bucket — a later phase); `recent_events` is omitted (optional on the client — the tx log rides
+/// the separate `explorer:events` stream).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveFrame {
+    tps: f64,
+    peak_tps: f64,
+    total_actions: i64,
+    active_tunnels: i64,
+    settled_tunnels: i64,
+    per_game: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Build one live frame from the trailing `metric_bucket` rows
+/// `(ts_bucket, total_actions, active_tunnels, settled_tunnels)`, embedding the maintained
+/// `peak_tps` (all-time, kept durably by the caller — see `SettlementStore::bump_peak_tps`). `None`
+/// when there are no rows (indexer stalled / cold start) so the caller holds the last frame instead
+/// of emitting a fake zero. `tps` is derived purely from the shared rows ⇒ coherent across replicas.
+pub fn derive_live_frame(
+    rows: &[(i64, i64, i64, i64)],
+    window_secs: i64,
+    peak_tps: f64,
+) -> Option<LiveFrame> {
+    let &(_, total, active, settled) = rows.last()?;
+    let series: Vec<(i64, i64)> = rows.iter().map(|&(t, v, _, _)| (t, v)).collect();
+    Some(LiveFrame {
+        tps: current_tps(&series, window_secs),
+        peak_tps,
+        total_actions: total,
+        active_tunnels: active,
+        settled_tunnels: settled,
+        per_game: std::collections::BTreeMap::new(),
+    })
+}
+
 /// Fetch resolution (seconds/sample) pulled from the store: full 1s fidelity for live windows,
 /// coarsening only enough to keep a wide (30-day) range within `MAX_FETCH_SAMPLES` rows. Always
 /// finer than the display bucket, so peaks still survive the in-memory MAX rollup.
@@ -314,6 +388,115 @@ mod tests {
     use shared::memory::InMemorySettlementStore;
     use shared::{LifecycleKind, SettlementRow};
     use tower::ServiceExt; // oneshot
+
+    // A steady counter (100/s) must read back as a flat 100/s over the trailing window — the
+    // baseline the live number is built on.
+    #[test]
+    fn current_tps_steady_counter_reads_the_rate() {
+        let rows: Vec<(i64, i64)> = (0..=6).map(|t| (t, t * 100)).collect();
+        assert!((current_tps(&rows, 5) - 100.0).abs() < 1e-9);
+    }
+
+    // The headline case: a sustained high rate reads back accurately (the fleet demo figure).
+    #[test]
+    fn current_tps_sustained_high_rate_reads_back_accurately() {
+        let rows: Vec<(i64, i64)> = (0..=8).map(|t| (t, t * 1_000_000)).collect();
+        assert!((current_tps(&rows, 5) - 1_000_000.0).abs() < 1.0);
+    }
+
+    // Regression lock for the "spike then 0" aliasing: the counter advances +200 every 2 s, so the
+    // per-second series is 0,0,200,200,400,400,600. A per-row delta reads 200 one second and 0 the
+    // next; the windowed rate must instead be a bounded average — never 0, never the 200 spike.
+    #[test]
+    fn current_tps_bursty_counter_is_a_steady_average_not_zero_or_a_spike() {
+        let totals = [0i64, 0, 200, 200, 400, 400, 600];
+        let rows: Vec<(i64, i64)> = totals
+            .iter()
+            .enumerate()
+            .map(|(t, &v)| (t as i64, v))
+            .collect();
+        for last in 5..rows.len() {
+            let r = current_tps(&rows[..=last], 5);
+            assert!(
+                r > 0.0 && r < 200.0,
+                "rate {r} at t={last} must be a bounded average"
+            );
+        }
+    }
+
+    // A counter that goes backwards (Redis flush / restart) clamps to 0, never a negative spike.
+    #[test]
+    fn current_tps_counter_reset_is_zero_not_negative() {
+        let rows = vec![(0i64, 1_000_000i64), (1, 1_000_050), (2, 0)];
+        assert_eq!(current_tps(&rows, 5), 0.0);
+    }
+
+    // Indexer downtime leaves one lone recent sample inside the window; a rate needs two points
+    // in-window, so this reads 0 — the pre-gap accrual is NOT smeared into a fake spike.
+    #[test]
+    fn current_tps_isolated_sample_after_a_gap_is_zero_not_a_spike() {
+        let rows = vec![(0i64, 5i64), (15, 1_000_000)];
+        assert_eq!(current_tps(&rows, 5), 0.0);
+    }
+
+    // No divide-by-zero on empty or single-row input.
+    #[test]
+    fn current_tps_empty_or_single_row_is_zero() {
+        assert_eq!(current_tps(&[], 5), 0.0);
+        assert_eq!(current_tps(&[(3i64, 42i64)], 5), 0.0);
+    }
+
+    // No rows (indexer stalled / cold start) ⇒ None, so the caller holds the last frame.
+    #[test]
+    fn derive_live_frame_is_none_without_rows() {
+        assert!(derive_live_frame(&[], 5, 0.0).is_none());
+    }
+
+    // The frame reports the windowed current rate, the LATEST row's counters, and the peak it is
+    // handed (maintained durably by the caller, not recomputed here — so it passes through verbatim).
+    #[test]
+    fn derive_live_frame_sets_rate_latest_counters_and_peak() {
+        let rows: Vec<(i64, i64, i64, i64)> = (0..=6).map(|t| (t, t * 100, 40 + t, 7)).collect();
+        let frame = derive_live_frame(&rows, 5, 5_000_000.0).unwrap();
+        assert!((frame.tps - 100.0).abs() < 1e-9);
+        assert_eq!(frame.total_actions, 600);
+        assert_eq!(frame.active_tunnels, 46); // latest row: 40 + 6
+        assert_eq!(frame.settled_tunnels, 7);
+        assert!((frame.peak_tps - 5_000_000.0).abs() < 1e-9); // handed in, passed through verbatim
+    }
+
+    // The sharp 1s-resolution peak: a 6M burst in ONE second reads at full strength (what the
+    // history chart shows), NOT averaged down the way the 5s current window reports it (~1.2M).
+    // This is why peak and current use different windows.
+    #[test]
+    fn peak_1s_rate_captures_the_burst_not_the_average() {
+        let rows = [
+            (0i64, 1_000_000i64),
+            (1, 1_000_000),
+            (2, 1_000_000),
+            (3, 7_000_000), // +6,000,000 in one second
+            (4, 7_000_000),
+            (5, 7_000_000),
+            (6, 7_000_000),
+        ];
+        assert!((peak_1s_rate(&rows, 10) - 6_000_000.0).abs() < 1.0);
+        assert!(current_tps(&rows, 5) < 1_500_000.0); // same burst, diluted over 5s
+    }
+
+    // The wire shape the frontend consumes: camelCase keys, perGame present (empty in v1),
+    // recentEvents omitted (optional on the client).
+    #[test]
+    fn derive_live_frame_serializes_camelcase_for_the_frontend() {
+        let rows = [(0i64, 0i64, 3i64, 4i64), (1, 100, 3, 4)];
+        let frame = derive_live_frame(&rows, 5, 0.0).unwrap();
+        let j = serde_json::to_value(&frame).unwrap();
+        assert!(j.get("peakTps").is_some());
+        assert!(j.get("totalActions").is_some());
+        assert!(j.get("activeTunnels").is_some());
+        assert!(j.get("settledTunnels").is_some());
+        assert_eq!(j["perGame"], serde_json::json!({}));
+        assert!(j.get("recentEvents").is_none());
+    }
 
     fn state_with(rows: Vec<SettlementRow>) -> ApiState {
         let store = InMemorySettlementStore::new();

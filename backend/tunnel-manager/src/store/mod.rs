@@ -35,9 +35,8 @@ pub trait ControlStore: Send + Sync {
     async fn set_tunnel_status(&self, id: &str, s: crate::state::TunnelStatus);
     async fn get_tunnel_status(&self, id: &str) -> Option<crate::state::TunnelStatus>;
     async fn add_actions(&self, game: &str, delta: u64);
-    /// Fold the latest `tps` into the maintained peak (running max). Idempotent on a lower value.
-    async fn update_peak_tps(&self, tps: f64);
-    /// Cumulative snapshot; `tps` is filled by the broadcaster from its per-tick diff.
+    /// Cumulative counter snapshot. The TPS rate is derived downstream (explorer, from the deduped
+    /// `metric_bucket` series), not filled here — raw counters keep derivation single-source.
     async fn snapshot(&self) -> crate::state::StatsSnapshot;
     /// Append a displayable lifecycle row to the bounded recent-events ring, idempotent by
     /// `tx_digest` (cursor-restart replays and multi-instance indexers must not double-insert).

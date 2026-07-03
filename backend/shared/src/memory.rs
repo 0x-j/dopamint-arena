@@ -14,6 +14,8 @@ use crate::{
 pub struct InMemorySettlementStore {
     rows: RwLock<HashMap<String, SettlementRow>>,
     settled: RwLock<i64>,
+    /// Maintained all-time peak TPS (a display aggregate; see `bump_peak_tps`).
+    peak: RwLock<f64>,
 }
 
 impl InMemorySettlementStore {
@@ -126,11 +128,31 @@ impl SettlementStore for InMemorySettlementStore {
     ) -> anyhow::Result<Vec<(i64, i64)>> {
         Ok(vec![])
     }
+
+    async fn metric_recent(&self, _from_secs: i64) -> anyhow::Result<Vec<(i64, i64, i64, i64)>> {
+        Ok(vec![]) // no time-series in the in-memory store; see metric_history
+    }
+
+    async fn bump_peak_tps(&self, candidate: f64) -> anyhow::Result<f64> {
+        let mut p = self.peak.write().unwrap();
+        if candidate > *p {
+            *p = candidate;
+        }
+        Ok(*p)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bump_peak_tps_is_a_running_max() {
+        let s = InMemorySettlementStore::new();
+        assert_eq!(s.bump_peak_tps(10.0).await.unwrap(), 10.0);
+        assert_eq!(s.bump_peak_tps(4.0).await.unwrap(), 10.0);
+        assert_eq!(s.bump_peak_tps(25.0).await.unwrap(), 25.0);
+    }
 
     fn row(digest: &str, ts: i64, kind: LifecycleKind) -> SettlementRow {
         SettlementRow {

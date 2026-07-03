@@ -90,39 +90,63 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Second bridge: stats:snapshot -> stats_tx, relayed to /v1/stats/live. N tunnel-manager
-    // instances publish ~identical snapshots, so SSE viewers see a few duplicate frames/tick;
-    // the frontend overwrites state idempotently, so this is harmless. `_stats_rx` is held for
-    // the same reason as `_rx` above (keep the channel from reporting zero receivers).
+    // Live-stats deriver (ADR: read-time derivation). Once a second, derive ONE coherent frame from
+    // the deduped `metric_bucket` counter series — the same source `/v1/stats/history` reads — and
+    // fan it out to `/v1/stats/live`. `derive_live_frame` is a pure function of the shared rows, so
+    // every explorer-api replica computes the identical value: no per-instance windows, no
+    // interleaving (the flicker this replaces). `_stats_rx` is held so the channel keeps ≥1 receiver
+    // (same reason as `_rx` above).
     let (stats_tx, _stats_rx) = tokio::sync::broadcast::channel::<String>(256);
-    if let Ok(url) = std::env::var("REDIS_PUBSUB_URL") {
-        let sub = Builder::from_config(RedisConfig::from_url(&url)?).build_subscriber_client()?;
-        sub.init().await?;
-        sub.subscribe("stats:snapshot").await?;
-        let mut messages = sub.message_rx();
-        let tx2 = stats_tx.clone();
+    {
+        let store = state.store.clone();
+        let tx = stats_tx.clone();
         tokio::spawn(async move {
-            use tokio::sync::broadcast::error::RecvError;
-            let _sub = sub;
+            // Current TPS averages over WINDOW_SECS (smooth — kills the flicker); PEAK is the sharp
+            // 1s-resolution max, maintained DURABLY via bump_peak_tps (GREATEST) so it matches
+            // /v1/stats/history's peak, survives restarts, and stays coherent across replicas. Fetch
+            // a touch more than the window so a 5s rate always has two in-window points under ~1s lag.
+            const WINDOW_SECS: i64 = 5;
+            const FETCH_SECS: i64 = 8;
+            const GAP_MAX_SECS: i64 = 10;
+            let unix_secs = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            };
+            // Seed the durable peak from the last 24h of history so a fresh deploy shows the true
+            // peak immediately instead of climbing from 0 (best-effort).
+            let seed_now = unix_secs();
+            if let Ok(hist) = store.metric_history(seed_now - 86_400, seed_now, 1).await {
+                let _ = store
+                    .bump_peak_tps(explorer::api::peak_1s_rate(&hist, GAP_MAX_SECS))
+                    .await;
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                match messages.recv().await {
-                    Ok(msg) => {
-                        if let Some(s) = msg.value.as_string() {
-                            let _ = tx2.send(s);
-                        }
+                ticker.tick().await;
+                let now = unix_secs();
+                let rows = match store.metric_recent(now - FETCH_SECS).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "live-stats metric_recent failed");
+                        continue;
                     }
-                    Err(RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            skipped = n,
-                            "stats:snapshot message_rx lagged; live samples dropped"
-                        );
+                };
+                // Fold the sharpest recent 1s-rate into the durable all-time peak; the returned value
+                // is coherent across replicas (GREATEST) and is what the frame reports.
+                let series: Vec<(i64, i64)> = rows.iter().map(|&(t, v, _, _)| (t, v)).collect();
+                let peak = store
+                    .bump_peak_tps(explorer::api::peak_1s_rate(&series, GAP_MAX_SECS))
+                    .await
+                    .unwrap_or(0.0);
+                // None ⇒ no fresh rows (indexer stalled / cold start) ⇒ hold the last frame.
+                if let Some(frame) = explorer::api::derive_live_frame(&rows, WINDOW_SECS, peak) {
+                    if let Ok(json) = serde_json::to_string(&frame) {
+                        let _ = tx.send(json);
                     }
-                    Err(RecvError::Closed) => break,
                 }
             }
-            tracing::warn!(
-                "Redis stats:snapshot subscription closed; SSE live stats silent until restart"
-            );
         });
     }
 

@@ -122,8 +122,10 @@ pub struct SettlementPage {
     pub next_cursor: Option<String>,
 }
 
-/// Read-only settlement store. Single writer (framework indexer via Diesel), many readers
-/// (explorer-api). `upsert`/`last_checkpoint` are NOT on this trait — the framework owns writes.
+/// Read store for settlement rows + metric counters (single writer: the framework indexer via
+/// Diesel; many readers: explorer-api). `upsert`/`last_checkpoint` are NOT here — the framework owns
+/// those. The one write it exposes is `bump_peak_tps`, a commutative display aggregate the read tier
+/// maintains.
 #[async_trait::async_trait]
 pub trait SettlementStore: Send + Sync {
     async fn get(&self, tx_digest: &str) -> anyhow::Result<Option<SettlementRow>>;
@@ -141,6 +143,16 @@ pub trait SettlementStore: Send + Sync {
         to_secs: i64,
         stride_secs: i64,
     ) -> anyhow::Result<Vec<(i64, i64)>>;
+    /// Newest `metric_bucket` rows with `ts_bucket >= from_secs`, ascending —
+    /// `(ts_bucket, total_actions, active_tunnels, settled_tunnels)`. The live-stats deriver reads
+    /// the last few seconds (`from = now - window`) and derives the rate on the fly, so the value
+    /// is a pure function of these shared rows — coherent across replicas, no per-instance state.
+    /// Empty ⇒ no fresh data (indexer stalled) ⇒ the deriver holds the last frame, not a fake 0.
+    async fn metric_recent(&self, from_secs: i64) -> anyhow::Result<Vec<(i64, i64, i64, i64)>>;
+    /// Fold a candidate rate into the maintained all-time peak TPS and return the new peak
+    /// (`GREATEST`, idempotent on a lower value). Commutative, so concurrent explorer-api replicas
+    /// converge to the true max, and durable across restarts (unlike an in-process running max).
+    async fn bump_peak_tps(&self, candidate: f64) -> anyhow::Result<f64>;
 }
 
 #[cfg(test)]

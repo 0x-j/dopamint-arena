@@ -140,6 +140,34 @@ impl SettlementStore for PgSettlementStore {
         .await?;
         Ok(rows)
     }
+
+    async fn metric_recent(&self, from_secs: i64) -> anyhow::Result<Vec<(i64, i64, i64, i64)>> {
+        // Full per-second rows for the trailing window (caller passes `now - window`): the deriver
+        // takes the rate from the `total_actions` series and the latest counters from the last row.
+        let rows = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT ts_bucket, total_actions, active_tunnels, settled_tunnels FROM metric_bucket \
+             WHERE ts_bucket >= $1 ORDER BY ts_bucket ASC",
+        )
+        .bind(from_secs)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn bump_peak_tps(&self, candidate: f64) -> anyhow::Result<f64> {
+        // Commutative running max: GREATEST makes concurrent bumps from N replicas converge to the
+        // true peak regardless of order, and it survives restarts. RETURNING hands back the current
+        // peak so the deriver puts it straight in the frame.
+        let peak: f64 = sqlx::query_scalar(
+            "INSERT INTO metric_meta (key, value) VALUES ('peak_tps', $1) \
+             ON CONFLICT (key) DO UPDATE SET value = GREATEST(metric_meta.value, EXCLUDED.value) \
+             RETURNING value",
+        )
+        .bind(candidate)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(peak)
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +257,60 @@ mod tests {
             .await
             .unwrap();
         Some(s)
+    }
+
+    // metric_recent returns the trailing window (ts_bucket >= from_secs) ascending, with all four
+    // counter columns — the exact slice the live deriver reads to compute the rate + latest totals.
+    #[tokio::test]
+    async fn metric_recent_returns_the_trailing_window_ascending() {
+        let Some(s) = store().await else {
+            return; // gated on TEST_DATABASE_URL
+        };
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS metric_bucket (ts_bucket BIGINT PRIMARY KEY, \
+             total_actions BIGINT NOT NULL, active_tunnels BIGINT NOT NULL, \
+             settled_tunnels BIGINT NOT NULL)",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("TRUNCATE metric_bucket")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        for (ts, total) in [(100i64, 1000i64), (101, 1500), (102, 2100)] {
+            sqlx::query("INSERT INTO metric_bucket VALUES ($1,$2,5,7)")
+                .bind(ts)
+                .bind(total)
+                .execute(&s.pool)
+                .await
+                .unwrap();
+        }
+        // from=101 drops the t=100 row; the rest come back ascending with all four columns.
+        let rows = s.metric_recent(101).await.unwrap();
+        assert_eq!(rows, vec![(101, 1500, 5, 7), (102, 2100, 5, 7)]);
+    }
+
+    // bump_peak_tps is a durable running max: a lower candidate never lowers the stored peak.
+    #[tokio::test]
+    async fn bump_peak_tps_is_a_durable_running_max() {
+        let Some(s) = store().await else {
+            return; // gated on TEST_DATABASE_URL
+        };
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS metric_meta (key TEXT PRIMARY KEY, \
+             value DOUBLE PRECISION NOT NULL)",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM metric_meta WHERE key = 'peak_tps'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(s.bump_peak_tps(10.0).await.unwrap(), 10.0);
+        assert_eq!(s.bump_peak_tps(4.0).await.unwrap(), 10.0); // lower ignored
+        assert_eq!(s.bump_peak_tps(25.0).await.unwrap(), 25.0);
     }
 
     /// Seed a settled row directly (no upsert on the read store — the indexer owns writes).
