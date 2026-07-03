@@ -110,6 +110,23 @@ if (cfg.enokiApiKey) {
   enokiApiKeySecretArn = secret.arn;
 }
 
+// Arena allocate session-JWT signing secret (B5): same secret-config => Secrets Manager => ECS
+// `secrets` path. Absent => the backend leaves the allocate auth gate OFF (rollout switch).
+let sessionJwtSecretArn: pulumi.Output<string> | undefined;
+if (cfg.sessionJwtSecret) {
+  const secret = new aws.secretsmanager.Secret(
+    `dopamint-${cfg.environment}-session-jwt-secret`,
+    {
+      description: `Arena allocate session-JWT signing secret for dopamint-${cfg.environment}`,
+    },
+  );
+  new aws.secretsmanager.SecretVersion(
+    `dopamint-${cfg.environment}-session-jwt-secret-version`,
+    { secretId: secret.id, secretString: cfg.sessionJwtSecret },
+  );
+  sessionJwtSecretArn = secret.arn;
+}
+
 // Wallet-pool passphrase (PR #124): same secret-config => Secrets Manager => ECS `secrets` path.
 // Absent => the backend can't open the pool and the arena opener degrades to Noop (no funded seat-B).
 let walletPoolAccessSecretArn: pulumi.Output<string> | undefined;
@@ -170,6 +187,7 @@ const iam = createIam(`dopamint-${cfg.environment}`, {
     ...(settlerKeySecretArn ? [settlerKeySecretArn] : []),
     ...(faucetAdminTokenSecretArn ? [faucetAdminTokenSecretArn] : []),
     ...(enokiApiKeySecretArn ? [enokiApiKeySecretArn] : []),
+    ...(sessionJwtSecretArn ? [sessionJwtSecretArn] : []),
     ...(walletPoolAccessSecretArn ? [walletPoolAccessSecretArn] : []),
   ],
   taskRoleTranscriptsBucketArn: transcriptsBucket.bucketArn,
@@ -190,6 +208,7 @@ const backend = createBackend({
   s3TranscriptsBucket: transcriptsBucket.bucketName,
   faucetAdminTokenSecretArn,
   enokiApiKeySecretArn,
+  sessionJwtSecretArn,
   walletPoolAccessSecretArn,
   ollamaEnabled: cfg.ollamaEnabled,
   ollamaModel: cfg.ollamaModel,

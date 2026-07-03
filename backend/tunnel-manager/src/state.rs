@@ -87,6 +87,9 @@ pub struct AppState {
     pub faucet_max_per_window: u32,
     /// Shared bearer secret gating the internal faucet; `None` disables it (fail closed).
     pub faucet_admin_token: Option<String>,
+    /// HS256 secret for the arena session-JWT gate (auth.rs, B5). `None` disables the gate so
+    /// `arena_allocate` stays unauthenticated — the rollout switch; set it to enforce.
+    pub session_jwt_secret: Option<String>,
 }
 
 pub type SharedState = std::sync::Arc<AppState>;
@@ -149,6 +152,7 @@ impl AppState {
             faucet_cooldown_secs: 1_800,
             faucet_max_per_window: 5,
             faucet_admin_token: None,
+            session_jwt_secret: None,
         })
     }
 }

@@ -35,6 +35,8 @@ sui-transaction-builder.workspace = true
 sui-crypto.workspace = true
 bcs.workspace = true
 base64.workspace = true
+# Session-auth JWT (HS256): backend-issued token gating spend endpoints (arena allocate). See auth.rs.
+jsonwebtoken = "9"
 aws-config = "1"
 aws-sdk-s3 = "1"
 # Direct rustls dep so we can install `ring` as the process-default CryptoProvider at

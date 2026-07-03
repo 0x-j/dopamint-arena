@@ -70,6 +70,7 @@ pub(crate) mod test_support {
             faucet_cooldown_secs: 1_800,
             faucet_max_per_window: 5,
             faucet_admin_token: None,
+            session_jwt_secret: None,
         })
     }
 }
@@ -320,6 +321,74 @@ pub(crate) struct ArenaAllocateResponse {
     allocations: Vec<ArenaAllocation>,
 }
 
+/// Arena session-JWT TTL (seconds). Short so a leaked token expires fast; the FE silently re-auths
+/// via Enoki (no popup) when it nears expiry. 30 min balances leak-window vs re-auth churn.
+const SESSION_TTL_SECS: u64 = 30 * 60;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthSessionResponse {
+    /// The backend session JWT the FE attaches as `Authorization: Bearer` to `/v1/arena/allocate`.
+    session_jwt: String,
+    /// The canonical address Enoki resolved for the id_token; the FE pins its allocate `userAddress`
+    /// to this so the two always agree at the gate.
+    address: String,
+    expires_in_secs: u64,
+}
+
+/// Exchange a fresh Enoki/zkLogin id_token for a short-lived backend session JWT — the arena gate
+/// credential (B5). The id_token arrives in the `zklogin-jwt` header (mirroring Enoki) or
+/// `Authorization: Bearer`; Enoki (`GET /v1/zklogin`) validates it AND returns the canonical address,
+/// which we bind into the minted session JWT. Fails closed (503) when the gate or Enoki is not
+/// configured, so the FE learns auth is unavailable instead of silently receiving no token.
+pub(crate) async fn auth_session(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let Some(secret) = state.session_jwt_secret.as_deref() else {
+        return ApiError::resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_disabled",
+            "session auth is not configured (SESSION_JWT_SECRET unset)",
+        )
+        .into_response();
+    };
+    let Some(enoki) = state.enoki.as_ref() else {
+        return ApiError::resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_disabled",
+            "identity verification unavailable (Enoki not configured)",
+        )
+        .into_response();
+    };
+    let Some(id_token) = id_token_from_headers(&headers) else {
+        return ApiError::resp(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing zkLogin id token (send it in the `zklogin-jwt` header or Authorization: Bearer)",
+        )
+        .into_response();
+    };
+    let address = match enoki.verify_zklogin(id_token).await {
+        Ok(a) => a,
+        Err(e) => {
+            return ApiError::resp(StatusCode::UNAUTHORIZED, "invalid_identity", &e.to_string())
+                .into_response();
+        }
+    };
+    match crate::auth::mint_session_jwt(secret, &address, SESSION_TTL_SECS, unix_now()) {
+        Ok(session_jwt) => Json(AuthSessionResponse {
+            session_jwt,
+            address,
+            expires_in_secs: SESSION_TTL_SECS,
+        })
+        .into_response(),
+        Err(e) => ApiError::resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mint_failed",
+            &e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
 /// Max tunnel opens per batched PTB (Design 1). ~7 catalog games fit comfortably; 30 is a flood cap
 /// well under the ~1024-command / event ceilings (30 games ≈ 120 commands, ≈ 90 events). Larger
 /// requests chunk into ceil(N / 30) PTBs. Matches the frontend deposit-batch cap.
@@ -332,8 +401,37 @@ const ARENA_OPEN_BATCH_MAX: usize = 30;
 /// the frontend opens only what it actually got.
 pub(crate) async fn arena_allocate(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<ArenaAllocateRequest>,
-) -> Json<ArenaAllocateResponse> {
+) -> Result<Json<ArenaAllocateResponse>, Response> {
+    // B5: gate house on-chain spend behind a verified session (auth.rs). Disabled until
+    // SESSION_JWT_SECRET is set (rollout switch); when set, require a valid session JWT whose `sub`
+    // equals `user_address`, so neither an anonymous caller nor a stolen token can burn settler gas.
+    if let crate::auth::GateOutcome::Denied(reason) = crate::auth::arena_session_gate(
+        state.session_jwt_secret.as_deref(),
+        bearer_token(&headers),
+        &req.user_address,
+    ) {
+        let (status, code, msg) = match reason {
+            crate::auth::DenyReason::MissingToken => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing session token (POST /v1/auth/session first)",
+            ),
+            crate::auth::DenyReason::InvalidToken => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "invalid or expired session token",
+            ),
+            crate::auth::DenyReason::AddressMismatch => (
+                StatusCode::FORBIDDEN,
+                "address_mismatch",
+                "session does not authorize this user_address",
+            ),
+        };
+        return Err(ApiError::resp(status, code, msg).into_response());
+    }
+
     // Plan: keep only served games that have a `GameProfile` (the stake source that makes the on-chain
     // deposit match the off-chain initial balances the FE co-signs), preserving request order.
     let mut planned: Vec<(String, String, u64)> = Vec::new(); // (game_id, user_eph_pubkey, stake_each)
@@ -355,9 +453,9 @@ pub(crate) async fn arena_allocate(
         ));
     }
     if planned.is_empty() {
-        return Json(ArenaAllocateResponse {
+        return Ok(Json(ArenaAllocateResponse {
             allocations: Vec::new(),
-        });
+        }));
     }
 
     // Design 1 batching: check out ONE seat-B address for the whole request — every tunnel shares
@@ -451,7 +549,7 @@ pub(crate) async fn arena_allocate(
         }
     }
     tracing::info!(user = %req.user_address, allocated = allocations.len(), "arena allocate");
-    Json(ArenaAllocateResponse { allocations })
+    Ok(Json(ArenaAllocateResponse { allocations }))
 }
 
 /// The user finished the batched deposit PTB. In the co-located design the bot is spawned at
@@ -1009,6 +1107,32 @@ pub(crate) fn settled_event(
         timestamp_ms,
         proof_url: non_empty(proof_url),
     }
+}
+
+/// The token from `Authorization: Bearer <token>`, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+}
+
+/// The zkLogin id_token from either the `zklogin-jwt` header (preferred; mirrors Enoki's own header
+/// name) or `Authorization: Bearer` — the FE may send it either way.
+fn id_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("zklogin-jwt")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| bearer_token(headers))
+}
+
+/// Current unix time (seconds) for the session-JWT `exp`; isolated so `auth::mint_session_jwt` stays
+/// clock-free (hence unit-testable with an injected `now`).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// True iff `Authorization: Bearer <token>` is present and equals `expected`.
@@ -1730,12 +1854,14 @@ mod arena_tests {
         let state = AppState::in_memory_for_test();
         let resp = arena_allocate(
             State(state),
+            axum::http::HeaderMap::new(),
             Json(ArenaAllocateRequest {
                 user_address: "0xuser".into(),
                 games: vec![game_req("blackjack")],
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(resp.0.allocations.is_empty());
     }
 
@@ -1747,12 +1873,14 @@ mod arena_tests {
         let state = AppState::in_memory_with_arena_fleet(1, vec!["blackjack".into()]);
         let resp = arena_allocate(
             State(state),
+            axum::http::HeaderMap::new(),
             Json(ArenaAllocateRequest {
                 user_address: "0xuser".into(),
                 games: vec![game_req("blackjack")],
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             resp.0.allocations.len(),
             1,
@@ -1771,12 +1899,14 @@ mod arena_tests {
         let state = AppState::in_memory_with_arena_fleet(1, vec!["blackjack".into()]);
         let resp = arena_allocate(
             State(state),
+            axum::http::HeaderMap::new(),
             Json(ArenaAllocateRequest {
                 user_address: "0xuser".into(),
                 games: vec![game_req("quantum_poker")], // enabled fleet, but not in the served set
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             resp.0.allocations.is_empty(),
             "a game outside FLEET_COLOCATED_GAMES is not served"
@@ -1795,12 +1925,14 @@ mod arena_tests {
             AppState::in_memory_with_arena_fleet(3, games.iter().map(|g| g.to_string()).collect());
         let resp = arena_allocate(
             State(state),
+            axum::http::HeaderMap::new(),
             Json(ArenaAllocateRequest {
                 user_address: "0xuser".into(),
                 games: games.iter().map(|g| game_req(g)).collect(),
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         let allocs = &resp.0.allocations;
         assert_eq!(

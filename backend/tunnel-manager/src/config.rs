@@ -44,6 +44,10 @@ pub struct Config {
     /// Shared bearer secret gating the internal faucet. Unset = internal endpoint disabled (503) —
     /// fails closed so an unlimited mint can never be accidentally open.
     pub faucet_admin_token: Option<String>,
+    /// HS256 secret for the arena session-JWT gate (auth.rs, B5). Unset => the gate is DISABLED and
+    /// `arena_allocate` stays unauthenticated (rollout switch, so a partial deploy can't brick play);
+    /// set it (and ship the FE token) to enforce identity on house on-chain spend.
+    pub session_jwt_secret: Option<String>,
     pub walrus_publisher_url: Option<String>,
     pub walrus_aggregator_url: Option<String>,
     pub redis_cache_url: Option<String>,
@@ -113,6 +117,7 @@ impl Config {
                 .filter(|&n| n > 0)
                 .unwrap_or(5),
             faucet_admin_token: opt("FAUCET_ADMIN_TOKEN"),
+            session_jwt_secret: opt("SESSION_JWT_SECRET"),
             walrus_publisher_url: opt("WALRUS_PUBLISHER_URL"),
             walrus_aggregator_url: opt("WALRUS_AGGREGATOR_URL"),
             redis_cache_url: opt("REDIS_CACHE_URL"),

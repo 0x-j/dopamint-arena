@@ -3,6 +3,7 @@
 // deposit seat A into every pre-opened tunnel in ONE batched PTB (the batcher's deposit mode). The
 // tunnel activates on that single signature; each game then plays genuine two-party over the relay.
 import { fromHex, toHex } from "@mysten/sui/utils";
+import { ensureSessionJwt } from "./authSession";
 import { requestTunnelOpen } from "./sharedTunnelOpenBatcher";
 import type { TunnelOpenRequest } from "./tunnelOpenBatcher";
 import type { PartyOnchain } from "./tunnelTx";
@@ -48,6 +49,9 @@ interface ArenaApi {
   /** Backend base URL; "" (same-origin) by default. Mirrors `resolveBackendUrl` in controlPlane. */
   apiBase?: string;
   fetchFn?: typeof fetch;
+  /** Backend session JWT (B5) attached as `Authorization: Bearer` on allocate. Omitted when auth is
+   *  off or unavailable — the backend gate is disabled until SESSION_JWT_SECRET is set. */
+  sessionJwt?: string;
 }
 
 const backendUrl = (apiBase?: string): string =>
@@ -62,9 +66,13 @@ export async function allocateArenaBots(
   api: ArenaApi = {},
 ): Promise<ArenaAllocation[]> {
   const doFetch = api.fetchFn ?? fetch;
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (api.sessionJwt) headers.authorization = `Bearer ${api.sessionJwt}`;
   const res = await doFetch(`${backendUrl(api.apiBase)}/v1/arena/allocate`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify({ userAddress, games }),
   });
   if (!res.ok) throw new Error(`arena allocate failed: ${res.status}`);
@@ -113,22 +121,36 @@ export async function enterArena(
     usesAddressBalance?: boolean;
     /** Called with the committed deposit PTB digest for each game once the batched open lands. */
     onDepositDigest?: (game: string, digest: string) => void;
+    /** Yields the fresh Enoki id_token to authorize allocate (B5); null for a non-zkLogin wallet.
+     *  When set, `enterArena` exchanges it for a session JWT and attaches it to allocate. */
+    getIdToken?: () => Promise<string | null>;
   } & ArenaApi,
 ): Promise<ArenaAllocation[]> {
   // A fresh ephemeral key per game, BEFORE allocate — its pubkey is baked into the tunnel at create.
+  // Run key-gen and the (B5) session-JWT mint CONCURRENTLY so the auth round-trip overlaps key
+  // generation instead of adding to time-to-play. `sessionJwt` is null when there's no zkLogin
+  // identity or the gate is off, and allocate then proceeds unauthenticated. The mint is pinned to
+  // `userAddress`, so a token cached for a different account (a same-browser switch) is re-minted.
   const parties = new Map<string, PartyOnchain>();
-  await Promise.all(
-    opts.games.map(async (game) => {
-      parties.set(game, await opts.makeUserParty(game));
-    }),
-  );
+  const [, sessionJwt] = await Promise.all([
+    Promise.all(
+      opts.games.map(async (game) => {
+        parties.set(game, await opts.makeUserParty(game));
+      }),
+    ),
+    opts.getIdToken
+      ? ensureSessionJwt(opts.getIdToken, opts, {
+          address: opts.userAddress,
+        }).then((t) => t ?? undefined)
+      : Promise.resolve(opts.sessionJwt),
+  ]);
   const allocations = await allocateArenaBots(
     opts.games.map((game) => ({
       id: game,
       userEphPubkey: toHex(parties.get(game)!.publicKey),
     })),
     opts.userAddress,
-    opts,
+    { apiBase: opts.apiBase, fetchFn: opts.fetchFn, sessionJwt },
   );
   const open = opts.open ?? requestTunnelOpen;
   // Deposit seat A into every pre-opened tunnel. The batcher coalesces these into ONE PTB (one

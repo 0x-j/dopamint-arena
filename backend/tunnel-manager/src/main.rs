@@ -1,6 +1,7 @@
 //! tunnel-manager — Dopamint Arena control-plane backend (DOP-170).
 //! Off the per-move path (ADR-0001): registry + settlement + Walrus + stats only.
 
+mod auth;
 mod chat_store;
 mod config;
 mod enoki;
@@ -352,7 +353,14 @@ async fn main() -> anyhow::Result<()> {
         faucet_cooldown_secs: config.faucet_cooldown_secs,
         faucet_max_per_window: config.faucet_max_per_window,
         faucet_admin_token: config.faucet_admin_token.clone(),
+        session_jwt_secret: config.session_jwt_secret.clone(),
     });
+    if state.session_jwt_secret.is_none() {
+        tracing::warn!(
+            "arena allocate is UNAUTHENTICATED — set SESSION_JWT_SECRET (+ ship the FE session token) \
+             to gate house on-chain spend (B5); the gate stays OFF until it is set"
+        );
+    }
     stats::spawn_stats_broadcaster(state.clone());
     spawn_action_flusher(state.clone());
 
@@ -430,6 +438,9 @@ async fn main() -> anyhow::Result<()> {
         // is unlimited and bearer-gated (fails closed when FAUCET_ADMIN_TOKEN is unset).
         .route("/v1/faucet", post(routes::faucet))
         .route("/v1/faucet/internal", post(routes::faucet_admin))
+        // Session auth (B5): exchange a fresh Enoki id_token for a short-lived session JWT that gates
+        // `/v1/arena/allocate`. Enforced only when SESSION_JWT_SECRET is set (else the gate is off).
+        .route("/v1/auth/session", post(routes::auth_session))
         .route("/v1/chat", post(routes::chat))
         .route("/v1/chat/topic", get(routes::chat_topic))
         .route("/v1/chat/live/publish", post(routes::chat_publish))

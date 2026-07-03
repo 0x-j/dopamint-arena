@@ -111,6 +111,29 @@ impl EnokiClient {
             .map(|s| s.to_owned())
             .ok_or_else(|| anyhow!("enoki execute response missing data.digest: {json}"))
     }
+
+    /// Verify a user's Enoki/zkLogin id_token and return their canonical Sui address. Calls Enoki's
+    /// `GET /v1/zklogin` (the endpoint the wallet itself hits at login) with the id_token in the
+    /// `zklogin-jwt` header and OUR private api key as bearer; Enoki validates the JWT and returns
+    /// the address derived from (sub, aud, salt). An invalid/expired id_token yields a non-2xx,
+    /// surfaced via `read_enoki_json`. This is how a spend endpoint binds a request to a real
+    /// identity — validating the JWT and resolving its address in one call.
+    pub async fn verify_zklogin(&self, jwt: &str) -> anyhow::Result<String> {
+        let url = format!("{}/v1/zklogin", self.base_url);
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .header("zklogin-jwt", jwt)
+            .send()
+            .await
+            .context("enoki zklogin request")?;
+        let json = read_enoki_json(resp, "zklogin").await?;
+        json.pointer("/data/address")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| anyhow!("enoki zklogin response missing data.address: {json}"))
+    }
 }
 
 /// Read an Enoki response: capture the body as text FIRST (so a non-2xx error body survives — unlike
@@ -236,5 +259,39 @@ mod tests {
         assert!(c.execute("bad0digest", "SIG").await.is_err());
         assert!(c.execute("../escape", "SIG").await.is_err());
         assert!(c.execute("", "SIG").await.is_err());
+    }
+
+    // verify_zklogin GETs /v1/zklogin with the user id_token in the `zklogin-jwt` header + OUR api
+    // key as bearer, and returns the canonical address from the `{data:{address}}` envelope. This is
+    // the exact contract the Enoki wallet uses at login, so it pins the header names + field path.
+    #[tokio::test]
+    async fn verify_zklogin_sends_jwt_header_and_returns_address() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/zklogin"))
+            .and(header("authorization", "Bearer test_key"))
+            .and(header("zklogin-jwt", "USER_ID_TOKEN"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": { "address": "0xuser", "publicKey": "0xpk" } }),
+            ))
+            .mount(&server)
+            .await;
+        let c = client(server.uri());
+        assert_eq!(c.verify_zklogin("USER_ID_TOKEN").await.unwrap(), "0xuser");
+    }
+
+    // An invalid/expired id_token → Enoki non-2xx → the error must surface Enoki's body (never a
+    // silent empty address that would authorize the wrong caller).
+    #[tokio::test]
+    async fn verify_zklogin_error_surfaces_enoki_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid jwt"))
+            .mount(&server)
+            .await;
+        let c = client(server.uri());
+        let err = c.verify_zklogin("bad").await.unwrap_err().to_string();
+        assert!(err.contains("401"), "got: {err}");
+        assert!(err.contains("invalid jwt"), "got: {err}");
     }
 }

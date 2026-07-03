@@ -8,9 +8,11 @@
 import { useEffect, useRef } from "react";
 import {
   useCurrentAccount,
+  useCurrentWallet,
   useSignAndExecuteTransaction,
   useSuiClient,
 } from "@mysten/dapp-kit";
+import { getSession, isEnokiWallet } from "@mysten/enoki";
 import { generateKeyPair, type KeyPair } from "sui-tunnel-ts/core/crypto";
 import { list, arenaGameIdForModule } from "@/games/registry";
 import { useSponsoredSignExec } from "@/onchain/useSponsoredSignExec";
@@ -85,6 +87,7 @@ function arenaGameIdsForOpenWindows(): string[] {
 
 export function useArenaAutoEnter(): void {
   const account = useCurrentAccount();
+  const currentWallet = useCurrentWallet().currentWallet;
   const client = useSuiClient();
   const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
   const sponsored = useSponsoredSignExec();
@@ -137,12 +140,26 @@ export function useArenaAutoEnter(): void {
       return party;
     };
 
+    // The Enoki id_token authorizes allocate (B5). Fetched on demand + silently (Enoki holds the
+    // ephemeral key, so no popup); null for a non-zkLogin wallet, so allocate falls back to
+    // unauthenticated where the gate is off.
+    const getIdToken = async (): Promise<string | null> => {
+      if (!currentWallet || !isEnokiWallet(currentWallet)) return null;
+      try {
+        const session = await getSession(currentWallet);
+        return session?.jwt ?? null;
+      } catch {
+        return null;
+      }
+    };
+
     void (async () => {
       try {
         const allocations = await enterArena({
           games,
           userAddress: owner,
           makeUserParty,
+          getIdToken,
           coinType: isMtpsConfigured ? MTPS_COIN_TYPE : undefined,
           apiBase: resolveBackendUrl(),
         });
@@ -157,7 +174,7 @@ export function useArenaAutoEnter(): void {
         entered.current = null;
       }
     })();
-  }, [owner, client, signAndExecute, sponsored]);
+  }, [owner, client, signAndExecute, sponsored, currentWallet]);
 }
 
 /** App-wide mount for the centralized batched arena entry. Render ONCE inside the wallet provider. */

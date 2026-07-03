@@ -33,6 +33,10 @@ export interface InfraConfig {
   // Enoki PRIVATE api key (enoki_private_…), injected as ENOKI_API_KEY. Secret config =>
   // Secrets Manager => ECS `secrets`. Unset => Enoki off, settler is the sole gas source.
   enokiApiKey?: pulumi.Output<string>;
+  // HS256 signing secret for the arena allocate session-JWT gate (B5), injected as
+  // SESSION_JWT_SECRET. Secret config => Secrets Manager => ECS `secrets`. Unset => the gate stays
+  // OFF (allocate unauthenticated). Set via `pulumi config set --secret dopamint:session-jwt-secret`.
+  sessionJwtSecret?: pulumi.Output<string>;
   // Wallet-pool passphrase (PR #124), injected as WALLET_POOL_ACCESS_VALUE. Secret config =>
   // Secrets Manager => ECS `secrets`. Unset => the pool can't open and the arena opener degrades to
   // Noop (no funded seat-B). Set via `pulumi config set --secret dopamint:wallet-pool-access-value`.
@@ -64,6 +68,7 @@ export function getConfig(): InfraConfig {
     settlerKey: config.getSecret("settler-key"),
     faucetAdminToken: config.getSecret("faucet-admin-token"),
     enokiApiKey: config.getSecret("enoki-api-key"),
+    sessionJwtSecret: config.getSecret("session-jwt-secret"),
     walletPoolAccessValue: config.getSecret("wallet-pool-access-value"),
     ollamaEnabled: config.getBoolean("ollama-enabled") ?? true,
     ollamaModel: config.get("ollama-model") ?? "qwen2.5:1.5b",

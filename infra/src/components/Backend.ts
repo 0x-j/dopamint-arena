@@ -26,6 +26,9 @@ export interface BackendArgs {
   // Secrets Manager ARN for the Enoki PRIVATE api key, injected as ENOKI_API_KEY via ECS
   // `secrets`. Omitted => Enoki sponsorship is off and the settler is the sole gas source.
   enokiApiKeySecretArn?: pulumi.Input<string>;
+  // Secrets Manager ARN for the arena session-JWT signing secret, injected as SESSION_JWT_SECRET
+  // via ECS `secrets`. Omitted => the allocate auth gate stays OFF (B5 rollout switch).
+  sessionJwtSecretArn?: pulumi.Input<string>;
   // Secrets Manager ARN for the wallet-pool passphrase (PR #124), injected as WALLET_POOL_ACCESS_VALUE
   // via ECS `secrets`. Omitted => the pool can't open and the arena opener degrades to Noop.
   walletPoolAccessSecretArn?: pulumi.Input<string>;
@@ -55,13 +58,17 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
       pulumi.output(args.faucetAdminTokenSecretArn ?? undefined),
       pulumi.output(args.enokiApiKeySecretArn ?? undefined),
       pulumi.output(args.walletPoolAccessSecretArn ?? undefined),
+      pulumi.output(args.sessionJwtSecretArn ?? undefined),
     ])
-    .apply(([settler, faucetAdminToken, enoki, walletPoolAccess]) => ({
-      settler,
-      faucetAdminToken,
-      enoki,
-      walletPoolAccess,
-    }));
+    .apply(
+      ([settler, faucetAdminToken, enoki, walletPoolAccess, sessionJwt]) => ({
+        settler,
+        faucetAdminToken,
+        enoki,
+        walletPoolAccess,
+        sessionJwt,
+      }),
+    );
   const corsAllowedOrigins = pulumi.output(
     args.corsAllowedOrigins ?? undefined,
   );
@@ -229,6 +236,12 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
           backendSecrets.push({
             name: "WALLET_POOL_ACCESS_VALUE",
             valueFrom: secretArns.walletPoolAccess,
+          });
+        }
+        if (secretArns.sessionJwt) {
+          backendSecrets.push({
+            name: "SESSION_JWT_SECRET",
+            valueFrom: secretArns.sessionJwt,
           });
         }
 
