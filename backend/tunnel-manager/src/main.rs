@@ -117,6 +117,25 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Identity verification for the B5 auth gate uses a SEPARATE Enoki key with the zkLogin feature
+    // (`ENOKI_ZKLOGIN_API_KEY`) — a different Enoki feature than sponsorship — so verifying a user's
+    // zkLogin id_token never forces Enoki to sponsor gas. Independent of `enoki` above: either, both,
+    // or neither may be set. No network guard: `verify_zklogin` doesn't touch the settler's pinned
+    // chain digest (it only resolves an address), so a network mismatch can't cause a split-brain.
+    let enoki_zklogin = match config.enoki_zklogin_api_key.clone() {
+        Some(key) => {
+            tracing::info!("enoki zklogin identity verification enabled");
+            Some(enoki::EnokiClient::new(
+                key,
+                config.sui_network.clone(),
+                enoki::ENOKI_BASE_URL,
+            )?)
+        }
+        None => {
+            tracing::info!("enoki zklogin key not configured; arena session auth cannot mint");
+            None
+        }
+    };
     let walrus = walrus::WalrusClient::new(
         Config::require("WALRUS_PUBLISHER_URL", &config.walrus_publisher_url)?.to_string(),
         Config::require("WALRUS_AGGREGATOR_URL", &config.walrus_aggregator_url)?.to_string(),
@@ -329,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         settler,
         settle_queue,
         enoki,
+        enoki_zklogin,
         walrus,
         archiver,
         s3_prefix: config.s3_prefix.clone().unwrap_or_default(),

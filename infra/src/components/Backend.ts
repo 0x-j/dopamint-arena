@@ -26,6 +26,10 @@ export interface BackendArgs {
   // Secrets Manager ARN for the Enoki PRIVATE api key, injected as ENOKI_API_KEY via ECS
   // `secrets`. Omitted => Enoki sponsorship is off and the settler is the sole gas source.
   enokiApiKeySecretArn?: pulumi.Input<string>;
+  // Secrets Manager ARN for the Enoki zkLogin (identity) api key, injected as ENOKI_ZKLOGIN_API_KEY
+  // via ECS `secrets`. Distinct from the sponsor key above. Omitted => the arena session auth can't
+  // verify identity and /v1/auth/session 503s (the B5 gate can't mint).
+  enokiZkloginApiKeySecretArn?: pulumi.Input<string>;
   // Secrets Manager ARN for the arena session-JWT signing secret, injected as SESSION_JWT_SECRET
   // via ECS `secrets`. Omitted => the allocate auth gate stays OFF (B5 rollout switch).
   sessionJwtSecretArn?: pulumi.Input<string>;
@@ -59,14 +63,23 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
       pulumi.output(args.enokiApiKeySecretArn ?? undefined),
       pulumi.output(args.walletPoolAccessSecretArn ?? undefined),
       pulumi.output(args.sessionJwtSecretArn ?? undefined),
+      pulumi.output(args.enokiZkloginApiKeySecretArn ?? undefined),
     ])
     .apply(
-      ([settler, faucetAdminToken, enoki, walletPoolAccess, sessionJwt]) => ({
+      ([
         settler,
         faucetAdminToken,
         enoki,
         walletPoolAccess,
         sessionJwt,
+        enokiZklogin,
+      ]) => ({
+        settler,
+        faucetAdminToken,
+        enoki,
+        walletPoolAccess,
+        sessionJwt,
+        enokiZklogin,
       }),
     );
   const corsAllowedOrigins = pulumi.output(
@@ -230,6 +243,12 @@ function makeContainerDefinitions(args: BackendArgs): pulumi.Output<string> {
           backendSecrets.push({
             name: "ENOKI_API_KEY",
             valueFrom: secretArns.enoki,
+          });
+        }
+        if (secretArns.enokiZklogin) {
+          backendSecrets.push({
+            name: "ENOKI_ZKLOGIN_API_KEY",
+            valueFrom: secretArns.enokiZklogin,
           });
         }
         if (secretArns.walletPoolAccess) {

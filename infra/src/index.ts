@@ -110,6 +110,21 @@ if (cfg.enokiApiKey) {
   enokiApiKeySecretArn = secret.arn;
 }
 
+let enokiZkloginApiKeySecretArn: pulumi.Output<string> | undefined;
+if (cfg.enokiZkloginApiKey) {
+  const secret = new aws.secretsmanager.Secret(
+    `dopamint-${cfg.environment}-enoki-zklogin-api-key`,
+    {
+      description: `Enoki zkLogin (identity) API key for dopamint-${cfg.environment}`,
+    },
+  );
+  new aws.secretsmanager.SecretVersion(
+    `dopamint-${cfg.environment}-enoki-zklogin-api-key-version`,
+    { secretId: secret.id, secretString: cfg.enokiZkloginApiKey },
+  );
+  enokiZkloginApiKeySecretArn = secret.arn;
+}
+
 // Arena allocate session-JWT signing secret (B5): same secret-config => Secrets Manager => ECS
 // `secrets` path. Absent => the backend leaves the allocate auth gate OFF (rollout switch).
 let sessionJwtSecretArn: pulumi.Output<string> | undefined;
@@ -187,6 +202,7 @@ const iam = createIam(`dopamint-${cfg.environment}`, {
     ...(settlerKeySecretArn ? [settlerKeySecretArn] : []),
     ...(faucetAdminTokenSecretArn ? [faucetAdminTokenSecretArn] : []),
     ...(enokiApiKeySecretArn ? [enokiApiKeySecretArn] : []),
+    ...(enokiZkloginApiKeySecretArn ? [enokiZkloginApiKeySecretArn] : []),
     ...(sessionJwtSecretArn ? [sessionJwtSecretArn] : []),
     ...(walletPoolAccessSecretArn ? [walletPoolAccessSecretArn] : []),
   ],
@@ -208,6 +224,7 @@ const backend = createBackend({
   s3TranscriptsBucket: transcriptsBucket.bucketName,
   faucetAdminTokenSecretArn,
   enokiApiKeySecretArn,
+  enokiZkloginApiKeySecretArn,
   sessionJwtSecretArn,
   walletPoolAccessSecretArn,
   ollamaEnabled: cfg.ollamaEnabled,

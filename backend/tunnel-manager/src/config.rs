@@ -18,10 +18,18 @@ pub struct Config {
     /// match the network `ENOKI_API_KEY` is provisioned for. NOTE: the settler fallback's chain
     /// digest is hard-coded testnet (`sui.rs`), so leave this `testnet` until that is config-driven.
     pub sui_network: String,
-    /// Enoki PRIVATE api key (`enoki_private_…`). When set, Enoki is the primary gas sponsor and the
-    /// settler is the fallback; unset disables Enoki entirely (settler-only). Distinct from the
-    /// frontend's PUBLIC `VITE_ENOKI_API_KEY` (zkLogin wallet).
+    /// Enoki PRIVATE api key (`enoki_private_…`) with the SPONSORED_TRANSACTIONS feature. When set,
+    /// Enoki is the primary gas sponsor and the settler is the fallback; unset disables Enoki
+    /// sponsorship (settler-only). Distinct from the frontend's PUBLIC `VITE_ENOKI_API_KEY` (zkLogin
+    /// wallet) and from `enoki_zklogin_api_key` below.
     pub enoki_api_key: Option<String>,
+    /// Enoki PRIVATE api key with the **ZKLOGIN** feature, injected as `ENOKI_ZKLOGIN_API_KEY`. Used
+    /// ONLY to verify a user's zkLogin id_token at `/v1/auth/session` (B5) and resolve their address.
+    /// zkLogin is a DIFFERENT Enoki feature (and key) than sponsorship, so this is kept separate from
+    /// `enoki_api_key` — identity verification then never forces Enoki to sponsor gas. Must belong to
+    /// the SAME Enoki project + auth provider as the frontend's zkLogin key, or the resolved address
+    /// won't match the user's wallet. Unset ⇒ the arena session gate can't mint (auth 503).
+    pub enoki_zklogin_api_key: Option<String>,
     pub sui_rpc_url: Option<String>,
     pub package_id: Option<String>,
     /// Slim example-app packages — when set, their ops become gas-sponsorable.
@@ -92,6 +100,7 @@ impl Config {
             coin_type: std::env::var("TUNNEL_COIN_TYPE").unwrap_or_else(|_| "0x2::sui::SUI".into()),
             sui_network: std::env::var("SUI_NETWORK").unwrap_or_else(|_| "testnet".into()),
             enoki_api_key: opt("ENOKI_API_KEY"),
+            enoki_zklogin_api_key: opt("ENOKI_ZKLOGIN_API_KEY"),
             sui_rpc_url: opt("SUI_RPC_URL"),
             package_id: opt("TUNNEL_PACKAGE_ID"),
             agent_allowance_package_id: opt("AGENT_ALLOWANCE_PACKAGE_ID"),
@@ -212,14 +221,17 @@ mod tests {
     }
 
     // Enoki is optional-with-fallback: a deploy without ENOKI_API_KEY boots settler-only, and
-    // SUI_NETWORK defaults to testnet so the chain matches the hard-coded settler digest.
+    // SUI_NETWORK defaults to testnet so the chain matches the hard-coded settler digest. The zkLogin
+    // identity key is independently optional (a deploy may verify identity without Enoki sponsorship).
     #[test]
     fn from_env_defaults_network_and_leaves_enoki_unset() {
         std::env::remove_var("SUI_NETWORK");
         std::env::remove_var("ENOKI_API_KEY");
+        std::env::remove_var("ENOKI_ZKLOGIN_API_KEY");
         let c = Config::from_env().unwrap();
         assert_eq!(c.sui_network, "testnet");
         assert!(c.enoki_api_key.is_none());
+        assert!(c.enoki_zklogin_api_key.is_none());
     }
 
     #[test]

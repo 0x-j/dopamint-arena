@@ -22,6 +22,10 @@ pub struct AppState {
     /// Enoki sponsored-tx client when configured (ADR-0014): the primary gas sponsor, with
     /// `settler` as the fallback. `None` = settler-only.
     pub enoki: Option<crate::enoki::EnokiClient>,
+    /// Enoki client for zkLogin identity verification (B5), built from `ENOKI_ZKLOGIN_API_KEY` (a key
+    /// with the zkLogin feature). SEPARATE from `enoki` so verifying a user's identity never enables
+    /// Enoki gas sponsorship. `None` = the arena session gate can't mint (`/v1/auth/session` 503s).
+    pub enoki_zklogin: Option<crate::enoki::EnokiClient>,
     pub walrus: crate::walrus::WalrusClient,
     /// S3 transcript archiver (ADR-0023). `None` when S3 is unconfigured (dev/test) —
     /// archival is then disabled. Concurrent with Walrus; Walrus is untouched.
@@ -124,6 +128,7 @@ impl AppState {
             settler: Arc::new(crate::sui::SuiSettler::noop()),
             settle_queue: Arc::new(crate::settle_queue::InMemorySettleQueue::default()),
             enoki: None,
+            enoki_zklogin: None,
             walrus: crate::walrus::WalrusClient::noop(),
             archiver: None,
             s3_prefix: "".into(),

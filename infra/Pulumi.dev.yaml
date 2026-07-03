@@ -24,4 +24,6 @@ config:
   dopamint:session-jwt-secret:
     secure: AAABACmcbXTw/+7uGE9YjpukLmhE4t/bX4hwExis3Hrax5+WZg93M31pAj2Oh0OqIgYBk9YYuKwV+jeTFD7JAN7PKjTMhkT9ES0gtXU80ARa52sYA3tikhS5lKhupJn/
   dopamint:enoki-api-key:
-    secure: AAABAGpCgZYwY+NrnT8ll8eSeXEUBFX0B6nkSfbp+xkl71f/j/s88a+5qsxZXKWn50eMJLwaUv5VEYqbiiMSQ3WE2aF8MauPShOX8cHM
+    secure: AAABAJziyr7/qjCUDTeAuyLMHRVrbEs2gc+imVPUo9NjB+Oros60pyxJYErPF5liVAV8uLQNHPltCJdbhnS1Yy09VhP7HZ2Zz3DHfVlI
+  dopamint:enoki-zklogin-api-key:
+    secure: AAABAEY6yO85VgNem2KKALP+0XiCfP2hNzxKn+BZQTVUwAO6bsSXUrV+kIF5+qixxTp5y21Xo3jp1nZFq3jwf6JwaepPWVAW3r+Z+hA=

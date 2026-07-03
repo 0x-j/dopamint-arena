@@ -33,6 +33,11 @@ export interface InfraConfig {
   // Enoki PRIVATE api key (enoki_private_…), injected as ENOKI_API_KEY. Secret config =>
   // Secrets Manager => ECS `secrets`. Unset => Enoki off, settler is the sole gas source.
   enokiApiKey?: pulumi.Output<string>;
+  // Enoki PRIVATE api key with the zkLogin feature, injected as ENOKI_ZKLOGIN_API_KEY. Used ONLY to
+  // verify zkLogin id_tokens at /v1/auth/session (B5) — a different Enoki feature than sponsorship,
+  // so identity verification never forces Enoki gas sponsorship. Unset => the arena session gate
+  // can't mint (auth 503). Set via `pulumi config set --secret dopamint:enoki-zklogin-api-key`.
+  enokiZkloginApiKey?: pulumi.Output<string>;
   // HS256 signing secret for the arena allocate session-JWT gate (B5), injected as
   // SESSION_JWT_SECRET. Secret config => Secrets Manager => ECS `secrets`. Unset => the gate stays
   // OFF (allocate unauthenticated). Set via `pulumi config set --secret dopamint:session-jwt-secret`.
@@ -68,6 +73,7 @@ export function getConfig(): InfraConfig {
     settlerKey: config.getSecret("settler-key"),
     faucetAdminToken: config.getSecret("faucet-admin-token"),
     enokiApiKey: config.getSecret("enoki-api-key"),
+    enokiZkloginApiKey: config.getSecret("enoki-zklogin-api-key"),
     sessionJwtSecret: config.getSecret("session-jwt-secret"),
     walletPoolAccessValue: config.getSecret("wallet-pool-access-value"),
     ollamaEnabled: config.getBoolean("ollama-enabled") ?? true,

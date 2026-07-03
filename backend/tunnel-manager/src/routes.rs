@@ -46,6 +46,7 @@ pub(crate) mod test_support {
             settler,
             settle_queue: std::sync::Arc::new(crate::settle_queue::InMemorySettleQueue::default()),
             enoki: None,
+            enoki_zklogin: None,
             walrus,
             archiver: None,
             s3_prefix: "".into(),
@@ -350,11 +351,13 @@ pub(crate) async fn auth_session(State(state): State<SharedState>, headers: Head
         )
         .into_response();
     };
-    let Some(enoki) = state.enoki.as_ref() else {
+    // Identity verification uses the DEDICATED zkLogin key (ENOKI_ZKLOGIN_API_KEY), not the sponsor
+    // key — zkLogin is a different Enoki feature, so a sponsor-only key can't verify here.
+    let Some(enoki) = state.enoki_zklogin.as_ref() else {
         return ApiError::resp(
             StatusCode::SERVICE_UNAVAILABLE,
             "auth_disabled",
-            "identity verification unavailable (Enoki not configured)",
+            "identity verification unavailable (ENOKI_ZKLOGIN_API_KEY not configured)",
         )
         .into_response();
     };
@@ -1988,12 +1991,14 @@ mod arena_tests {
         let state = AppState::in_memory_with_arena_fleet(1, vec!["blackjack".into()]);
         let resp = arena_allocate(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(ArenaAllocateRequest {
                 user_address: "0xuser".into(),
                 games: vec![game_req("blackjack")],
             }),
         )
-        .await;
+        .await
+        .unwrap();
         let alloc = &resp.0.allocations[0];
         let owner = state
             .control
