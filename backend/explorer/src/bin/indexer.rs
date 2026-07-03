@@ -38,10 +38,20 @@ struct StatsSample {
 }
 
 const METRIC_RETENTION_SECS: i64 = 30 * 24 * 3600;
+// The N fleet instances each publish a snapshot per tick; their `total_actions` and
+// `settled_tunnels` are lagging, phase-offset observations of the same monotonic global
+// counters. Last-write-wins stored whichever message *arrived* last (arrival order != read
+// order), so the per-second series jumped backwards and the derived live TPS clamped to 0
+// (`current_tps` floors negative deltas). GREATEST keeps each cumulative counter
+// non-decreasing — and since every observation is <= the true count, `max` is also the
+// least-lagged/least-torn estimate. `active_tunnels` is a concurrency gauge (opens and
+// closes), so it stays last-write-wins; GREATEST would wrongly pin it to all-time-max.
 const METRIC_UPSERT_SQL: &str = "INSERT INTO metric_bucket \
     (ts_bucket, total_actions, active_tunnels, settled_tunnels) VALUES ($1,$2,$3,$4) \
-    ON CONFLICT (ts_bucket) DO UPDATE SET total_actions=EXCLUDED.total_actions, \
-    active_tunnels=EXCLUDED.active_tunnels, settled_tunnels=EXCLUDED.settled_tunnels";
+    ON CONFLICT (ts_bucket) DO UPDATE SET \
+    total_actions=GREATEST(metric_bucket.total_actions, EXCLUDED.total_actions), \
+    active_tunnels=EXCLUDED.active_tunnels, \
+    settled_tunnels=GREATEST(metric_bucket.settled_tunnels, EXCLUDED.settled_tunnels)";
 const METRIC_RETENTION_SQL: &str = "DELETE FROM metric_bucket WHERE ts_bucket < $1";
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
@@ -244,4 +254,72 @@ async fn wire_redis(redis_url: &str, database_url_str: &str) -> anyhow::Result<(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::METRIC_UPSERT_SQL;
+    use diesel::sql_types::BigInt;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    #[derive(diesel::QueryableByName)]
+    struct MetricRow {
+        #[diesel(sql_type = BigInt)]
+        total_actions: i64,
+        #[diesel(sql_type = BigInt)]
+        settled_tunnels: i64,
+    }
+
+    // A stale, phase-offset fleet publish (lower cumulative counters, but arriving last) must
+    // NOT lower a bucket-second a fresher publish already raised — last-write-wins let it, and
+    // the derived live TPS then clamped to 0. GREATEST makes the per-second collapse monotonic.
+    #[tokio::test]
+    async fn metric_upsert_collapses_monotonically_not_last_write_wins() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return; // gated: needs a Postgres
+        };
+        let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS metric_bucket (ts_bucket BIGINT PRIMARY KEY, \
+             total_actions BIGINT NOT NULL, active_tunnels BIGINT NOT NULL, \
+             settled_tunnels BIGINT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A ts_bucket far outside the live/retention range so we never touch real rows.
+        let ts: i64 = -424242;
+        diesel::sql_query("DELETE FROM metric_bucket WHERE ts_bucket = $1")
+            .bind::<BigInt, _>(ts)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let upsert = |total: i64, settled: i64| {
+            diesel::sql_query(METRIC_UPSERT_SQL)
+                .bind::<BigInt, _>(ts)
+                .bind::<BigInt, _>(total)
+                .bind::<BigInt, _>(99) // active_tunnels is a gauge: last-write-wins is correct
+                .bind::<BigInt, _>(settled)
+        };
+        // The fresh, higher publishes land first; the stale, lower one arrives LAST — the exact
+        // order last-write-wins would mishandle (it would store 600/20). GREATEST must keep 1400/70.
+        upsert(1000, 50).execute(&mut conn).await.unwrap();
+        upsert(1400, 70).execute(&mut conn).await.unwrap();
+        upsert(600, 20).execute(&mut conn).await.unwrap(); // stale publish arriving last
+
+        let row: MetricRow = diesel::sql_query(
+            "SELECT total_actions, settled_tunnels FROM metric_bucket WHERE ts_bucket = $1",
+        )
+        .bind::<BigInt, _>(ts)
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.total_actions, 1400,
+            "cumulative total must not step back"
+        );
+        assert_eq!(row.settled_tunnels, 70, "settled count must not step back");
+    }
 }
