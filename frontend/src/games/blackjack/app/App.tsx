@@ -26,12 +26,12 @@ export function SketchDefs() {
   );
 }
 
-export default function App() {
+export default function App({ windowId }: { windowId: string }) {
   return (
     <div className="bj-root qp-sketch w-full h-full relative overflow-hidden">
       <SketchDefs />
       <ScaledWrapper>
-        <PvpBlackjack />
+        <PvpBlackjack windowId={windowId} />
       </ScaledWrapper>
       <Toaster
         position="top-right"

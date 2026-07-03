@@ -2,7 +2,7 @@ import { useState } from "react";
 import {
   usePvpTicTacToe,
   type Variant,
-} from "@/games/ticTacToe/app/hooks/usePvpTicTacToe";
+} from "@/games/ticTacToe/usePvpTicTacToe";
 import { Board } from "@/games/ticTacToe/app/components/Board";
 import { CaroBoard } from "@/games/ticTacToe/app/components/CaroBoard";
 import { isMtpsConfigured } from "@/onchain/mtps";
@@ -46,11 +46,19 @@ function statusText(g: ReturnType<typeof usePvpTicTacToe>): string {
   return "Opponent's turn…";
 }
 
-export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
+export function PvpScene({
+  windowId,
+  onBack,
+  isPortrait = false,
+}: {
+  windowId: string;
+  onBack: () => void;
+  isPortrait?: boolean;
+}) {
   // Default to Caro (15×15) — the headline variant for this window; the 3×3 classic is a toggle.
   const [variant, setVariant] = useState<Variant>("caro");
   const [boardSize, setBoardSize] = useState(15);
-  const g = usePvpTicTacToe(variant, boardSize);
+  const g = usePvpTicTacToe(windowId, variant, boardSize);
 
   const playing =
     g.phase === "playing" || g.phase === "settling" || g.phase === "done";

@@ -24,7 +24,12 @@ import {
   DEFAULT_BOT_DIFFICULTY,
   pickShot,
 } from "./bot";
-import { CELL_COUNT, placeFleetRandom, placementsToBoard } from "./fleet";
+import {
+  CELL_COUNT,
+  placeFleetRandom,
+  placementsToBoard,
+  type Placement,
+} from "./fleet";
 import {
   type BoardCommitment,
   SALT_BYTES,
@@ -48,15 +53,25 @@ export function makeFleetSecret(
   return { board, salts, commitment: commitBoard(board, salts) };
 }
 
-/** A randomly-placed fleet with rng-derived salts — for the bot seat and tests. */
-export function randomFleetSecret(rng: () => number): FleetSecret {
-  const board = placementsToBoard(placeFleetRandom(rng));
+/** A randomly-placed fleet plus the placements that produced it — kept so a spectate view can render
+ *  the seat's actual ships (sunk-ship + per-ship damage need the placements, not just the board). */
+export function randomFleetWithPlacements(rng: () => number): {
+  secret: FleetSecret;
+  placements: Placement[];
+} {
+  const placements = placeFleetRandom(rng);
+  const board = placementsToBoard(placements);
   const salts = Array.from({ length: CELL_COUNT }, () => {
     const s = new Uint8Array(SALT_BYTES);
     for (let i = 0; i < SALT_BYTES; i++) s[i] = Math.floor(rng() * 256);
     return s;
   });
-  return makeFleetSecret(board, salts);
+  return { secret: makeFleetSecret(board, salts), placements };
+}
+
+/** A randomly-placed fleet with rng-derived salts — for the bot seat and tests. */
+export function randomFleetSecret(rng: () => number): FleetSecret {
+  return randomFleetWithPlacements(rng).secret;
 }
 
 export interface DrivenMove {

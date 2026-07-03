@@ -249,7 +249,10 @@ function estimateStrengthProfile(
   const own = ownStreetBet(state, party);
   const other = ownStreetBet(state, otherParty(party));
   const callAmount = other > own ? other - own : 0n;
-  const available = ownBalance(state, party) - ownTotalBet(state, party);
+  // Effective stack: the protocol caps bets at the shorter balance (heads-up), so the surplus
+  // of the larger stack is unbettable. Mirror `QuantumPokerProtocol.availableFor`.
+  const effectiveStack = state.balanceA < state.balanceB ? state.balanceA : state.balanceB;
+  const available = effectiveStack - ownTotalBet(state, party);
   const pot = state.totalBetA + state.totalBetB;
   const safeHoles = holes ?? [];
   const preflop = state.board.length < 3;

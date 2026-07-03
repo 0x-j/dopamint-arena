@@ -25,7 +25,10 @@ const backendUrl = (apiBase?: string): string =>
 
 function ls(): Storage | null {
   try {
-    return (globalThis as { localStorage?: Storage }).localStorage ?? null;
+    const storage = (globalThis as { localStorage?: Storage }).localStorage;
+    // Node ≥25 exposes a `localStorage` global that is a method-less stub unless
+    // `--localstorage-file` is set — treat anything non-functional as "no storage".
+    return storage && typeof storage.getItem === "function" ? storage : null;
   } catch {
     return null;
   }

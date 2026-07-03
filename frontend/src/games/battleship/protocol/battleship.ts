@@ -397,6 +397,16 @@ export class BattleshipProtocol implements Protocol<
   }
 }
 
+/** A move byte-field that MAY arrive hex-encoded (an FE peer, or a `wire_hex` bot field) OR as a raw
+ *  JSON byte array. The Rust bot serializes `reveal_board`'s `cells: Vec<u8>` / `salts: Vec<[u8;32]>`
+ *  WITHOUT the `wire_hex` attribute its other move fields carry, so they land as `[0,1,…]` rather than
+ *  `"0x…"`. Tolerating both keeps the terminal board reveal from throwing (`hex.startsWith is not a
+ *  function`) inside the frame decode — a throw that in the worker kills the whole frame pump. */
+function hexOrBytes(v: string | number[] | undefined): Uint8Array {
+  if (v == null) return new Uint8Array();
+  return typeof v === "string" ? fromHex(v) : Uint8Array.from(v);
+}
+
 /**
  * Move (de)serializer for the PvP relay. The frame envelope is JSON, which can't
  * carry the move's binary fields (commit root, salt, Merkle proof) — those are
@@ -428,8 +438,8 @@ export const battleshipMoveCodec: MoveCodec<BattleshipMove> = {
       isShip?: boolean;
       salt?: string;
       proof?: string[];
-      cells?: string;
-      salts?: string[];
+      cells?: string | number[];
+      salts?: (string | number[])[];
     };
     if (o.type === "commit") return { type: "commit", root: fromHex(o.root!) };
     if (o.type === "shoot") return { type: "shoot", cell: o.cell! };
@@ -444,8 +454,8 @@ export const battleshipMoveCodec: MoveCodec<BattleshipMove> = {
     if (o.type === "reveal_board")
       return {
         type: "reveal_board",
-        cells: fromHex(o.cells ?? ""),
-        salts: (o.salts ?? []).map(fromHex),
+        cells: hexOrBytes(o.cells),
+        salts: (o.salts ?? []).map(hexOrBytes),
       };
     throw new Error(`unknown battleship move: ${o.type}`);
   },

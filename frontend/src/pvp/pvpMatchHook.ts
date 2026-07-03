@@ -10,6 +10,10 @@
  * Scope: public-state, no-hidden-secret games (ADR-0010) with JSON-native moves — they ride the
  * relay with the identity codec, no per-game move (de)serializer. Hidden-info games (battleship/
  * poker) are a richer superset (binary moves + secret hooks) and are NOT driven by this engine.
+ *
+ * @deprecated Legacy main-thread engine — kept ONLY as the `?engine=legacy` fallback and slated
+ * for removal. The worker engine is the primary path: implement the game as a `GameSessionSpec`
+ * (registered via `defineGame`, see src/engine/specs/registry.ts) and drive it with `useGameMatch`.
  */
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import {
@@ -45,6 +49,7 @@ import {
   closeCooperativeWithRoot,
   openAndFundSharedTunnel,
   raiseDisputeUnilateral,
+  forceCloseAfterTimeout,
   readCreatedAt,
 } from "@/onchain/tunnelTx";
 import {
@@ -70,10 +75,13 @@ import {
   installResumePersistence,
   evictExpiredRecords,
   readResumeRecord,
+  writeResumeRecord,
   listActiveTunnels,
   clearResumeRecord,
   keypairFromSecretHex,
+  type ResumeRecord,
 } from "@/pvp/resume";
+import { disputesToFinalize } from "@/pvp/disputeFinalize";
 
 export type PvpStatus =
   | "idle"
@@ -593,15 +601,22 @@ export class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
         opponentPubkeyHex: info.opponentPubkeyHex,
         selfEphemeralSecretHex: info.selfEphemeralSecretHex,
       },
-      // Settlement floor: after the 1h grace, settle from the held checkpoint.
+      // Settlement floor: after the 1h grace, stake the held checkpoint via raise_dispute, then stamp
+      // the record disputed so a later cold-resume finalizes it (force_close) once the on-chain timeout
+      // elapses — nothing else closes a STATUS_DISPUTED tunnel (see disputeFinalize).
       onGraceExpired: (latest) => {
-        if (latest)
-          void raiseDisputeUnilateral({
-            signExec: signExec as never,
-            tunnelId: dt.tunnelId,
-            update: latest,
-            role: info.role,
-          });
+        if (!latest) return;
+        void raiseDisputeUnilateral({
+          signExec: signExec as never,
+          tunnelId: dt.tunnelId,
+          update: latest,
+          role: info.role,
+        })
+          .then(() => {
+            const rec = readResumeRecord(dt.tunnelId);
+            if (rec) writeResumeRecord({ ...rec, disputedAt: Date.now() });
+          })
+          .catch(() => {});
       },
     });
 
@@ -621,6 +636,20 @@ export class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
       .map((id) => readResumeRecord(id))
       .some((r) => r?.game === this.spec.game);
     if (!resumable) return; // nothing to resume → don't open a socket
+    // Dispute floor step 2: finalize any dispute we raised whose on-chain timeout elapsed — a
+    // wallet-signed force_close, no relay socket needed. Disputed records are skipped by
+    // resumeActiveTunnels below, so a still-young one just waits for a later resume. Mirrors the
+    // worker session's cold-resume sweep.
+    const persisted = listActiveTunnels()
+      .map((id) => readResumeRecord(id))
+      .filter((r): r is ResumeRecord => r != null && r.game === this.spec.game);
+    for (const tunnelId of disputesToFinalize(persisted, Date.now())) {
+      void forceCloseAfterTimeout({
+        signExec: deps.signExec as never,
+        tunnelId,
+      }).catch(() => {});
+      clearResumeRecord(tunnelId);
+    }
     void (async () => {
       try {
         const ephemeral: KeyPair = generateKeyPair();
@@ -999,6 +1028,9 @@ export class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
  * Build a React hook that drives this game's PvP matches. Sessions live in a module-level map keyed
  * by `windowId` (one map per game, since each game calls this once) so a window can minimize/reflow
  * without dropping the opponent; the window-close disposer tears the session down.
+ *
+ * @deprecated Legacy main-thread engine (`?engine=legacy` fallback only) — use a `GameSessionSpec`
+ * via `defineGame` + `useGameMatch` instead. See the module-header notice.
  */
 export function createPvpMatchHook<
   State extends { winner: unknown },

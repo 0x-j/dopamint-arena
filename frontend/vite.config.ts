@@ -1,22 +1,76 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { sentryVitePlugin } from "@sentry/vite-plugin";
 import { fileURLToPath, URL } from "node:url";
 
 // Same-origin in dev, mirroring the prod CloudFront `/v1/*` behavior: route /v1 (HTTP +
 // the /v1/mp WebSocket) to the ALB so the browser issues same-origin requests. With this,
 // VITE_BACKEND_URL stays empty everywhere (prod is same-origin via CloudFront), which also
 // sidesteps the https-page→http-ALB mixed-content block on the deployed frontend.
-const BACKEND_ALB =
-  "http://dopamint-dev-alb-0fac7e0-1152788681.us-east-1.elb.amazonaws.com";
+const BACKEND_ALB = "https://relay-dev.millionstps.io";
+
+// The vendored SDK barrel (and its examples) ends with `if (require.main === module) runAllExamples()`
+// — a Node "run me directly" guard. Bundling `sui-tunnel-ts` pulls it in, where `require.main`/`module`
+// are undefined and would throw. Neutralize the guard to `false` at transform time (so the example
+// runner tree-shakes away) INSTEAD of a global `define: { module: "null" }` — that define rewrote
+// `module.exports` inside React's CJS files too, making the production (rolldown) build fail with
+// hundreds of "X is not exported by react" errors. We never edit the vendored source (re-syncable).
+const stripSdkMainGuard = {
+  name: "strip-sdk-main-guard",
+  transform(code: string, id: string) {
+    if (
+      id.includes("/sui-tunnel-ts/src/") &&
+      code.includes("require.main === module")
+    ) {
+      return {
+        code: code.replaceAll("require.main === module", "false"),
+        map: null,
+      };
+    }
+    return null;
+  },
+};
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const pkgId =
     env.VITE_TUNNEL_PACKAGE_ID ||
     "0x0b89fe86e42cdbfd1e614757a83d014b455d12923d0dded58842ab18f8a5a22b";
+  // Sentry release + debug-ID injection + source-map upload (build-time only). Fully
+  // disabled without SENTRY_AUTH_TOKEN, so local/CI builds run as before; the deploy
+  // pipeline sets the token. Workers build in their OWN plugin pipeline, so `worker.plugins`
+  // gets a fresh instance below — without it, worker stack frames never symbolicate.
+  const sentryBuild = (extra?: Parameters<typeof sentryVitePlugin>[0]) =>
+    sentryVitePlugin({
+      org: "commandoss-gs",
+      project: "dopamint-arena",
+      authToken: env.SENTRY_AUTH_TOKEN,
+      disable: !env.SENTRY_AUTH_TOKEN,
+      telemetry: false,
+      ...extra,
+    });
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      stripSdkMainGuard,
+      react(),
+      tailwindcss(),
+      // Deletion only here (not in the worker pipeline): this outer bundle closes LAST,
+      // after every sub-build's maps — worker maps included — have been uploaded.
+      ...sentryBuild({
+        sourcemaps: { filesToDeleteAfterUpload: ["dist/**/*.map"] },
+      }),
+    ],
+    worker: {
+      // ES format: the sentry plugin can't inject debug IDs into iife worker bundles.
+      format: "es" as const,
+      plugins: () => [...sentryBuild()],
+    },
+    build: {
+      // "hidden": emit maps for the Sentry upload but strip sourceMappingURL from the
+      // served assets (and the upload deletes the .map files from dist afterwards).
+      sourcemap: "hidden" as const,
+    },
     server: {
       proxy: {
         "/v1": { target: BACKEND_ALB, changeOrigin: true, ws: true },
@@ -27,7 +81,9 @@ export default defineConfig(({ mode }) => {
     define: {
       "process.env.PACKAGE_ID": JSON.stringify(pkgId),
       "process.env.SUI_NETWORK": JSON.stringify("testnet"),
-      "require.main": "undefined",
+      // NB: do NOT `define` a global `module`/`require.main` here — that rewrites `module.exports`
+      // inside React's CJS files and breaks the rolldown build. The SDK's `require.main === module`
+      // guard is handled by the `stripSdkMainGuard` transform plugin above instead.
     },
     resolve: {
       // The vendored SDK pins an older @mysten/sui in its own node_modules. Force the bundled

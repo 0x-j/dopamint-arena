@@ -244,8 +244,31 @@ export function buildSweepToAddressBalance(
  * address balance already covers `need` it does NOTHING (the open's own withdrawal is the only tx).
  * Otherwise it faucets — only when coins + address balance together fall short — then sweeps owned
  * coins into the address balance. Pass a sponsored `signExec` so a 0-SUI player tops up for free.
+ *
+ * SERIALIZED (process-wide): multiple solo game windows open concurrently and each calls this to
+ * ensure their stake is funded. Without serialization, N windows race to read-balance → faucet →
+ * withdraw, each reading a stale balance (before the previous faucet's deposit settles), each
+ * faucet-minting another full stake into the shared address balance, and each subsequent window's
+ * open PTB arriving at the on-chain check AFTER a prior window's withdrawal has already consumed
+ * the balance. With serialization, window N's check-top-up-wait runs AFTER window N-1's entire
+ * cycle completes, so it sees the cumulative settled balance and the faucet fires only when needed.
  */
-export async function ensureMtpsAddressBalance(opts: {
+// Process-wide serialization queue: one ensureMtpsAddressBalance runs at a time. The caller's
+// promise resolves when their slot runs; the queue is a plain promise chain (no setTimeout —
+// the checkpoint-settle wait inside the function provides the necessary gap).
+let ensureQueue: Promise<void> = Promise.resolve();
+export function ensureMtpsAddressBalance(opts: {
+  client: MtpsBalanceReader;
+  signExec: SignExec;
+  owner: string;
+  need: bigint;
+}): Promise<void> {
+  const run = () => ensureMtpsAddressBalanceInner(opts);
+  ensureQueue = ensureQueue.then(run, run);
+  return ensureQueue;
+}
+
+async function ensureMtpsAddressBalanceInner(opts: {
   client: MtpsBalanceReader;
   signExec: SignExec;
   owner: string;
@@ -270,32 +293,31 @@ export async function ensureMtpsAddressBalance(opts: {
       })
     ).data;
 
-  const { addr, total } = await readBalance();
-  if (addr >= opts.need) return; // already funded in the address balance — nothing to do
-  if (total < opts.need) {
-    // Not enough owned coins to cover the stake: faucet straight into the address balance
-    // (admin_mint_to_balance) — the backend deposit IS the funding, so there's nothing to sweep.
-    await faucetMtps({ recipient: opts.owner, toBalance: true });
-  } else {
-    // Already hold enough as owned coins: sweep them into the address balance (no faucet needed) so
-    // the open can withdraw from it.
-    const coins = await readCoins();
-    if (coins.length > 0) {
-      const tx = new Transaction();
-      buildSweepToAddressBalance(
-        tx,
-        opts.owner,
-        coins.map((c) => c.coinObjectId),
-      );
-      await opts.signExec(tx);
-    }
-  }
-  // SIP-58 deposits settle at a CHECKPOINT boundary, not in the depositing tx, so the funds aren't
-  // withdrawable in the very next transaction. Wait until the address balance reflects the deposit
-  // before returning (so the open's withdrawal doesn't dry-run against a still-empty balance). Best
-  // effort: if the RPC never surfaces the settled balance, the open's own retry covers the lag.
-  for (let i = 0; i < 15; i++) {
+  const { addr } = await readBalance();
+  if (addr >= opts.need) return; // already funded — withdraw straight from the address balance
+
+  // FAUCET DISABLED (by request): the backend faucet was unreliable (admin-cap stale → 502) and its
+  // retries stalled the open / PTB-sign queue. The stake now comes from the CONNECTED wallet's MTPS
+  // address balance — the player funds it directly. We still SWEEP the wallet's owned MTPS COINS into
+  // its address balance (no mint, no retry) so coins it already holds become withdrawable; if there
+  // are none, we return immediately and let the open use whatever the address balance already holds
+  // (it fails fast on-chain if truly insufficient — the player tops up their wallet).
+  const coins = await readCoins();
+  if (coins.length === 0) return;
+  const tx = new Transaction();
+  buildSweepToAddressBalance(
+    tx,
+    opts.owner,
+    coins.map((c) => c.coinObjectId),
+  );
+  await opts.signExec(tx);
+
+  // SIP-58 deposits settle at a CHECKPOINT boundary (not in the sweep tx), so briefly wait for the
+  // swept funds to become withdrawable before the open fires — short (≤6s), not the old ~18s faucet poll.
+  const SETTLE_POLL_MS = 600;
+  const SETTLE_MAX_POLLS = 10; // ~6s
+  for (let i = 0; i < SETTLE_MAX_POLLS; i++) {
     if ((await readBalance()).addr >= opts.need) return;
-    await sleep(600);
+    await sleep(SETTLE_POLL_MS);
   }
 }

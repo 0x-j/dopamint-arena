@@ -54,6 +54,11 @@ export interface ResumeRecord {
    *  match from an in-flight one without a protocol: a finished match must NOT suppress a fresh
    *  allocate on reload. Absent on records written before this field existed (treated as non-terminal). */
   terminal?: boolean;
+  /** Wall-clock ms when we raised an on-chain dispute on this tunnel (the grace floor fired: the peer
+   *  was gone). Set → the tunnel is `STATUS_DISPUTED` on-chain, so a cold-resume must NOT rebuild it as
+   *  a live match; instead it force-closes to claim once the on-chain timeout has elapsed (see
+   *  `disputesToFinalize`). Absent on every normal in-flight record. */
+  disputedAt?: number;
   updatedAt: number;
 }
 

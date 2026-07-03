@@ -12,6 +12,7 @@ import {
   type TpsPoint,
 } from "@/backend/useTpsHistory";
 import type { BackendStats } from "@/backend/useBackendStats";
+import { Skeleton } from "@/components/ui/skeleton";
 import { formatCount } from "@/lib/utils";
 
 // Trailing presets. 1D (86400s) is the backend's trailing-window ceiling; longer spans go through
@@ -60,24 +61,28 @@ const fmtClock = (epochSecs: number) =>
  *  stays round and labels stay crisp despite the SVG's `preserveAspectRatio="none"` stretch. */
 type ProjPoint = { t: number; v: number; xFrac: number; yFrac: number };
 
-/** Line + filled-area paths, y-axis autoscaled to the window's own peak so even single-digit TPS
- *  fills the panel rather than flatlining at the bottom. */
-function buildPaths(points: TpsPoint[]) {
-  if (points.length < 2)
+/** Line + filled-area paths over an EXPLICIT [minX,maxX] time domain (the selected window or
+ *  range) — not the data's own extent — so the x-axis always spans what the user picked, and a
+ *  window with only partial data reads as partial instead of stretching a short span full-width.
+ *  Y is autoscaled to the in-window peak so even single-digit TPS fills the panel. */
+function buildPaths(points: TpsPoint[], minX: number, maxX: number) {
+  const inWin = points.filter((p) => p.t >= minX && p.t <= maxX);
+  if (inWin.length < 2)
     return { line: "", area: "", peak: 0, proj: [] as ProjPoint[] };
-  const xs = points.map((p) => p.t);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const peak = Math.max(...points.map((p) => p.v));
+  const peak = Math.max(...inWin.map((p) => p.v));
   const spanX = maxX - minX || 1;
   const spanV = peak || 1;
   const x = (t: number) => ((t - minX) / spanX) * VIEW_W;
   const y = (v: number) => VIEW_H - PAD_Y - (v / spanV) * (VIEW_H - PAD_Y * 2);
-  const line = points
+  const line = inWin
     .map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`)
     .join(" ");
-  const area = `${line} L${VIEW_W},${VIEW_H} L0,${VIEW_H} Z`;
-  const proj: ProjPoint[] = points.map((p) => ({
+  // Close the fill under the line's actual extent, not the full width — a partially-filled
+  // window must not paint area under the empty stretch.
+  const x0 = x(inWin[0].t).toFixed(1);
+  const x1 = x(inWin[inWin.length - 1].t).toFixed(1);
+  const area = `${line} L${x1},${VIEW_H} L${x0},${VIEW_H} Z`;
+  const proj: ProjPoint[] = inWin.map((p) => ({
     t: p.t,
     v: p.v,
     xFrac: (p.t - minX) / spanX,
@@ -110,20 +115,33 @@ export function TpsGraph({ snapshot, status }: BackendStats) {
   const [fromInput, setFromInput] = useState("");
   const [toInput, setToInput] = useState("");
 
-  const { series, seedError } = useTpsHistory(
+  const { series, seedError, loading } = useTpsHistory(
     range ?? { window: win },
     snapshot,
   );
   const points = useMemo(() => downsample(series, RENDER_BUDGET), [series]);
+  // The x-axis domain is the SELECTED span, not the data's extent: a range is its [from,to]; a
+  // trailing window ends at the latest sample and runs back `win` seconds. Anchoring here (vs
+  // deriving from data) is what makes "1D" read as a day even before a full day of data exists.
+  const domainMax = range
+    ? range.to
+    : points.length
+      ? points[points.length - 1].t
+      : nowSecs();
+  const domainMin = range ? range.from : domainMax - win;
+  const spanSecs = domainMax - domainMin;
+  // Clock-only for short spans; add the date once the span could straddle days (≥12h), so 1D
+  // and long custom ranges don't show the same HH:MM at both ends.
+  const fmtAxis = (s: number) =>
+    spanSecs >= 12 * 3600 ? fmtStamp(s) : fmtClock(s);
   const { line, area, peak, proj } = useMemo(
-    () => buildPaths(points),
-    [points],
+    () => buildPaths(points, domainMin, domainMax),
+    [points, domainMin, domainMax],
   );
   // Read "current" off the SAME snapshot the strip uses, so the two never show different numbers.
   const current = status === "live" ? snapshot?.tps : undefined;
 
-  // Nearest-point hover readout. Index-by-fraction is exact enough since the rendered series is
-  // (near-)uniformly spaced after downsampling; clamped so a shrinking series can't dangle a stale idx.
+  // Nearest-point hover readout, clamped so a shrinking series can't dangle a stale idx.
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const hovered =
     hoverIdx != null ? proj[Math.min(hoverIdx, proj.length - 1)] : null;
@@ -131,12 +149,18 @@ export function TpsGraph({ snapshot, status }: BackendStats) {
     if (proj.length < 2) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const frac = (e.clientX - rect.left) / rect.width;
-    setHoverIdx(
-      Math.max(
-        0,
-        Math.min(proj.length - 1, Math.round(frac * (proj.length - 1))),
-      ),
-    );
+    // Pick the point nearest the cursor by x-FRACTION, not by index. Peak-preserving
+    // downsampling puts each kept sample at an arbitrary time within its bucket, so the
+    // rendered points aren't uniformly spaced — `round(frac * count)` would select a point
+    // whose drawn x (its `xFrac`) sits away from the cursor, dragging the dot/crosshair off.
+    // proj is time-sorted, so scan for the closest xFrac.
+    let best = 0;
+    for (let i = 1; i < proj.length; i++) {
+      if (Math.abs(proj[i].xFrac - frac) < Math.abs(proj[best].xFrac - frac)) {
+        best = i;
+      }
+    }
+    setHoverIdx(best);
   };
 
   // A range is a static historical view → headline its peak; a window is live → headline now.
@@ -265,95 +289,127 @@ export function TpsGraph({ snapshot, status }: BackendStats) {
           </div>
         )}
         <div className="flex items-baseline gap-2">
-          <span className="wal-doto text-4xl tabular-nums text-primary">
-            {formatCount(heroValue)}
-          </span>
+          {/* Window mode's hero is the LIVE current rate (no fetch), so it never waits; a range's
+              hero is the fetched peak, so it skeletons until the new range lands. */}
+          {range && loading ? (
+            <Skeleton className="h-9 w-24" />
+          ) : (
+            <span className="wal-doto text-4xl tabular-nums text-primary">
+              {formatCount(heroValue)}
+            </span>
+          )}
           <span className="wal-mono text-[10px] uppercase tracking-wider text-muted-foreground">
             {heroUnit}
           </span>
-          <span className="ml-auto wal-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-            {caption}
-          </span>
+          {loading ? (
+            <Skeleton className="ml-auto h-3 w-28 self-center" />
+          ) : (
+            <span className="ml-auto wal-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              {caption}
+            </span>
+          )}
         </div>
         <div
           className="relative h-28 w-full"
           onPointerMove={onHoverMove}
           onPointerLeave={() => setHoverIdx(null)}
         >
-          <svg
-            viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
-            preserveAspectRatio="none"
-            className="absolute inset-0 h-full w-full text-primary"
-            role="img"
-            aria-label="Transactions per second over the selected window"
-          >
-            <defs>
-              <linearGradient id="tps-area" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="currentColor" stopOpacity={0.28} />
-                <stop offset="100%" stopColor="currentColor" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            {[0.25, 0.5, 0.75].map((f) => (
-              <line
-                key={f}
-                x1={0}
-                x2={VIEW_W}
-                y1={VIEW_H * f}
-                y2={VIEW_H * f}
-                className="text-border"
-                stroke="currentColor"
-                strokeWidth={1}
-                vectorEffect="non-scaling-stroke"
-              />
-            ))}
-            {area && <path d={area} fill="url(#tps-area)" stroke="none" />}
-            {line && (
-              <path
-                d={line}
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={1.5}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-                vectorEffect="non-scaling-stroke"
-              />
-            )}
-          </svg>
-          {/* Hover overlay in HTML (not SVG) so the crosshair/dot/label aren't stretched by the
-              non-uniform viewBox. Positioned by the point's normalized coords. */}
-          {hovered && (
+          {loading ? (
+            <Skeleton className="absolute inset-0 h-full w-full" />
+          ) : (
             <>
-              <div
-                className="pointer-events-none absolute bottom-0 top-0 w-px bg-primary/40"
-                style={{ left: `${hovered.xFrac * 100}%` }}
-              />
-              <div
-                className="pointer-events-none absolute size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary ring-2 ring-card"
-                style={{
-                  left: `${hovered.xFrac * 100}%`,
-                  top: `${hovered.yFrac * 100}%`,
-                }}
-              />
-              <div
-                className="wal-mono pointer-events-none absolute top-1 -translate-x-1/2 whitespace-nowrap border border-border bg-popover px-1.5 py-0.5 text-[10px] tabular-nums text-popover-foreground"
-                style={{
-                  left: `${Math.min(90, Math.max(10, hovered.xFrac * 100))}%`,
-                }}
+              <svg
+                viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+                preserveAspectRatio="none"
+                className="absolute inset-0 h-full w-full text-primary"
+                role="img"
+                aria-label="Transactions per second over the selected window"
               >
-                {formatCount(hovered.v)}{" "}
-                <span className="text-muted-foreground">
-                  tx/s · {fmtClock(hovered.t)}
-                </span>
-              </div>
+                <defs>
+                  <linearGradient id="tps-area" x1="0" y1="0" x2="0" y2="1">
+                    <stop
+                      offset="0%"
+                      stopColor="currentColor"
+                      stopOpacity={0.28}
+                    />
+                    <stop
+                      offset="100%"
+                      stopColor="currentColor"
+                      stopOpacity={0}
+                    />
+                  </linearGradient>
+                </defs>
+                {[0.25, 0.5, 0.75].map((f) => (
+                  <line
+                    key={f}
+                    x1={0}
+                    x2={VIEW_W}
+                    y1={VIEW_H * f}
+                    y2={VIEW_H * f}
+                    className="text-border"
+                    stroke="currentColor"
+                    strokeWidth={1}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ))}
+                {area && <path d={area} fill="url(#tps-area)" stroke="none" />}
+                {line && (
+                  <path
+                    d={line}
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.5}
+                    strokeLinejoin="round"
+                    strokeLinecap="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
+              </svg>
+              {/* Hover overlay in HTML (not SVG) so the crosshair/dot/label aren't stretched by the
+              non-uniform viewBox. Positioned by the point's normalized coords. */}
+              {hovered && (
+                <>
+                  <div
+                    className="pointer-events-none absolute bottom-0 top-0 w-px bg-primary/40"
+                    style={{ left: `${hovered.xFrac * 100}%` }}
+                  />
+                  <div
+                    className="pointer-events-none absolute size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary ring-2 ring-card"
+                    style={{
+                      left: `${hovered.xFrac * 100}%`,
+                      top: `${hovered.yFrac * 100}%`,
+                    }}
+                  />
+                  <div
+                    className="wal-mono pointer-events-none absolute top-1 -translate-x-1/2 whitespace-nowrap border border-border bg-popover px-1.5 py-0.5 text-[10px] tabular-nums text-popover-foreground"
+                    style={{
+                      left: `${Math.min(90, Math.max(10, hovered.xFrac * 100))}%`,
+                    }}
+                  >
+                    {formatCount(hovered.v)}{" "}
+                    <span className="text-muted-foreground">
+                      tx/s · {fmtAxis(hovered.t)}
+                    </span>
+                  </div>
+                </>
+              )}
             </>
           )}
         </div>
-        {proj.length >= 2 && (
-          <div className="wal-mono flex justify-between text-[9px] uppercase tracking-wider text-muted-foreground">
-            <span>{fmtClock(proj[0].t)}</span>
-            <span>{fmtClock(proj[Math.floor((proj.length - 1) / 2)].t)}</span>
-            <span>{fmtClock(proj[proj.length - 1].t)}</span>
+        {loading ? (
+          <div className="flex justify-between">
+            <Skeleton className="h-2.5 w-12" />
+            <Skeleton className="h-2.5 w-12" />
+            <Skeleton className="h-2.5 w-12" />
           </div>
+        ) : (
+          proj.length >= 2 && (
+            <div className="wal-mono flex justify-between text-[9px] uppercase tracking-wider text-muted-foreground">
+              <span>{fmtAxis(domainMin)}</span>
+              <span>{fmtAxis((domainMin + domainMax) / 2)}</span>
+              <span>{fmtAxis(domainMax)}</span>
+            </div>
+          )
         )}
       </PanelContent>
     </Panel>

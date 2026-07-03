@@ -67,6 +67,13 @@ import {
   type BlackjackState,
 } from "sui-tunnel-ts/protocol/blackjack";
 import { blackjackMoveCodec } from "sui-tunnel-ts/protocol/blackjackCodec";
+import { engineEnabled } from "@/engine/flag";
+import { engineClient } from "@/engine/engineClient";
+import { useGameMatch } from "@/engine/react/useGameMatch";
+import { useArenaWorkerEntry } from "@/engine/react/useArenaWorkerEntry";
+import { useWorkerArenaPlay } from "@/engine/react/useWorkerArenaPlay";
+import type { MatchSnapshot } from "@/engine/engineApi";
+import type { BlackjackPvpView } from "@/games/blackjack/blackjackPvpView";
 import { runArenaPlay } from "@/onchain/arenaPlay";
 import type { StakeStrategy } from "@/onchain/stakeTunnel";
 
@@ -163,6 +170,9 @@ export interface PvpView {
   forfeit: () => void;
 }
 
+/** @deprecated Legacy main-thread blackjack PvP engine — kept ONLY as the `?engine=legacy`
+ *  fallback and slated for removal. The worker engine is the primary path: the game lives in
+ *  `blackjackPvpSpec.ts` (`defineGame`) and is driven by `useWorkerBlackjackPvp` below. */
 export function usePvpBlackjack(): PvpView {
   const client = useMemo<SuiJsonRpcClient>(() => getSuiClient(), []);
   const account = useCurrentAccount();
@@ -1548,3 +1558,122 @@ export function usePvpBlackjack(): PvpView {
     forfeit,
   };
 }
+
+// --- Worker adapter (routes PvP through the shared hub when engine=worker) --------
+
+/** Map the worker hub's PvP snapshot into the legacy `PvpView` shape the
+ *  `PvpBlackjack` page already renders. */
+function useWorkerBlackjackPvp(windowId: string): PvpView {
+  const snap = useGameMatch(
+    windowId,
+    "blackjack",
+  ) as MatchSnapshot<BlackjackPvpView>;
+  const v = snap.view;
+  const s = v?.state ?? null;
+
+  // Map engine status → PvpPhase
+  const phase: PvpPhase =
+    snap.status === "idle"
+      ? "idle"
+      : snap.status === "matching"
+        ? "queuing"
+        : snap.status === "funding"
+          ? "funding"
+          : snap.status === "playing"
+            ? "playing"
+            : snap.status === "settling"
+              ? "settling"
+              : snap.status === "settled"
+                ? "done"
+                : snap.status === "error"
+                  ? "error"
+                  : "idle";
+
+  // Arena one-sig auto-enter (ADR-0028), same as caro: claim blackjack's fleet-bot allocation from the
+  // store and join it in the worker on wallet-connect — vs a real bot. This is the dev-raid flow
+  // (allocate → join → play). The `queue` fallback below still calls findMatch, but auto-enter is the
+  // primary path so the window no longer hangs at "finding opponent" (quickMatch has no bot).
+  useArenaWorkerEntry({
+    windowId,
+    gameId: "blackjack",
+    arenaGameId: BLACKJACK_ARENA_GAME_ID,
+    isIdle: () => snap.status === "idle",
+  });
+  const playArena = useWorkerArenaPlay({
+    windowId,
+    gameId: "blackjack",
+    arenaGameId: BLACKJACK_ARENA_GAME_ID,
+    label: "blackjack",
+  });
+
+  const playerHand = s ? s.playerHand : [];
+  const dealerHand = s
+    ? s.phase === "player"
+      ? s.dealerHand.slice(0, 1)
+      : s.dealerHand
+    : [];
+
+  return {
+    phase,
+    error: snap.error,
+    role: snap.role,
+    isDealer: v?.isDealer ?? false,
+    playerHand,
+    dealerHand,
+    playerSum: bjCardsHandValue(playerHand),
+    dealerSum:
+      s && s.phase !== "player"
+        ? bjCardsHandValue(s.dealerHand)
+        : bjCardsHandValue(dealerHand),
+    balancePlayer: s
+      ? getPlayerParty(s.round || 1n) === "A"
+        ? s.balanceA
+        : s.balanceB
+      : 0n,
+    balanceDealer: s
+      ? getDealerParty(s.round || 1n) === "A"
+        ? s.balanceA
+        : s.balanceB
+      : 0n,
+    myBalance: s ? (snap.role === "A" ? s.balanceA : s.balanceB) : 0n,
+    oppBalance: s ? (snap.role === "A" ? s.balanceB : s.balanceA) : 0n,
+    round: s ? Number(s.round) : 0,
+    gamePhase: s ? s.phase : null,
+    myTurn: v?.myTurn ?? false,
+    inRoundOver: v?.inRoundOver ?? false,
+    terminal: v?.terminal ?? false,
+    outOfChips: v?.outOfChips ?? null,
+    currentBet: v?.currentBet ?? 0n,
+    tableMax: v?.tableMax ?? 0n,
+    betOptions: v?.betOptions ?? [],
+    rounds: v?.rounds ?? [],
+    auto: snap.auto,
+    stake: DEFAULT_STAKE,
+    walletAddress: "", // worker path doesn't surface wallet info through the snapshot
+    walletBalance: 0n,
+    digests: {},
+    fund: () => {}, // not needed in worker mode (funding handled by the engine bridge)
+    queue: () => engineClient.findMatch(windowId, "blackjack"),
+    playArena,
+    hit: () => engineClient.submitInput(windowId, { type: "hit" }),
+    stand: () => engineClient.submitInput(windowId, { type: "stand" }),
+    bet: (amount: number) =>
+      engineClient.submitInput(windowId, { type: "bet", amount }),
+    // Worker interim: graceful end at the round boundary (the engine settles on terminal). The
+    // legacy hook's true concede ((0, total) close) needs engine support — follow-up.
+    forfeit: () => engineClient.submitInput(windowId, { type: "stop" }),
+    setAuto: (on: boolean) => engineClient.setAuto(windowId, on),
+    leave: () => engineClient.reset(windowId),
+  };
+}
+
+/** Legacy path wraps the bespoke hook (windowId unused). */
+function useLegacyBlackjackAdapter(_windowId: string): PvpView {
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  return usePvpBlackjack();
+}
+
+/** Worker path routes blackjack PvP through the shared hub; `?engine=legacy` keeps the
+ *  bespoke hook. Selected once at module load. */
+export const useRoutedPvpBlackjack: (windowId: string) => PvpView =
+  engineEnabled() ? useWorkerBlackjackPvp : useLegacyBlackjackAdapter;

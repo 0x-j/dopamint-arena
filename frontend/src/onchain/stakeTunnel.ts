@@ -4,6 +4,8 @@
 // centralize it so a fix to the funding strategy lands once, not in five files.
 import {
   openAndFundSharedTunnel,
+  openManySharedSeatA,
+  openAndFundSelfPlay,
   depositStake,
   type SignExec,
 } from "./tunnelTx";
@@ -96,6 +98,151 @@ export async function openSharedTunnelStaked(
         penaltyAmount: amount,
       }),
     `${opts.label} open/fund`,
+  );
+}
+
+/** One match's seat-A open in a batched flush: both seats, this match's per-seat stake, and a label. */
+export interface SharedStakedOpenSpec {
+  partyA: SharedParty;
+  partyB: SharedParty;
+  amount: bigint;
+  label: string;
+}
+
+/**
+ * Batched seat A: open + share + fund seat A for N matches in ONE sponsored PTB, returning each
+ * match's tunnel id in SPEC ORDER (the i-th id is the i-th spec's tunnel). The batched analogue of
+ * {@link openSharedTunnelStaked}: same funding-strategy branch (MTPS address-balance → MTPS coin →
+ * SUI sponsored-with-wallet-fallback) and the same `penaltyAmount = amount` per seat (the
+ * abandonment-forfeit model — see {@link openSharedTunnelStaked}), but the whole batch draws ONE
+ * summed stake withdrawal so a flush costs ONE Enoki sponsor+execute pair (design §4.1).
+ *
+ * Demux is by each created tunnel's on-chain `party_b.public_key` inside {@link openManySharedSeatA}
+ * (objectChanges order is unspecified); a post-commit demux failure surfaces as `BatchCommittedError`
+ * — the tunnels exist and stake is consumed, so callers MUST NOT retry. A 1-spec call builds the same
+ * PTB shape as `openSharedTunnelStaked` (one create + seat-A deposit + share, one withdrawal), so the
+ * lone-flush / single-match path stays correct.
+ */
+export async function openSharedTunnelStakedMany(
+  opts: StakeStrategy & {
+    reads: SharedReads;
+    specs: SharedStakedOpenSpec[];
+  },
+): Promise<string[]> {
+  const { reads, specs } = opts;
+  const total = specs.reduce((sum, s) => sum + s.amount, 0n);
+  const seatSpecs = specs.map((s) => ({
+    partyA: s.partyA,
+    partyB: s.partyB,
+    amount: s.amount,
+    penaltyAmount: s.amount,
+  }));
+  if (isMtpsConfigured) {
+    if (isMtpsAddressBalance) {
+      // ADR-0013: withdraw the WHOLE batch's stake (summed) from the player's address balance in one
+      // shot — concurrent opens across games don't equivocate. Top up first (no-op once funded).
+      await opts.ensureStakeBalance(total);
+      return openManySharedSeatA({
+        reads,
+        signExec: opts.sponsoredSignExec,
+        specs: seatSpecs,
+        coinType: MTPS_COIN_TYPE,
+        stakeFromBalance: { amount: total, coinType: MTPS_COIN_TYPE },
+      });
+    }
+    return openManySharedSeatA({
+      reads,
+      signExec: opts.sponsoredSignExec,
+      specs: seatSpecs,
+      coinType: MTPS_COIN_TYPE,
+      stakeCoinId: await opts.prepareStake(total),
+    });
+  }
+  return withSponsorFallback(
+    async () =>
+      openManySharedSeatA({
+        reads,
+        signExec: opts.sponsoredSignExec,
+        specs: seatSpecs,
+        stakeCoinId: await opts.selectStakeCoin(total),
+      }),
+    () =>
+      openManySharedSeatA({
+        reads,
+        signExec: opts.walletSignExec,
+        specs: seatSpecs,
+      }),
+    `pvp many-open (${specs.length})`,
+  );
+}
+
+/**
+ * Self-play: open + fund BOTH ephemeral-bot seats from one wallet in ONE signature. The self-play
+ * analogue of {@link openSharedTunnelStaked} — same funding-strategy branch (MTPS address-balance →
+ * MTPS coin → SUI sponsored-with-wallet-fallback) so a fix lands once — but it funds both seats via
+ * `create_and_fund` (the existing {@link openAndFundSelfPlay} tx) instead of seat A only. No penalty
+ * is set: both seats are the same player's bots, so there is no opponent to make whole on abandon.
+ */
+export async function openSelfPlayStaked(
+  opts: StakeStrategy & {
+    reads: SharedReads;
+    partyA: SharedParty;
+    partyB: SharedParty;
+    aAmount: bigint;
+    bAmount: bigint;
+    label: string;
+  },
+): Promise<string> {
+  const { reads, partyA, partyB, aAmount, bAmount } = opts;
+  const total = aAmount + bAmount;
+  if (isMtpsConfigured) {
+    if (isMtpsAddressBalance) {
+      // ADR-0013: withdraw both seats' stake (summed) from the player's address balance — concurrent
+      // opens across games don't equivocate. Top up first (no-op once funded).
+      await opts.ensureStakeBalance(total);
+      return openAndFundSelfPlay({
+        reads,
+        signExec: opts.sponsoredSignExec,
+        partyA,
+        partyB,
+        aAmount,
+        bAmount,
+        coinType: MTPS_COIN_TYPE,
+        stakeFromBalance: { amount: total, coinType: MTPS_COIN_TYPE },
+      });
+    }
+    return openAndFundSelfPlay({
+      reads,
+      signExec: opts.sponsoredSignExec,
+      partyA,
+      partyB,
+      aAmount,
+      bAmount,
+      coinType: MTPS_COIN_TYPE,
+      stakeCoinId: await opts.prepareStake(total),
+    });
+  }
+  return withSponsorFallback(
+    async () =>
+      openAndFundSelfPlay({
+        reads,
+        signExec: opts.sponsoredSignExec,
+        partyA,
+        partyB,
+        aAmount,
+        bAmount,
+        stakeCoinId: await opts.selectStakeCoin(total),
+      }),
+    () =>
+      openAndFundSelfPlay({
+        reads,
+        signExec: opts.walletSignExec,
+        partyA,
+        partyB,
+        aAmount,
+        bAmount,
+      }),
+    `${opts.label} self-play open/fund`,
   );
 }
 

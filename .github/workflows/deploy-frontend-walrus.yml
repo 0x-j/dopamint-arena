@@ -97,6 +97,10 @@ jobs:
           VITE_MTPS_COIN_TYPE: ${{ vars.VITE_MTPS_COIN_TYPE_PROD || vars.VITE_MTPS_COIN_TYPE }}
           VITE_AGENT_ALLOWANCE_PACKAGE_ID: ${{ vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID_PROD || vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID }}
           VITE_STREAMING_PAYMENT_PACKAGE_ID: ${{ vars.VITE_STREAMING_PAYMENT_PACKAGE_ID_PROD || vars.VITE_STREAMING_PAYMENT_PACKAGE_ID }}
+          # Sentry (both optional; empty disables cleanly). Public DSN Variable + build-time-only
+          # auth token for release/source-map upload — same contract as deploy-frontend.yml.
+          VITE_SENTRY_DSN: ${{ vars.VITE_SENTRY_DSN_PROD || vars.VITE_SENTRY_DSN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
           pnpm build
           # Carry the site id + SPA routes into dist/ so the deploy action updates the

@@ -51,6 +51,7 @@ export function useTpsHistory(
 ): {
   series: TpsPoint[];
   seedError: boolean;
+  loading: boolean;
 } {
   // Decompose the union into primitives. The effects then depend on these directly — honest,
   // complete dependency arrays (no eslint-disable) — whereas an inline-constructed `query` object
@@ -61,9 +62,19 @@ export function useTpsHistory(
   const [series, setSeries] = useState<TpsPoint[]>([]);
   const [seedError, setSeedError] = useState(false);
   const lastT = useRef(0);
+  // The query key `series` was last seeded for. Compared against the active key DURING render, so a
+  // window/range switch reads as `loading` on the very first frame — before the effect fires and
+  // before any stale data can paint — and clears only when that key's own fetch settles. (A ref,
+  // not state, so the seed fetch flips it without an extra render; the setSeries beside it re-renders.)
+  const seededKey = useRef("");
+  const key =
+    from != null && to != null ? `r:${from}:${to}` : `w:${windowSecs}`;
+  const loading = seededKey.current !== key;
   useEffect(() => {
     let alive = true;
     setSeedError(false);
+    const nextKey =
+      from != null && to != null ? `r:${from}:${to}` : `w:${windowSecs}`;
     const q: StatsHistoryQuery =
       from != null && to != null
         ? { from, to }
@@ -71,10 +82,14 @@ export function useTpsHistory(
     getControlPlaneClient()
       .fetchStatsHistory(q)
       .then((seed) => {
-        if (alive) setSeries(seed);
+        if (!alive) return;
+        setSeries(seed);
+        seededKey.current = nextKey;
       })
       .catch(() => {
-        if (alive) setSeedError(true);
+        if (!alive) return;
+        setSeedError(true);
+        seededKey.current = nextKey;
       });
     return () => {
       alive = false;
@@ -90,5 +105,5 @@ export function useTpsHistory(
       capSeries([...prev, { t, v: snapshot.tps }], windowSecs),
     );
   }, [snapshot, windowSecs]);
-  return { series, seedError };
+  return { series, seedError, loading };
 }

@@ -116,6 +116,25 @@ export interface PvpChannel {
   ): void;
 }
 
+/** The relay surface a match session drives (ADR-0030). `MpClient` implements it directly for the
+ *  shared-hub path; the pool's `RemoteMpClient` implements the same over a MessagePort. Kept narrow
+ *  (exactly what `PvpMatchSession` calls) so a session runs unchanged against either transport. */
+export interface RelayClient {
+  quickMatch(game: string): Promise<MatchInfo>;
+  joinMatch(matchId: string): Promise<MatchInfo>;
+  channel(matchId: string): PvpChannel;
+  announceTunnel(matchId: string, tunnelId: string): void;
+  releaseMatch(matchId: string): void;
+  resumeMatch(matchId: string): void;
+  // Resume path (rebuildTunnel + attachResume): mark a rebuilt match active for the reconnect loop
+  // and subscribe to the socket-lifecycle events the resync handshake keys off. Each returns an
+  // unsubscribe fn (except markActive). All events carry a matchId so the pool routes them per-window.
+  markActive(matchId: string): void;
+  onResumeOk(cb: (e: ResumeOkEvent) => void): () => void;
+  onPeerResumed(cb: (e: PeerResumedEvent) => void): () => void;
+  onPeerDropped(cb: (e: PeerDroppedEvent) => void): () => void;
+}
+
 const te = new TextEncoder();
 
 /** Derive the /v1/mp WS URL from the backend base (empty => same-origin dev proxy). */
@@ -125,7 +144,7 @@ export function resolveMpWsUrl(backendUrl: string): string {
   return base.replace(/^http/, "ws").replace(/\/+$/, "") + "/v1/mp";
 }
 
-export class MpClient {
+export class MpClient implements RelayClient {
   #ws: WebSocket | null = null;
   readonly #url: string;
   readonly #wallet: string;
@@ -427,6 +446,16 @@ export class MpClient {
   releaseMatch(matchId: string) {
     this.#relayHandlers.delete(matchId);
     this.#activeMatches.delete(matchId);
+  }
+
+  /** Send a resume frame for a match rebuilt AFTER the socket is already open. The connect-time
+   *  {@link #resumeActive} only covers matches registered before connect; a shared socket that is
+   *  already connected when a cold-loaded match attaches needs this explicit resume. Idempotent —
+   *  markActive also makes the reconnect loop re-resume it. No-op until the socket is connected
+   *  (connect's handshake will then carry it). */
+  resumeMatch(matchId: string) {
+    this.markActive(matchId);
+    if (this.#connected) this.#send({ type: "resume", matchId });
   }
 
   /** Announce the opened on-chain tunnel id to the backend registry (watchtower). */

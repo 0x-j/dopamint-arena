@@ -117,6 +117,11 @@ export function GridLayout({
   const [width, setWidth] = useState(0);
   const [live, setLive] = useState<LiveState | null>(null);
   const [placeholder, setPlaceholder] = useState<Box | null>(null);
+  // Off until the grid has mounted, measured its width, and settled its column fit once — so windows
+  // appear IN PLACE on mount (and on every tab-switch remount) instead of sliding in from the
+  // unmeasured (width 0 ⇒ default-cols) layout. Flipped on after two frames; drags and real resizes
+  // still animate via FRAME_TRANSITION.
+  const [settled, setSettled] = useState(false);
 
   // Mirror the latest layout so window event handlers never read a stale closure.
   const layoutRef = useRef(layout);
@@ -177,6 +182,19 @@ export function GridLayout({
     });
     observer.observe(el);
     return () => observer.disconnect();
+  }, []);
+
+  // Enable the settle transition only after the first paint + the post-measure column refit have
+  // landed (two frames), so the initial layout doesn't animate in.
+  useEffect(() => {
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(() => setSettled(true));
+    });
+    return () => {
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
+    };
   }, []);
 
   const unitWidth = width / activeCols;
@@ -410,7 +428,7 @@ export function GridLayout({
             ...pixelBox(item),
             zIndex: zOrder[item.id] ?? 1,
             transform: "translate3d(0,0,0)",
-            transition: isActive ? "none" : FRAME_TRANSITION,
+            transition: isActive || !settled ? "none" : FRAME_TRANSITION,
           };
           if (isActive && live) {
             if (live.mode === "drag") {

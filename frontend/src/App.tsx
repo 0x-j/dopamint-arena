@@ -2,6 +2,7 @@ import { RouterProvider } from "@tanstack/react-router";
 
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { PerfHud } from "./desktop/PerfHud";
 import { DemoWalletProvider } from "./wallet/useWalletSession";
 import { ThemeProvider } from "./theme/useTheme";
 import { TelemetryProvider } from "./telemetry/TelemetryProvider";
@@ -18,6 +19,7 @@ export function App() {
           <TooltipProvider delayDuration={150}>
             <RouterProvider router={router} />
             <Toaster />
+            <PerfHud />
           </TooltipProvider>
         </TelemetryProvider>
       </DemoWalletProvider>

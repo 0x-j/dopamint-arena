@@ -43,7 +43,7 @@ export interface GameModule {
    *  consumes whichever variant it's currently showing. */
   arenaGameId?: string | string[];
   // Window size is uniform across games — the desktop opens every window at the same
-  // tile size (see TILE in Desktop.tsx), so games no longer declare their own footprint.
+  // tile size (see TILE in desktop/floorGrid.ts), so games no longer declare their own footprint.
   // Deferred until games drive the engine:
   //   protocolFactory?: () => Protocol<unknown, unknown>;  // from sui-tunnel-ts
 }

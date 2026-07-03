@@ -201,9 +201,19 @@ export async function enterArena(
       return { ...alloc, tunnelId, depositDigest };
     }),
   );
-  await reportArenaOpened(
-    live.map((o) => ({ matchId: o.matchId, tunnelId: o.tunnelId })),
-    opts,
-  );
+  // Best-effort cue: the tunnels are already funded (deposit landed) and the fleet bot enters its
+  // move loop on tunnel-open, not on this notification — so a failed/`503` "opened" report must NOT
+  // abort entry and strand a funded tunnel. Log and continue so each game still auto-enters + plays.
+  try {
+    await reportArenaOpened(
+      live.map((o) => ({ matchId: o.matchId, tunnelId: o.tunnelId })),
+      opts,
+    );
+  } catch (e) {
+    console.warn(
+      "[arena] reportArenaOpened failed (tunnels funded; entering anyway)",
+      e,
+    );
+  }
   return live;
 }

@@ -24,6 +24,40 @@
   --wal-blue: #2e69df;
   --wal-mint: #138a5c;
   --wal-lime: #5e6b00;
+
+  /* ---- category identity colors (workspace) ----
+     CONSTANT across themes (defined only here) so ONE set reads in BOTH light and dark: each is a
+     saturated design-system accent (the aurora family — violet / pink / mint / blue) kept dark
+     enough for cream text on either the cream or the ink canvas. "All" IS the brand primary
+     (violet); the others are its aurora neighbours. `--cat-*-grad` is a subtle same-hue gradient,
+     each blended a touch toward the violet/blue family so the set reads as "mixed from the primary"
+     — a light gradient that still reads as one colour. Used by the workspace tab pills, the
+     game-window title bars, and the category dots (text/icons in cream `--cat-foreground`). */
+  --cat-all: #613dff; /* = --primary */
+  --cat-game: #c23bb0;
+  --cat-payment: #138a5c;
+  --cat-chat: #2e69df;
+  --cat-foreground: var(--wal-cream);
+  --cat-all-grad: linear-gradient(
+    135deg,
+    var(--cat-all),
+    color-mix(in oklab, var(--cat-all), var(--cat-chat) 32%)
+  );
+  --cat-game-grad: linear-gradient(
+    135deg,
+    var(--cat-game),
+    color-mix(in oklab, var(--cat-game), var(--cat-all) 30%)
+  );
+  --cat-payment-grad: linear-gradient(
+    135deg,
+    var(--cat-payment),
+    color-mix(in oklab, var(--cat-payment), var(--cat-chat) 30%)
+  );
+  --cat-chat-grad: linear-gradient(
+    135deg,
+    var(--cat-chat),
+    color-mix(in oklab, var(--cat-chat), var(--cat-all) 30%)
+  );
   --wal-grad-memory: linear-gradient(
     96deg,
     #613dff 0%,
@@ -103,6 +137,7 @@
   --wal-blue: #a1c8ff;
   --wal-mint: #9cefcf;
   --wal-lime: #eaff80;
+  /* --cat-* stay constant (see :root) — one saturated set for both themes — so no dark override. */
   --wal-glow:
     0 0 0 1px rgba(202, 177, 255, 0.18), 0 18px 60px rgba(97, 61, 255, 0.22);
 
@@ -183,6 +218,15 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+
+  /* Category identity colors (constant; see the --cat-* block above). `bg-cat-game` is the flat
+     fallback fill, layered under `bg-[image:var(--cat-game-grad)]` for the gradient; text/icons ON a
+     fill use `text-cat-foreground`. */
+  --color-cat-game: var(--cat-game);
+  --color-cat-payment: var(--cat-payment);
+  --color-cat-chat: var(--cat-chat);
+  --color-cat-all: var(--cat-all);
+  --color-cat-foreground: var(--cat-foreground);
 
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);

@@ -21,6 +21,10 @@ interface ImportMetaEnv {
   // (POST /v1/faucet), so there is no faucet-object id.
   readonly VITE_MTPS_PACKAGE_ID?: string;
   readonly VITE_MTPS_COIN_TYPE?: string;
+  // Sentry error monitoring. The DSN is a public client identifier; unset disables Sentry.
+  readonly VITE_SENTRY_DSN?: string;
+  // Optional 0..1 traces override; defaults to 1.0 in dev / 0.2 in prod (sentryClient.ts).
+  readonly VITE_SENTRY_TRACES_SAMPLE_RATE?: string;
 }
 
 interface ImportMeta {

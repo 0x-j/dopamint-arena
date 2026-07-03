@@ -45,7 +45,9 @@ export function TransactionsFeed({
 
   return (
     <Panel className={className}>
-      <PanelHeader>
+      {/* Compact chrome throughout: the feed lives in the dock, where every saved pixel is a
+          visible row — the default dock height budgets ~5 rows (see the bottom panel in Desktop). */}
+      <PanelHeader className="py-1.5">
         <PanelTitle>{title}</PanelTitle>
       </PanelHeader>
 
@@ -54,7 +56,7 @@ export function TransactionsFeed({
         onValueChange={setTab}
         className="flex min-h-0 flex-1 flex-col gap-0"
       >
-        <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b border-border bg-transparent p-1.5">
+        <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b border-border bg-transparent p-1">
           <TabsTrigger value="all" className="shrink-0 text-[11px]">
             All
           </TabsTrigger>
@@ -70,21 +72,22 @@ export function TransactionsFeed({
         </TabsList>
 
         <div className="min-h-0 flex-1 overflow-auto">
-          <table className="w-full text-left text-xs">
+          {/* Single-line rows: nowrap keeps every row exactly one line tall (the dock height
+              budget counts rows); long game names truncate (max-w + ellipsis) instead of
+              wrapping or forcing a horizontal scroll. */}
+          <table className="w-full whitespace-nowrap text-left text-xs">
             <thead className="sticky top-0 bg-card text-muted-foreground">
               <tr>
                 {onchain && (
                   <>
-                    <th className="px-2.5 py-1.5 font-medium">DIGEST</th>
-                    <th className="px-2.5 py-1.5 font-medium">ADDRESS</th>
-                    <th className="px-2.5 py-1.5 font-medium">PROOF</th>
+                    <th className="px-2.5 py-1 font-medium">DIGEST</th>
+                    <th className="px-2.5 py-1 font-medium">ADDRESS</th>
+                    <th className="px-2.5 py-1 font-medium">PROOF</th>
                   </>
                 )}
-                {showGame && (
-                  <th className="px-2.5 py-1.5 font-medium">GAME</th>
-                )}
-                <th className="px-2.5 py-1.5 font-medium">TIME</th>
-                <th className="px-2.5 py-1.5 font-medium">TYPE</th>
+                {showGame && <th className="px-2.5 py-1 font-medium">GAME</th>}
+                <th className="px-2.5 py-1 font-medium">TIME</th>
+                <th className="px-2.5 py-1 font-medium">TYPE</th>
               </tr>
             </thead>
             <tbody>
@@ -92,7 +95,7 @@ export function TransactionsFeed({
                 <tr>
                   <td
                     colSpan={colCount}
-                    className="px-2.5 py-8 text-center text-muted-foreground"
+                    className="px-2.5 py-4 text-center text-muted-foreground"
                   >
                     No activity yet.
                   </td>
@@ -110,7 +113,7 @@ export function TransactionsFeed({
                   >
                     {onchain && (
                       <>
-                        <td className="px-2.5 py-1.5">
+                        <td className="px-2.5 py-1">
                           {t.digest ? (
                             <HashLink
                               value={t.digest}
@@ -121,7 +124,7 @@ export function TransactionsFeed({
                             <span className="text-muted-foreground">—</span>
                           )}
                         </td>
-                        <td className="px-2.5 py-1.5">
+                        <td className="px-2.5 py-1">
                           {t.address ? (
                             <HashLink
                               value={t.address}
@@ -132,7 +135,7 @@ export function TransactionsFeed({
                             <span className="text-muted-foreground">—</span>
                           )}
                         </td>
-                        <td className="px-2.5 py-1.5">
+                        <td className="px-2.5 py-1">
                           {t.type === "Settled" && t.digest ? (
                             <Link
                               to="/explorer/$digest"
@@ -150,19 +153,19 @@ export function TransactionsFeed({
                       </>
                     )}
                     {showGame && (
-                      <td className="px-2.5 py-1.5 text-foreground">
+                      <td className="max-w-32 truncate px-2.5 py-1 text-foreground">
                         {gameLabel(t.game)}
                       </td>
                     )}
                     <td
-                      className="px-2.5 py-1.5 text-muted-foreground"
+                      className="px-2.5 py-1 text-muted-foreground"
                       title={t.time}
                     >
                       {t.timestampMs != null
                         ? formatRelativeTime(t.timestampMs, now)
                         : t.time}
                     </td>
-                    <td className="px-2.5 py-1.5">{t.type}</td>
+                    <td className="px-2.5 py-1">{t.type}</td>
                   </tr>
                 ))
               )}

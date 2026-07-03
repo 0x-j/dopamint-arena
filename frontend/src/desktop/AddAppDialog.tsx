@@ -8,6 +8,7 @@ import {
 import { GameIcon } from "../games/GameIcon";
 import { listByWorkspace } from "../games/registry";
 import type { GameModule, Workspace } from "../games/types";
+import { DeviceCapNotice } from "./DeviceCapNotice";
 
 /** Top-to-bottom groups in the picker. Each maps to a workspace; opening any card
  *  switches to that workspace (see `onOpen` in Desktop). */
@@ -40,6 +41,7 @@ export function AddAppDialog({
             Open a game, payment, or chat — it lands in its own workspace.
           </DialogDescription>
         </DialogHeader>
+        <DeviceCapNotice />
         <div className="-mx-1 flex max-h-[60vh] flex-col gap-4 overflow-y-auto px-1 py-1">
           {GROUPS.map((group) => {
             const modules = listByWorkspace(group.workspace);

@@ -93,6 +93,12 @@ jobs:
           VITE_MTPS_COIN_TYPE: ${{ github.ref_name == 'main' && vars.VITE_MTPS_COIN_TYPE_PROD || vars.VITE_MTPS_COIN_TYPE }}
           VITE_AGENT_ALLOWANCE_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID_PROD || vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID }}
           VITE_STREAMING_PAYMENT_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_STREAMING_PAYMENT_PACKAGE_ID_PROD || vars.VITE_STREAMING_PAYMENT_PACKAGE_ID }}
+          # Sentry (both optional; empty disables cleanly). The DSN is a public client id
+          # baked into the bundle — a Variable like the rest. The auth token IS secret and
+          # BUILD-TIME ONLY: it lets the vite plugin create the git-SHA release and upload
+          # source maps (main + worker chunks), then delete the .map files before S3.
+          VITE_SENTRY_DSN: ${{ github.ref_name == 'main' && vars.VITE_SENTRY_DSN_PROD || vars.VITE_SENTRY_DSN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: pnpm build
 
       - name: Deploy to S3

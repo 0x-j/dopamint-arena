@@ -24,6 +24,7 @@ import {
   buildForceClose as sdkForceClose,
 } from "sui-tunnel-ts/onchain/txbuilders";
 import { SignatureScheme } from "sui-tunnel-ts/core/crypto";
+import { toHex } from "sui-tunnel-ts/core/bytes";
 import type {
   CoSignedSettlement,
   CoSignedSettlementWithRoot,
@@ -116,7 +117,7 @@ export class BatchCommittedError extends Error {
     readonly cause: unknown,
   ) {
     super(
-      `openAndFundMany: batch committed (digest ${digest}) but post-commit step failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      `batch open committed (digest ${digest}) but post-commit step failed: ${cause instanceof Error ? cause.message : String(cause)}`,
     );
     this.name = "BatchCommittedError";
   }
@@ -181,6 +182,61 @@ export async function readTunnelPartyA(
   return addr;
 }
 
+/** Normalize a Move `vector<u8>` as `getObject` showContent renders it (number[] | base64 | hex)
+ *  to lower-case hex without `0x`, matching `toHex`. Returns null if unrecognizable. */
+function byteVectorToHex(v: unknown): string | null {
+  if (Array.isArray(v)) {
+    let h = "";
+    for (const n of v) {
+      const b = Number(n);
+      if (!Number.isInteger(b) || b < 0 || b > 255) return null;
+      h += b.toString(16).padStart(2, "0");
+    }
+    return h.length ? h : null;
+  }
+  if (typeof v === "string") {
+    const s = v.replace(/^0x/i, "");
+    if (s.length > 0 && s.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(s)) {
+      return s.toLowerCase();
+    }
+    try {
+      const bin = atob(v); // Sui can render a byte vector as base64
+      let h = "";
+      for (let i = 0; i < bin.length; i++) {
+        h += bin.charCodeAt(i).toString(16).padStart(2, "0");
+      }
+      return h.length ? h : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** A created tunnel's party-B public key (lower-case hex, no `0x`) from its on-chain fields. The
+ *  batch opener keys created tunnels by THIS, not by `objectChanges` order (Sui leaves that
+ *  unspecified): every tunnel in one flush shares party A (the single sender), but each carries a
+ *  distinct per-match opponent ephemeral as party B — the unique correlation key. */
+export async function readTunnelPartyB(
+  reads: SuiReads,
+  tunnelId: string,
+): Promise<string> {
+  const obj = await reads.getObject({
+    id: tunnelId,
+    options: { showContent: true },
+  });
+  const fields = obj.data?.content?.fields as
+    | { party_b?: { fields?: { public_key?: unknown } } }
+    | undefined;
+  const hex = byteVectorToHex(fields?.party_b?.fields?.public_key);
+  if (!hex) {
+    throw new Error(
+      `tunnel ${tunnelId}: missing party_b.public_key in content`,
+    );
+  }
+  return hex;
+}
+
 /**
  * Errors a fresh REBUILD can clear: owned-object/gas equivocation. Another tx consumed the same
  * coin/object version first, so this tx's build-time–pinned version is "unavailable for
@@ -201,13 +257,12 @@ function isStaleObjectReject(err: unknown): boolean {
     msg.includes("needs to be rebuilt") ||
     msg.includes("objectversionunavailable") ||
     msg.includes("rejected as invalid by more than 1/3") ||
-    msg.includes("equivocat") ||
-    // ADR-0013: a just-deposited address balance settles at the next checkpoint, so a withdrawal
-    // can briefly dry-run against a still-empty balance. The deposit IS landing, so rebuild + retry
-    // until it settles. (`ensureMtpsAddressBalance` waits too, but the sponsor dry-runs on its
-    // own node, which may trail by a checkpoint.)
-    msg.includes("invalid withdraw reservation") ||
-    msg.includes("available amount in account")
+    msg.includes("equivocat")
+    // NOTE: "invalid withdraw reservation" / "available amount in account" are NOT matched. With the
+    // faucet disabled (stake comes straight from the player's address balance), that error means a
+    // genuinely insufficient balance — a permanent failure that must surface FAST, not loop forever
+    // every ~5s (the doc above). `ensureMtpsAddressBalance` already waits for any coin-sweep to settle
+    // before the open fires, so a checkpoint-lag false-negative is not expected here.
   );
 }
 
@@ -349,6 +404,118 @@ export async function openAndFundSharedTunnel(opts: {
   const tunnelId = findTunnelId(txb.objectChanges);
   if (!tunnelId) throw new Error("could not find created tunnel id");
   return tunnelId;
+}
+
+/** One PvP seat-A open in a batched flush: both parties + this seat's stake (coin's base units).
+ *  The whole batch shares ONE sender (party A's wallet) and ONE summed stake withdrawal. */
+export interface SharedSeatAOpenSpec {
+  partyA: PartyOnchain;
+  partyB: PartyOnchain;
+  amount: bigint;
+  timeoutMs?: bigint;
+  penaltyAmount?: bigint;
+}
+
+/**
+ * Open + fund + share N PvP shared tunnels — SEAT A ONLY — in ONE PTB, returning each tunnel id in
+ * SPEC ORDER. Per spec it composes the seat-A opener `create` → `deposit_party_a` (gated to the
+ * sender = party A's address) → `public_share_object` (SDK `buildOpenAndFundSeatA`), and every
+ * spec splits its stake off ONE shared source: a single SIP-58 address-balance withdrawal
+ * (`redeem_funds`, ADR-0013) of the summed stake (`WithdrawFrom::Sender`), or one `stakeCoinId`,
+ * or the gas coin. This is the Enoki one-sponsor-per-batch path (design §4.1): N opens, ONE
+ * sponsored+executed tx, ONE withdrawal.
+ *
+ * NOT the self-play `openAndFundMany` (`create_and_fund`): this funds seat A ONLY (seat B deposits
+ * its own stake later via `depositStake`), and it correlates results to specs differently — see
+ * below. Reusing the self-play builder here would pre-fund seat B and double-consume the wallet.
+ *
+ * DEMUX: every tunnel in one flush shares party A's address (the single sender), so the self-play
+ * opener's "key by on-chain party A" trick collapses. Instead each created tunnel is keyed by its
+ * on-chain `party_b.public_key` — the per-match opponent ephemeral, freshly generated per match in
+ * `PvpEngine.findMatch`, so unique within a flush even against the same opponent. This does NOT rely
+ * on `objectChanges` order (which Sui leaves unspecified). Cost: N extra `getObject` reads per flush.
+ * Returns tunnel ids in SPEC ORDER; a spec with no matching created tunnel throws (fail-loud — it
+ * never mis-routes stake to the wrong match).
+ *
+ * Stake source MUST cover the summed `amount`s; on the address-balance path `stakeFromBalance.amount`
+ * MUST equal that sum (the zero remainder is destroyed). Post-commit failures throw
+ * {@link BatchCommittedError}: the N tunnels exist and their stake is consumed, so callers MUST NOT
+ * retry — a retry double-opens and double-consumes stake.
+ */
+export async function openManySharedSeatA(opts: {
+  reads: SuiReads;
+  signExec: SignExec;
+  specs: SharedSeatAOpenSpec[];
+  coinType?: string;
+  stakeFromBalance?: StakeFromBalance;
+  stakeCoinId?: string;
+}): Promise<string[]> {
+  const { digest } = await submitRebuildingOnStale(
+    () => {
+      const tx = new Transaction();
+      const source = stakeCoinArg(tx, opts);
+      for (const s of opts.specs) {
+        buildOpenAndFundSeatA(tx, {
+          partyA: { ...s.partyA, signatureType: SignatureScheme.ED25519 },
+          partyB: { ...s.partyB, signatureType: SignatureScheme.ED25519 },
+          aAmount: s.amount,
+          timeoutMs: s.timeoutMs ?? 86_400_000n,
+          penaltyAmount: s.penaltyAmount ?? 0n,
+          // All N seat-A splits draw from the one withdrawal/coin; on the address-balance path the
+          // exact-sum source lands at zero and is destroyed by consumeStakeRemainder below.
+          stakeCoin: source,
+          coinType: opts.coinType,
+        });
+      }
+      consumeStakeRemainder(tx, opts, source);
+      return tx;
+    },
+    opts.signExec,
+    "openManySharedSeatA",
+  );
+  // POST-COMMIT: everything below runs after the PTB has already landed. Any failure here means the
+  // N tunnels exist and their stake is consumed — callers must not retry (BatchCommittedError).
+  try {
+    await opts.reads.waitForTransaction({ digest });
+    const txb = await opts.reads.getTransactionBlock({
+      digest,
+      options: { showObjectChanges: true },
+    });
+    const ids = findAllTunnelIds(txb.objectChanges);
+    if (ids.length !== opts.specs.length) {
+      throw new Error(
+        `openManySharedSeatA: expected ${opts.specs.length} tunnels, got ${ids.length} (digest ${digest})`,
+      );
+    }
+    // Key by party-B pubkey (objectChanges order is unspecified), then return ids in SPEC ORDER so
+    // the caller's positional demux is correct. A spec with no match throws — fail-loud, never
+    // mis-route stake.
+    const byPartyB = new Map<string, string>();
+    for (const id of ids) {
+      const partyB = await readTunnelPartyB(opts.reads, id);
+      if (byPartyB.has(partyB)) {
+        // Two created tunnels share a party-B pubkey (e.g. an opponent that reused one ephemeral
+        // key across two coincident matches in this flush). The positional demux below would
+        // collapse them and silently mis-route stake — fail loud instead (committed: never retry).
+        throw new Error(
+          `openManySharedSeatA: duplicate party_b pubkey across created tunnels (digest ${digest})`,
+        );
+      }
+      byPartyB.set(partyB, id);
+    }
+    return opts.specs.map((s) => {
+      const id = byPartyB.get(toHex(s.partyB.publicKey));
+      if (!id) {
+        throw new Error(
+          `openManySharedSeatA: no created tunnel matched a spec's party_b pubkey (digest ${digest})`,
+        );
+      }
+      return id;
+    });
+  } catch (err) {
+    if (err instanceof BatchCommittedError) throw err; // already wrapped, pass through
+    throw new BatchCommittedError(digest, err);
+  }
 }
 
 /**

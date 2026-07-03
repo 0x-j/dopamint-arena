@@ -31,6 +31,12 @@ import {
 } from "sui-tunnel-ts/protocol/worldCanvasPvp";
 import { makeWorldCanvasPvpResumeAdapter } from "./pvpResumeAdapter";
 import { useTelemetry } from "@/telemetry/TelemetryProvider";
+import { engineEnabled } from "@/engine/flag";
+import { engineClient } from "@/engine/engineClient";
+import { useGameMatch } from "@/engine/react/useGameMatch";
+import { useArenaWorkerEntry } from "@/engine/react/useArenaWorkerEntry";
+import { useWorkerArenaPlay } from "@/engine/react/useWorkerArenaPlay";
+import type { MatchSnapshot } from "@/engine/engineApi";
 
 /** A seat's queued paint == the co-signed batch move (a run of cells). */
 export type PaintIntent = PvpPaintMove;
@@ -53,7 +59,9 @@ function readIntent(
  *  both the engine's arena consumer (the spec below) and `GameModule.arenaGameId` (index.ts). */
 export const WORLD_CANVAS_ARENA_GAME_ID = "world_canvas";
 
-const usePvpMatch = createPvpMatchHook<
+/** @deprecated `?engine=legacy` fallback only — the worker spec in `worldCanvasSpec.ts` is the
+ *  primary path. */
+const useLegacyMatch = createPvpMatchHook<
   PvpCanvasState,
   PvpPaintMove,
   PaintIntent,
@@ -70,6 +78,50 @@ const usePvpMatch = createPvpMatchHook<
   intentToMove,
   readIntent,
 });
+
+/** Worker path (`?engine=worker`): same PvpMatch surface, backed by the worker engine; the
+ *  paint-buffer wrapper below is unchanged. */
+function useWorkerMatch(
+  windowId: string,
+): PvpMatch<PvpCanvasState, PaintIntent, PvpCell[]> {
+  const snap = useGameMatch(windowId, "world-canvas") as MatchSnapshot<
+    PvpCell[],
+    PvpCanvasState["winner"]
+  >;
+  useArenaWorkerEntry({
+    windowId,
+    gameId: "world-canvas",
+    arenaGameId: WORLD_CANVAS_ARENA_GAME_ID,
+    isIdle: () => snap.status === "idle",
+  });
+  const playArena = useWorkerArenaPlay({
+    windowId,
+    gameId: "world-canvas",
+    arenaGameId: WORLD_CANVAS_ARENA_GAME_ID,
+    label: "world-canvas",
+  });
+  return {
+    status: snap.status,
+    role: snap.role,
+    stake: snap.stake,
+    auto: snap.auto,
+    view: snap.view,
+    winner: snap.winner,
+    error: snap.error,
+    findMatch: () => engineClient.findMatch(windowId, "world-canvas"),
+    playArena: () => playArena(),
+    setIntent: (i) => engineClient.submitInput(windowId, i),
+    toggleAuto: () => engineClient.setAuto(windowId, !snap.auto),
+    reset: () => engineClient.reset(windowId),
+    leave: () => engineClient.reset(windowId),
+    // Worker interim: same teardown as leave; a true concede needs engine support — follow-up.
+    forfeit: () => engineClient.reset(windowId),
+  };
+}
+
+/** `?engine=worker` selects the worker path; default keeps the main-thread path. Bound once
+ *  at module load so the hook identity is stable per session (rules-of-hooks). */
+const usePvpMatch = engineEnabled() ? useWorkerMatch : useLegacyMatch;
 
 export type { PvpStatus };
 

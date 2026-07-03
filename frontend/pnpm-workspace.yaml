@@ -2,3 +2,5 @@ packages:
   - "."
 allowBuilds:
   esbuild: true
+  # sentry-cli's postinstall downloads its binary — needed for source-map upload at build.
+  "@sentry/cli": true

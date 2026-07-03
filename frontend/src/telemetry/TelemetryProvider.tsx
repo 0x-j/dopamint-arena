@@ -52,13 +52,19 @@ interface TelemetryContextValue {
   /** Record `n` co-signed state updates for `gameId` — the same `actionsDelta` the game ships to
    *  the backend heartbeat (tagged by the scoped report each game window installs). Lets the
    *  per-game chip derive a REAL local rate, in the backend's own unit, when its authoritative
-   *  `perGame` feed is absent. Self-play only: PvP is relay-counted server-side, so it records
-   *  nothing here and shows a local rate only when the backend is connected. */
+   *  `perGame` feed is absent. The worker match feeds this each move (see `useGameMatch`), so it
+   *  grows while a match advances and holds flat when idle. */
   recordGameUpdate: (gameId: string, n: number) => void;
   /** Cumulative updates recorded for `gameId`, for the chip's own rate sampling. */
   getGameTotal: (gameId: string) => number;
   /** Cumulative updates across every game, for the aggregate off-chain local-rate display. */
   getGamesTotal: () => number;
+  /** Track a game window entering/leaving the floor (ref-counted per `gameId`, so duplicate windows
+   *  of one game count once). The aggregate "your TPS" sums the rate of the currently-open games. */
+  registerGameWindow: (gameId: string) => void;
+  unregisterGameWindow: (gameId: string) => void;
+  /** The distinct gameIds with at least one window open right now. */
+  getOpenGameIds: () => string[];
 }
 
 export const TelemetryContext = createContext<TelemetryContextValue | null>(
@@ -137,6 +143,23 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   );
   const getGamesTotal = useCallback(
     () => Object.values(perGameTotal.current).reduce((sum, n) => sum + n, 0),
+    [],
+  );
+
+  // Which game windows are on the floor right now (ref-counted per gameId — duplicate windows of a
+  // game count once). A ref, not state: the aggregate rate hook polls it on its own interval, so a
+  // window opening/closing needn't re-render the whole tree.
+  const openGameCounts = useRef<Record<string, number>>({});
+  const registerGameWindow = useCallback((gameId: string) => {
+    openGameCounts.current[gameId] = (openGameCounts.current[gameId] ?? 0) + 1;
+  }, []);
+  const unregisterGameWindow = useCallback((gameId: string) => {
+    const next = (openGameCounts.current[gameId] ?? 0) - 1;
+    if (next > 0) openGameCounts.current[gameId] = next;
+    else delete openGameCounts.current[gameId];
+  }, []);
+  const getOpenGameIds = useCallback(
+    () => Object.keys(openGameCounts.current),
     [],
   );
 
@@ -222,6 +245,9 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       recordGameUpdate,
       getGameTotal,
       getGamesTotal,
+      registerGameWindow,
+      unregisterGameWindow,
+      getOpenGameIds,
     }),
     [
       snapshot,
@@ -231,6 +257,9 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       recordGameUpdate,
       getGameTotal,
       getGamesTotal,
+      registerGameWindow,
+      unregisterGameWindow,
+      getOpenGameIds,
     ],
   );
 

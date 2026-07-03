@@ -1,5 +1,11 @@
-/** Target hands per tunnel before cooperative settlement. */
-export const QUANTUM_POKER_HAND_CAP = 180n;
+/**
+ * Hands per PvP tunnel before cooperative settlement. PARITY CONTRACT: `handCap` sits in the
+ * co-signed state (`encodeState`), so this MUST equal the fleet bot's cap
+ * (`QUANTUM_POKER_HAND_CAP = 50` in rust/fleet/core/src/play_match.rs) — a divergent cap makes the
+ * bot compute a different stateHash for the very first commit and silently reject it (the
+ * "Shuffling · opponent's turn" stall). Was 180n (a solo self-play tuning value no PvP peer checks).
+ */
+export const QUANTUM_POKER_HAND_CAP = 50n;
 
 /**
  * Hands per tunnel for the in-app Bot/Auto lanes before a cooperative close. The transcript carries

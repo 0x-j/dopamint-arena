@@ -77,6 +77,7 @@ export function MobileFloor({
                   title={mod.name}
                   icon={<GameTpsBadge gameId={gameOf(item.id)} />}
                   domId={item.id}
+                  category={workspace}
                   onClose={() => onClose(item.id)}
                 >
                   <GameContent

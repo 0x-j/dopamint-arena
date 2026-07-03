@@ -9,7 +9,12 @@ import {
   nextMove,
   randomFleetSecret,
 } from "../engine/selfPlay.ts";
-import { BattleshipProtocol, type BattleshipState } from "./battleship.ts";
+import {
+  BattleshipProtocol,
+  battleshipMoveCodec,
+  type BattleshipState,
+} from "./battleship.ts";
+import { toHex } from "sui-tunnel-ts/core/bytes";
 
 function mulberry32(seed: number): () => number {
   let a = seed;
@@ -318,4 +323,37 @@ test("randomMove only fires, and only on the mover's turn", () => {
 
   const pending = proto.applyMove(playing, { type: "shoot", cell: 0 }, "A");
   assert.equal(proto.randomMove(pending, "B", mulberry32(1)), null); // reveal owed, not a shot
+});
+
+test("reveal_board decode tolerates the Rust bot's raw byte arrays, not just hex", () => {
+  // The Rust bot serializes reveal_board's `cells`/`salts` WITHOUT the wire_hex attribute its other
+  // move fields carry, so they arrive as JSON number arrays, not "0x…" strings. The decoder must
+  // accept both or the terminal board reveal throws inside the frame pump and strands the match.
+  const cells = new Uint8Array([1, 0, 1, 0, 1]);
+  const salts = [
+    new Uint8Array(SALT_BYTES).fill(7),
+    new Uint8Array(SALT_BYTES).fill(9),
+  ];
+
+  const fromHexWire = battleshipMoveCodec.decode({
+    type: "reveal_board",
+    cells: toHex(cells),
+    salts: salts.map(toHex),
+  });
+  const fromArrayWire = battleshipMoveCodec.decode({
+    type: "reveal_board",
+    cells: Array.from(cells),
+    salts: salts.map((s) => Array.from(s)),
+  });
+
+  assert.deepEqual(
+    fromHexWire,
+    fromArrayWire,
+    "both wire formats decode identically",
+  );
+  assert.equal(fromArrayWire.type, "reveal_board");
+  if (fromArrayWire.type === "reveal_board") {
+    assert.deepEqual(fromArrayWire.cells, cells);
+    assert.deepEqual(fromArrayWire.salts, salts);
+  }
 });

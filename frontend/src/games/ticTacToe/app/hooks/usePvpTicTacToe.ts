@@ -194,6 +194,9 @@ function tttBestCell(inner: InnerState, by: "A" | "B"): number {
   return optimalMoves(board, CELL_SERVER)[0];
 }
 
+/** @deprecated Legacy main-thread ttt/caro PvP engine — kept ONLY as the `?engine=legacy`
+ *  fallback and slated for removal. The worker engine is the primary path: the game lives in
+ *  `tttCaroPvpSpec.ts` (`defineGame`) and is driven by the router in ../../usePvpTicTacToe.ts. */
 export function usePvpTicTacToe(
   variant: Variant,
   boardSize: number,

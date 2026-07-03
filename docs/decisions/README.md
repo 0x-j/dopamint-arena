@@ -100,6 +100,11 @@ _why_ survives after the people involved have moved on.
   pre-creates + funds seat B at allocate; the user joins with a deposit-only PTB
   (Active on one signature). Supersedes the open mechanics of 0026; makes
   `allocate` on-chain-bound, so it **must** be authenticated + rate-limited.
+- [0030](0030-scale-live-windows-visibility-render-worker-split.md) — Scale live
+  game windows: gate main-thread render by window visibility (off-screen matches
+  keep running in the worker, don't paint), and split the shared hub into one
+  socket worker + a per-window game worker (`?enginepool`, auto-on High/Max) so
+  co-sign spreads across cores while keeping one relay socket.
 
 ### Backend-local decisions
 

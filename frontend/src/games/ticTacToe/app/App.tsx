@@ -4,7 +4,13 @@ import { PvpScene } from "@/games/ticTacToe/app/scenes/PvpScene";
 import { SketchDefs } from "@/games/blackjack/app/App";
 import "./index.css";
 
-function AppContent() {
+function AppContent({
+  windowId,
+  onClose,
+}: {
+  windowId: string;
+  onClose: () => void;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 1024, height: 768 });
 
@@ -41,16 +47,26 @@ function AppContent() {
         ref={containerRef}
         className="w-full h-full flex items-center justify-center z-10"
       >
-        <PvpScene isPortrait={isPortrait} />
+        <PvpScene
+          windowId={windowId}
+          onBack={onClose}
+          isPortrait={isPortrait}
+        />
       </div>
     </div>
   );
 }
 
-export default function App() {
+export default function App({
+  windowId,
+  onClose,
+}: {
+  windowId: string;
+  onClose: () => void;
+}) {
   return (
     <CustomWalletProvider>
-      <AppContent />
+      <AppContent windowId={windowId} onClose={onClose} />
     </CustomWalletProvider>
   );
 }

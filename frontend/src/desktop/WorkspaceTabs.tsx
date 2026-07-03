@@ -34,27 +34,55 @@ type DockSide = "bottom" | "right";
  * Desktop workspaces switch from a tab bar at the top of the arena body — chrome
  * INSIDE the `/` route, not the global header. Each tab is just the `section`
  * search param (so refresh / share keeps the workspace); the telemetry dock below
- * stays put across all three. The right side carries the floor's controls — the
- * layout-tools menu and a primary `+ Add` — so the floor itself stays clean.
+ * stays put across all four. The right side carries the floor's controls — the
+ * layout-tools menu and a primary `+ Add` — so the floor itself stays clean. On the
+ * "All" floor those controls act on every group at once (see `toolTargets` in
+ * Desktop.tsx); on a single workspace they act on just that floor.
  */
+// Every tab is a category-filled pill all the time — the colorful bar is the point. The `cat-*`
+// fills are CONSTANT (one saturated design-system set that reads on both cream and ink) with a
+// subtle same-hue gradient, and cream `cat-foreground` text, so the pills read in both themes with
+// no per-theme flip. The ACTIVE tab is set apart by intensity, not an underline: idle pills sit
+// dimmed and flat, the active one is full-strength with a `cat-foreground` ring and a lifted shadow.
+// `solid` = flat fallback + gradient; class strings are LITERAL so Tailwind's scanner emits them.
 const WORKSPACE_TABS: {
   section: MobileSection;
   label: string;
   icon: LucideIcon;
+  solid: string;
 }[] = [
   // The aggregate "All" floor — every workspace's live windows at once — is the default
-  // landing (the bare `/` with no `section` param). It has no floor tools of its own (the
-  // right-side cluster hides below).
-  { section: "all", label: "All", icon: LayoutDashboard },
-  { section: "games", label: "Game", icon: Gamepad2 },
-  { section: "payment", label: "Payment", icon: Wallet },
-  { section: "chat", label: "Chat", icon: MessagesSquare },
+  // landing (the bare `/` with no `section` param). Its floor tools act on all groups.
+  {
+    section: "all",
+    label: "All",
+    icon: LayoutDashboard,
+    solid: "bg-cat-all bg-[image:var(--cat-all-grad)]",
+  },
+  {
+    section: "games",
+    label: "Game",
+    icon: Gamepad2,
+    solid: "bg-cat-game bg-[image:var(--cat-game-grad)]",
+  },
+  {
+    section: "payment",
+    label: "Payment",
+    icon: Wallet,
+    solid: "bg-cat-payment bg-[image:var(--cat-payment-grad)]",
+  },
+  {
+    section: "chat",
+    label: "Chat",
+    icon: MessagesSquare,
+    solid: "bg-cat-chat bg-[image:var(--cat-chat-grad)]",
+  },
 ];
 
-const tab =
-  "inline-flex items-center justify-center gap-1.5 rounded-md border border-transparent px-3 py-2.5 text-sm font-semibold text-foreground/60 transition-colors hover:bg-secondary hover:text-foreground";
-const tabActive =
-  "bg-primary text-primary-foreground shadow-sm hover:bg-primary hover:text-primary-foreground";
+const tabBase =
+  "relative inline-flex items-center justify-center gap-1.5 rounded-md border border-transparent px-3 py-2.5 text-sm font-semibold text-cat-foreground transition-all";
+const tabIdle = "opacity-60 hover:opacity-90";
+const tabActive = "shadow-md ring-2 ring-cat-foreground/45";
 
 /** A row action in the layout-tools menu. */
 function ToolItem({
@@ -114,12 +142,14 @@ export function WorkspaceTabs({
       <nav className="grid flex-1 grid-cols-4 gap-1">
         {WORKSPACE_TABS.map((t) => {
           const Icon = t.icon;
+          const isActive = active === t.section;
           return (
             <Link
               key={t.section}
               to="/"
               search={t.section === "all" ? {} : { section: t.section }}
-              className={cn(tab, active === t.section && tabActive)}
+              aria-current={isActive ? "page" : undefined}
+              className={cn(tabBase, t.solid, isActive ? tabActive : tabIdle)}
             >
               <Icon className="size-4" />
               {t.label}
@@ -128,65 +158,61 @@ export function WorkspaceTabs({
         })}
       </nav>
 
-      {active !== "all" && (
-        <div className="flex items-center gap-2">
-          <Popover open={toolsOpen} onOpenChange={setToolsOpen}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <PopoverTrigger asChild>
-                  <Button
-                    size="icon"
-                    variant="secondary"
-                    aria-label="Layout tools"
-                    className="size-10 border border-border"
-                  >
-                    <LayoutGrid className="size-5" />
-                  </Button>
-                </PopoverTrigger>
-              </TooltipTrigger>
-              <TooltipContent>Layout tools</TooltipContent>
-            </Tooltip>
-            <PopoverContent align="end" side="bottom" className="w-48 p-1">
-              <ToolItem
-                icon={LayoutGrid}
-                label="Auto-arrange"
-                onClick={tool(onArrange)}
-              />
-              <ToolItem icon={Plus} label="Add all" onClick={tool(onAddAll)} />
-              <ToolItem
-                icon={dockSide === "bottom" ? PanelRight : PanelBottom}
-                label={
-                  dockSide === "bottom" ? "Dock to right" : "Dock to bottom"
-                }
-                onClick={tool(onToggleDock)}
-              />
-              <ToolItem
-                icon={RotateCcw}
-                label="Reset layout"
-                onClick={tool(onResetLayout)}
-              />
-              <div className="my-1 border-t border-border" />
-              <ToolItem
-                icon={Trash2}
-                label="Remove all"
-                danger
-                onClick={tool(onRemoveAll)}
-              />
-            </PopoverContent>
-          </Popover>
+      <div className="flex items-center gap-2">
+        <Popover open={toolsOpen} onOpenChange={setToolsOpen}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <PopoverTrigger asChild>
+                <Button
+                  size="icon"
+                  variant="secondary"
+                  aria-label="Layout tools"
+                  className="size-10 border border-border"
+                >
+                  <LayoutGrid className="size-5" />
+                </Button>
+              </PopoverTrigger>
+            </TooltipTrigger>
+            <TooltipContent>Layout tools</TooltipContent>
+          </Tooltip>
+          <PopoverContent align="end" side="bottom" className="w-48 p-1">
+            <ToolItem
+              icon={LayoutGrid}
+              label="Auto-arrange"
+              onClick={tool(onArrange)}
+            />
+            <ToolItem icon={Plus} label="Add all" onClick={tool(onAddAll)} />
+            <ToolItem
+              icon={dockSide === "bottom" ? PanelRight : PanelBottom}
+              label={dockSide === "bottom" ? "Dock to right" : "Dock to bottom"}
+              onClick={tool(onToggleDock)}
+            />
+            <ToolItem
+              icon={RotateCcw}
+              label="Reset layout"
+              onClick={tool(onResetLayout)}
+            />
+            <div className="my-1 border-t border-border" />
+            <ToolItem
+              icon={Trash2}
+              label="Remove all"
+              danger
+              onClick={tool(onRemoveAll)}
+            />
+          </PopoverContent>
+        </Popover>
 
-          <Button
-            size="sm"
-            onClick={onAdd}
-            aria-label="Add an app"
-            data-testid="add-app"
-            className="h-10 gap-1.5 px-4 text-sm font-semibold"
-          >
-            <Plus className="size-5" />
-            Add
-          </Button>
-        </div>
-      )}
+        <Button
+          size="sm"
+          onClick={onAdd}
+          aria-label="Add an app"
+          data-testid="add-app"
+          className="h-10 gap-1.5 px-4 text-sm font-semibold"
+        >
+          <Plus className="size-5" />
+          Add
+        </Button>
+      </div>
     </div>
   );
 }
