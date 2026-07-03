@@ -70,21 +70,29 @@ jobs:
         # origin (CloudFront routes /v1/* to the ALB). A non-empty http ALB here bakes
         # ws://<alb> into the build, which the https site rejects (insecure WebSocket).
         #
-        # The rest of the VITE_* build config comes from GitHub Secrets instead of a
-        # committed .env.production: Vite exposes VITE_-prefixed process.env vars on
-        # import.meta.env, so these reach the bundle at build time.
+        # The rest of the VITE_* build config comes from GitHub Variables (not Secrets):
+        # every VITE_* value is baked into the browser bundle and therefore public (package
+        # ids, RPC URLs, the Enoki/Google public client identifiers). Vite exposes
+        # VITE_-prefixed process.env vars on import.meta.env, so these reach the bundle at
+        # build time.
+        #
+        # Per-branch config: on `main` use the `_PROD` variant, on `dev-raid` (or any other
+        # branch) use the shared variable. `<cond> && vars.X_PROD || vars.X` also falls back
+        # to the shared value when the `_PROD` variant is unset. Walrus (main-only) reads the
+        # same `_PROD` variables. VITE_BACKEND_URL stays empty on both branches — AWS is
+        # always same-origin via the CloudFront /v1 proxy.
         env:
           VITE_BACKEND_URL: ""
-          VITE_TUNNEL_PACKAGE_ID: ${{ secrets.VITE_TUNNEL_PACKAGE_ID }}
-          VITE_TTT_PACKAGE_ID: ${{ secrets.VITE_TTT_PACKAGE_ID }}
-          VITE_SUI_NETWORK: ${{ secrets.VITE_SUI_NETWORK }}
-          VITE_SUI_NETWORK_NAME: ${{ secrets.VITE_SUI_NETWORK_NAME }}
-          VITE_ENOKI_API_KEY: ${{ secrets.VITE_ENOKI_API_KEY }}
-          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID }}
-          VITE_MTPS_PACKAGE_ID: ${{ secrets.VITE_MTPS_PACKAGE_ID }}
-          VITE_MTPS_COIN_TYPE: ${{ secrets.VITE_MTPS_COIN_TYPE }}
-          VITE_AGENT_ALLOWANCE_PACKAGE_ID: ${{ secrets.VITE_AGENT_ALLOWANCE_PACKAGE_ID }}
-          VITE_STREAMING_PAYMENT_PACKAGE_ID: ${{ secrets.VITE_STREAMING_PAYMENT_PACKAGE_ID }}
+          VITE_TUNNEL_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_TUNNEL_PACKAGE_ID_PROD || vars.VITE_TUNNEL_PACKAGE_ID }}
+          VITE_TTT_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_TTT_PACKAGE_ID_PROD || vars.VITE_TTT_PACKAGE_ID }}
+          VITE_SUI_NETWORK: ${{ github.ref_name == 'main' && vars.VITE_SUI_NETWORK_PROD || vars.VITE_SUI_NETWORK }}
+          VITE_SUI_NETWORK_NAME: ${{ github.ref_name == 'main' && vars.VITE_SUI_NETWORK_NAME_PROD || vars.VITE_SUI_NETWORK_NAME }}
+          VITE_ENOKI_API_KEY: ${{ github.ref_name == 'main' && vars.VITE_ENOKI_API_KEY_PROD || vars.VITE_ENOKI_API_KEY }}
+          VITE_GOOGLE_CLIENT_ID: ${{ github.ref_name == 'main' && vars.VITE_GOOGLE_CLIENT_ID_PROD || vars.VITE_GOOGLE_CLIENT_ID }}
+          VITE_MTPS_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_MTPS_PACKAGE_ID_PROD || vars.VITE_MTPS_PACKAGE_ID }}
+          VITE_MTPS_COIN_TYPE: ${{ github.ref_name == 'main' && vars.VITE_MTPS_COIN_TYPE_PROD || vars.VITE_MTPS_COIN_TYPE }}
+          VITE_AGENT_ALLOWANCE_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID_PROD || vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID }}
+          VITE_STREAMING_PAYMENT_PACKAGE_ID: ${{ github.ref_name == 'main' && vars.VITE_STREAMING_PAYMENT_PACKAGE_ID_PROD || vars.VITE_STREAMING_PAYMENT_PACKAGE_ID }}
         run: pnpm build
 
       - name: Deploy to S3

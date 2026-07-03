@@ -1,0 +1,128 @@
+name: Deploy Frontend to Walrus Site
+
+# Publishes frontend/ to a Walrus Site (decentralized static hosting on Sui/Walrus),
+# a second, independent target alongside the AWS S3/CloudFront deploy-frontend.yml.
+# Runs on `main` (production); dev-raid pushes deploy to AWS via deploy-frontend.yml.
+# The site's object id lives in frontend/ws-resources.json — commit it once (see
+# docs/runbooks/walrus-deploy.md) so every run UPDATES the same site instead of
+# minting a new one.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-frontend-walrus.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write # deploy action may commit ws-resources.json updates back
+  pull-requests: write
+
+concurrency:
+  # A Walrus deploy mutates one shared on-chain site object; never run two at once.
+  group: deploy-frontend-walrus
+  cancel-in-progress: false
+
+jobs:
+  deploy-frontend-walrus:
+    name: Deploy frontend to Walrus
+    runs-on: ubuntu-latest
+    environment: walrus-mainnet
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      - name: Validate ws-resources.json exists
+        # Absent means "no site to update" — fail loudly rather than silently minting a new
+        # site on every run. Bootstrap it once per docs/runbooks/walrus-deploy.md.
+        run: |
+          if [ ! -f "frontend/ws-resources.json" ]; then
+            {
+              echo "## Deployment failed"
+              echo ""
+              echo "Missing required file: \`frontend/ws-resources.json\`."
+              echo ""
+              echo "See [.github/workflows/README.md](.github/workflows/README.md) for setup instructions."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "ERROR: frontend/ws-resources.json not found." >&2
+            echo "See .github/workflows/README.md for setup instructions." >&2
+            exit 1
+          fi
+          echo "frontend/ws-resources.json found"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install SDK dependencies
+        # frontend aliases `sui-tunnel-ts` to ../sui-tunnel-ts/src (vite.config.ts) and bundles
+        # the SDK source, so the SDK's own deps must be installed for the build to resolve.
+        working-directory: sui-tunnel-ts
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend for Walrus
+        working-directory: frontend
+        # Every VITE_* is baked into the browser bundle (public), so these are GitHub
+        # Variables, not Secrets — only SUI_KEYSTORE below is a Secret. This prod build
+        # reads the `_PROD` variant of each var and falls back to the shared variable
+        # (used by the dev-raid AWS build), so you only define a `_PROD` override when a
+        # production value differs. See .github/workflows/README.md.
+        #
+        # Unlike the CloudFront build (VITE_BACKEND_URL empty, same-origin /v1 proxy), a
+        # Walrus portal domain is CROSS-ORIGIN to the backend, so VITE_BACKEND_URL_PROD /
+        # VITE_API_URL_PROD must be real URLs and that backend must serve CORS AND expose a
+        # wss:// endpoint (the https portal blocks insecure ws://) — see the runbook.
+        env:
+          VITE_BACKEND_URL: ${{ vars.VITE_BACKEND_URL_PROD || vars.VITE_BACKEND_URL }}
+          VITE_API_URL: ${{ vars.VITE_API_URL_PROD || vars.VITE_API_URL }}
+          VITE_TUNNEL_PACKAGE_ID: ${{ vars.VITE_TUNNEL_PACKAGE_ID_PROD || vars.VITE_TUNNEL_PACKAGE_ID }}
+          VITE_TTT_PACKAGE_ID: ${{ vars.VITE_TTT_PACKAGE_ID_PROD || vars.VITE_TTT_PACKAGE_ID }}
+          VITE_SUI_NETWORK: ${{ vars.VITE_SUI_NETWORK_PROD || vars.VITE_SUI_NETWORK }}
+          VITE_SUI_NETWORK_NAME: ${{ vars.VITE_SUI_NETWORK_NAME_PROD || vars.VITE_SUI_NETWORK_NAME }}
+          VITE_ENOKI_API_KEY: ${{ vars.VITE_ENOKI_API_KEY_PROD || vars.VITE_ENOKI_API_KEY }}
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID_PROD || vars.VITE_GOOGLE_CLIENT_ID }}
+          VITE_MTPS_PACKAGE_ID: ${{ vars.VITE_MTPS_PACKAGE_ID_PROD || vars.VITE_MTPS_PACKAGE_ID }}
+          VITE_MTPS_COIN_TYPE: ${{ vars.VITE_MTPS_COIN_TYPE_PROD || vars.VITE_MTPS_COIN_TYPE }}
+          VITE_AGENT_ALLOWANCE_PACKAGE_ID: ${{ vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID_PROD || vars.VITE_AGENT_ALLOWANCE_PACKAGE_ID }}
+          VITE_STREAMING_PAYMENT_PACKAGE_ID: ${{ vars.VITE_STREAMING_PAYMENT_PACKAGE_ID_PROD || vars.VITE_STREAMING_PAYMENT_PACKAGE_ID }}
+        run: |
+          pnpm build
+          # Carry the site id + SPA routes into dist/ so the deploy action updates the
+          # existing site and serves index.html for client-side routes.
+          cp ws-resources.json dist/ws-resources.json
+
+      - name: Deploy to Walrus Site (mainnet)
+        id: deploy-mainnet
+        uses: MystenLabs/walrus-sites/.github/actions/deploy@main
+        with:
+          SUI_ADDRESS: ${{ vars.SUI_ADDRESS_PROD || vars.SUI_ADDRESS }}
+          SUI_KEYSTORE: ${{ secrets.SUI_KEYSTORE }}
+          DIST: ./frontend/dist
+          SUI_NETWORK: mainnet
+          EPOCHS: 3
+          CHECK_EXTEND: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SITES_CONFIG: |
+            contexts:
+              mainnet:
+                portal: wal.app
+                package: 0x26eb7ee8688da02c5f671679524e379f0b837a12f1d1d799f255b7eea260ad27
+                staking_object: 0x10b9d30c28448939ce6c4d6c6e0ffce4a7f8a4ada8248bdad09ef8b70e4a3904
+                general:
+                  wallet_env: mainnet
+                  walrus_context: mainnet
+                  walrus_package: 0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77
+                  gas_budget: 500000000
+            default_context: mainnet
