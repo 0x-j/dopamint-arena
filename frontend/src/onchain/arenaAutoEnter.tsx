@@ -18,6 +18,7 @@ import { list, arenaGameIdForModule } from "@/games/registry";
 import { useSponsoredSignExec } from "@/onchain/useSponsoredSignExec";
 import { configureSharedBatcher } from "@/onchain/sharedTunnelOpenBatcher";
 import { enterArena, type MakeUserParty } from "@/onchain/arenaEnter";
+import { setArenaIdTokenProvider } from "@/onchain/authSession";
 import { setArenaEntry } from "@/onchain/arenaAllocationStore";
 import { MTPS_COIN_TYPE, isMtpsConfigured } from "@/onchain/mtps";
 import { resolveBackendUrl } from "@/backend/controlPlane";
@@ -96,6 +97,22 @@ export function useArenaAutoEnter(): void {
   const entered = useRef<string | null>(null);
 
   useEffect(() => {
+    // Register this wallet's Enoki id_token source process-wide BEFORE anything else, so EVERY
+    // allocate path — the connect-time batch below, per-game Play, and lazy add-a-game — mints a
+    // session JWT (B5), not just this hook. Null for a non-zkLogin wallet or on disconnect, so a
+    // stale identity can't leak into a later allocate. Enoki holds the key → no popup.
+    setArenaIdTokenProvider(
+      currentWallet && isEnokiWallet(currentWallet)
+        ? async () => {
+            try {
+              return (await getSession(currentWallet))?.jwt ?? null;
+            } catch {
+              return null;
+            }
+          }
+        : null,
+    );
+
     if (!owner) {
       // Re-arm on disconnect so a reconnect re-runs the batched entry, giving open windows
       // that can't resume a fresh auto-mode match (freeze-on-disconnect). Reconnect then
@@ -140,26 +157,14 @@ export function useArenaAutoEnter(): void {
       return party;
     };
 
-    // The Enoki id_token authorizes allocate (B5). Fetched on demand + silently (Enoki holds the
-    // ephemeral key, so no popup); null for a non-zkLogin wallet, so allocate falls back to
-    // unauthenticated where the gate is off.
-    const getIdToken = async (): Promise<string | null> => {
-      if (!currentWallet || !isEnokiWallet(currentWallet)) return null;
-      try {
-        const session = await getSession(currentWallet);
-        return session?.jwt ?? null;
-      } catch {
-        return null;
-      }
-    };
-
     void (async () => {
       try {
+        // No explicit `getIdToken`: `enterArena` uses the provider registered above (the same one
+        // every other allocate path relies on), so all paths authenticate through one source.
         const allocations = await enterArena({
           games,
           userAddress: owner,
           makeUserParty,
-          getIdToken,
           coinType: isMtpsConfigured ? MTPS_COIN_TYPE : undefined,
           apiBase: resolveBackendUrl(),
         });

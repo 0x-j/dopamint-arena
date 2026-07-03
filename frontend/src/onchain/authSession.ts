@@ -52,6 +52,26 @@ export function clearSessionCache(): void {
   ls()?.removeItem(STORAGE_KEY);
 }
 
+/** Process-wide Enoki id_token source, registered once by the wallet layer (see arenaAutoEnter).
+ *  It lets EVERY allocate path — the connect-time batch, per-game Play, and lazy add-a-game — mint a
+ *  session JWT without each caller threading `getIdToken`; a missing registration was why the
+ *  on-demand paths hit the auth gate tokenless. */
+let registeredIdTokenProvider: (() => Promise<string | null>) | null = null;
+
+/** Register (or clear, with null) the connected wallet's id_token provider. Called on wallet
+ *  connect/disconnect; cleared on disconnect so a stale identity can't leak into a later allocate. */
+export function setArenaIdTokenProvider(
+  provider: (() => Promise<string | null>) | null,
+): void {
+  registeredIdTokenProvider = provider;
+}
+
+/** The registered id_token provider, or null when no zkLogin identity is available. `enterArena`
+ *  falls back to this when a caller passes no explicit `getIdToken`. */
+export function arenaIdTokenProvider(): (() => Promise<string | null>) | null {
+  return registeredIdTokenProvider;
+}
+
 /**
  * Return a valid backend session JWT for the current identity, minting one when the cache is empty or
  * near expiry. `getIdToken` yields the fresh Enoki id_token (or null when there is no zkLogin

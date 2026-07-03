@@ -3,7 +3,7 @@
 // deposit seat A into every pre-opened tunnel in ONE batched PTB (the batcher's deposit mode). The
 // tunnel activates on that single signature; each game then plays genuine two-party over the relay.
 import { fromHex, toHex } from "@mysten/sui/utils";
-import { ensureSessionJwt } from "./authSession";
+import { ensureSessionJwt, arenaIdTokenProvider } from "./authSession";
 import { requestTunnelOpen } from "./sharedTunnelOpenBatcher";
 import type { TunnelOpenRequest } from "./tunnelOpenBatcher";
 import type { PartyOnchain } from "./tunnelTx";
@@ -132,14 +132,19 @@ export async function enterArena(
   // identity or the gate is off, and allocate then proceeds unauthenticated. The mint is pinned to
   // `userAddress`, so a token cached for a different account (a same-browser switch) is re-minted.
   const parties = new Map<string, PartyOnchain>();
+  // Authenticate EVERY allocate path uniformly: prefer an explicit `getIdToken` (tests), else the
+  // process-wide provider the wallet layer registers on connect — so per-game Play and lazy
+  // add-a-game mint a session JWT too, not only the connect-time batch. Null → allocate proceeds
+  // unauthenticated (the gate is off until SESSION_JWT_SECRET is set).
+  const idTokenSource = opts.getIdToken ?? arenaIdTokenProvider() ?? undefined;
   const [, sessionJwt] = await Promise.all([
     Promise.all(
       opts.games.map(async (game) => {
         parties.set(game, await opts.makeUserParty(game));
       }),
     ),
-    opts.getIdToken
-      ? ensureSessionJwt(opts.getIdToken, opts, {
+    idTokenSource
+      ? ensureSessionJwt(idTokenSource, opts, {
           address: opts.userAddress,
         }).then((t) => t ?? undefined)
       : Promise.resolve(opts.sessionJwt),
