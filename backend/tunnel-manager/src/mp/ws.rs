@@ -1307,6 +1307,7 @@ mod tests {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_stop_loss: crate::config::SponsorStopLossConfig::default(),
         });
 
         let game = format!("hold-{}", uuid::Uuid::new_v4().simple());
@@ -1481,6 +1482,7 @@ mod tests {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_stop_loss: crate::config::SponsorStopLossConfig::default(),
         })
     }
 

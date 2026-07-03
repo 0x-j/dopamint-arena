@@ -9,6 +9,109 @@
 // Most fields are consumed from Phase 1 (settler) / Phase 2 (Walrus) onward; only
 // `bind_addr` is read in Phase 0. `derive(Debug)` does not count as a read for the
 // dead-code lint, so allow it on the foundation until the consumers land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SponsorStopLossConfig {
+    pub sender_window_secs: i64,
+    pub sender_max_per_window: u32,
+    pub global_window_secs: i64,
+    pub global_max_per_window: u32,
+}
+
+impl Default for SponsorStopLossConfig {
+    fn default() -> Self {
+        Self {
+            sender_window_secs: 60,
+            sender_max_per_window: 1_000,
+            global_window_secs: 24 * 60 * 60,
+            global_max_per_window: 100_000,
+        }
+    }
+}
+
+impl SponsorStopLossConfig {
+    fn from_env() -> Self {
+        Self::from_env_values(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_values(mut env: impl FnMut(&str) -> Option<String>) -> Self {
+        let default = Self::default();
+        Self {
+            sender_window_secs: env_positive_i64(
+                &mut env,
+                "SPONSOR_SENDER_WINDOW_SECS",
+                default.sender_window_secs,
+            ),
+            sender_max_per_window: env_positive_u32(
+                &mut env,
+                "SPONSOR_SENDER_MAX_PER_WINDOW",
+                default.sender_max_per_window,
+            ),
+            global_window_secs: env_positive_i64(
+                &mut env,
+                "SPONSOR_GLOBAL_WINDOW_SECS",
+                default.global_window_secs,
+            ),
+            global_max_per_window: env_positive_u32(
+                &mut env,
+                "SPONSOR_GLOBAL_MAX_PER_WINDOW",
+                default.global_max_per_window,
+            ),
+        }
+    }
+}
+
+fn env_positive_i64(
+    env: &mut impl FnMut(&str) -> Option<String>,
+    key: &'static str,
+    default: i64,
+) -> i64 {
+    let Some(value) = env(key) else {
+        return default;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    match trimmed.parse::<i64>() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            tracing::warn!(
+                env = key,
+                value = %value,
+                default,
+                "invalid positive integer env; using default"
+            );
+            default
+        }
+    }
+}
+
+fn env_positive_u32(
+    env: &mut impl FnMut(&str) -> Option<String>,
+    key: &'static str,
+    default: u32,
+) -> u32 {
+    let Some(value) = env(key) else {
+        return default;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    match trimmed.parse::<u32>() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            tracing::warn!(
+                env = key,
+                value = %value,
+                default,
+                "invalid positive integer env; using default"
+            );
+            default
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -56,6 +159,9 @@ pub struct Config {
     /// `arena_allocate` stays unauthenticated (rollout switch, so a partial deploy can't brick play);
     /// set it (and ship the FE token) to enforce identity on house on-chain spend.
     pub session_jwt_secret: Option<String>,
+    /// Stop-loss for public `/v1/sponsor` gas grants. This protects public spend only; it does not
+    /// throttle controlled arena fleet opens.
+    pub sponsor_stop_loss: SponsorStopLossConfig,
     pub walrus_publisher_url: Option<String>,
     pub walrus_aggregator_url: Option<String>,
     pub redis_cache_url: Option<String>,
@@ -127,6 +233,7 @@ impl Config {
                 .unwrap_or(5),
             faucet_admin_token: opt("FAUCET_ADMIN_TOKEN"),
             session_jwt_secret: opt("SESSION_JWT_SECRET"),
+            sponsor_stop_loss: SponsorStopLossConfig::from_env(),
             walrus_publisher_url: opt("WALRUS_PUBLISHER_URL"),
             walrus_aggregator_url: opt("WALRUS_AGGREGATOR_URL"),
             redis_cache_url: opt("REDIS_CACHE_URL"),
@@ -300,6 +407,48 @@ mod tests {
         assert_eq!(c.faucet_max_per_window, 5);
         assert!(c.faucet_admin_token.is_none());
         assert!(c.mtps_admin_cap_id.is_none());
+    }
+
+    #[test]
+    fn sponsor_stop_loss_reads_env_overrides() {
+        let limits = SponsorStopLossConfig::from_env_values(|key| {
+            Some(
+                match key {
+                    "SPONSOR_SENDER_WINDOW_SECS" => "30",
+                    "SPONSOR_SENDER_MAX_PER_WINDOW" => "20",
+                    "SPONSOR_GLOBAL_WINDOW_SECS" => "600",
+                    "SPONSOR_GLOBAL_MAX_PER_WINDOW" => "5000",
+                    _ => unreachable!("unexpected env key {key}"),
+                }
+                .to_string(),
+            )
+        });
+
+        assert_eq!(
+            limits,
+            SponsorStopLossConfig {
+                sender_window_secs: 30,
+                sender_max_per_window: 20,
+                global_window_secs: 600,
+                global_max_per_window: 5000,
+            }
+        );
+    }
+
+    #[test]
+    fn sponsor_stop_loss_defaults_invalid_env() {
+        let limits = SponsorStopLossConfig::from_env_values(|key| {
+            match key {
+                "SPONSOR_SENDER_WINDOW_SECS" => Some("0"),
+                "SPONSOR_SENDER_MAX_PER_WINDOW" => Some("not-a-number"),
+                "SPONSOR_GLOBAL_WINDOW_SECS" => Some("-1"),
+                "SPONSOR_GLOBAL_MAX_PER_WINDOW" => Some(""),
+                _ => None,
+            }
+            .map(|v| v.to_string())
+        });
+
+        assert_eq!(limits, SponsorStopLossConfig::default());
     }
 
     #[test]

@@ -94,6 +94,9 @@ pub struct AppState {
     /// HS256 secret for the arena session-JWT gate (auth.rs, B5). `None` disables the gate so
     /// `arena_allocate` stays unauthenticated — the rollout switch; set it to enforce.
     pub session_jwt_secret: Option<String>,
+    /// Public `/v1/sponsor` stop-loss limits. Protects house gas grants without throttling the
+    /// controlled arena fleet.
+    pub sponsor_stop_loss: crate::config::SponsorStopLossConfig,
 }
 
 pub type SharedState = std::sync::Arc<AppState>;
@@ -158,6 +161,7 @@ impl AppState {
             faucet_max_per_window: 5,
             faucet_admin_token: None,
             session_jwt_secret: None,
+            sponsor_stop_loss: crate::config::SponsorStopLossConfig::default(),
         })
     }
 }
