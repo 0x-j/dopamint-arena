@@ -83,6 +83,12 @@ export type PeerMessage =
       transcriptRoot: string;
       sig: string;
     }
+  | {
+      // Bare forfeit intent: the human concedes. The bot sources every settlement field itself
+      // (root/timestamp/nonce/forced 0-total balances) and replies on `settleHalf`, so nothing rides
+      // in this frame. Distinct tag so a natural-terminal co-sign never mistakes it for the close.
+      t: "forfeit";
+    }
   | { t: "opened"; tunnelId: string }
   | { t: "settle"; sig: string; root: string }
   | { t: "closed"; digest: string }

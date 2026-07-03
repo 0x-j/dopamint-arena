@@ -6,6 +6,7 @@ import {
 import { Board } from "@/games/ticTacToe/app/components/Board";
 import { CaroBoard } from "@/games/ticTacToe/app/components/CaroBoard";
 import { isMtpsConfigured } from "@/onchain/mtps";
+import { ForfeitDialog } from "@/pvp/ForfeitDialog";
 
 const SUISCAN_TX = "https://suiscan.xyz/testnet/tx/";
 const CARO_SIZES = [9, 15, 19];
@@ -59,10 +60,23 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
   const funded = isMtpsConfigured || g.balance > 10_000_000n;
   const locked = g.phase !== "idle" && g.phase !== "error";
 
+  // In-match Leave is destructive (forfeits the stake to the opponent), so a live game confirms
+  // first via ForfeitDialog instead of routing straight through leave/forfeit. Not live (or already
+  // "done") ⇒ Leave keeps its existing publish-only behavior below.
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const canForfeit = g.phase === "playing";
+
   // "Leave" during a match settles our half and drops back to THIS window's lobby (like "Cancel
   // Search"): `g.leave()` sends the settlement half, tears the match down, and returns phase to
-  // "idle" (the lobby). It never closes the window — that's the title-bar ✕'s job.
-  const returnToLobby = () => g.leave();
+  // "idle" (the lobby). It never closes the window — that's the title-bar ✕'s job. Live matches
+  // route through the forfeit confirm dialog first.
+  const returnToLobby = () => {
+    if (canForfeit) {
+      setConfirmOpen(true);
+      return;
+    }
+    g.leave();
+  };
 
   // ---- Lobby / matchmaking (fills the window; sizes scale with the window via cqw) ----------
   if (!playing) {
@@ -184,7 +198,7 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
       Auto
     </button>
   );
-  // Match-flow actions (next / stop / requeue) — only the relevant one shows.
+  // Match-flow actions (next / requeue) — only the relevant one shows.
   const actions = (
     <>
       {g.phase === "playing" &&
@@ -199,14 +213,6 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
             Next →
           </button>
         )}
-      {g.innerOver && g.phase === "playing" && (
-        <button
-          onClick={g.stop}
-          className="qp-btn ttt-ctl-btn w-full uppercase tracking-wider"
-        >
-          Stop &amp; settle
-        </button>
-      )}
       {g.phase === "done" && (
         <button
           onClick={() => {
@@ -261,6 +267,18 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
     </div>
   );
 
+  const forfeitDialog = (
+    <ForfeitDialog
+      open={canForfeit && confirmOpen}
+      stake={`${g.stake} MTPS`}
+      onKeepPlaying={() => setConfirmOpen(false)}
+      onForfeit={() => {
+        setConfirmOpen(false);
+        g.forfeit();
+      }}
+    />
+  );
+
   // Portrait: stack board over a compact control/log block.
   if (isPortrait) {
     return (
@@ -288,6 +306,7 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
           <div className="flex items-stretch gap-3 w-full">{actions}</div>
           {gameLog}
         </div>
+        {forfeitDialog}
       </div>
     );
   }
@@ -326,6 +345,7 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
           </div>
         )}
       </aside>
+      {forfeitDialog}
     </div>
   );
 }

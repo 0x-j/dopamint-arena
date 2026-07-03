@@ -7,16 +7,30 @@ import { POKER_BUYIN } from "./constants";
 import { QuantumPokerTable, PHASE_LABEL } from "./QuantumPokerTable";
 import { SketchDefs } from "../sketch";
 import { PokerActionBar } from "./PokerActionBar";
+import { ForfeitDialog } from "@/pvp/ForfeitDialog";
 
 /** Heads-up Quantum Poker vs a real opponent over the relay: matchmaking + co-sign + on-chain stakes,
  *  in the shared hand-drawn skin. An in-game Auto toggle lets a persona bot make this seat's bets. */
 export function QuantumPokerPvpWindow(_props: GameWindowProps) {
   const g = usePvpQuantumPoker();
 
-  // Back bails out of a live hand (auto-fold → publish our settlement half) and drops back to THIS
-  // window's lobby once the half is on the wire ("settled") or if settle errors — a failed/stuck close
-  // must never trap the player. A timeout backstops a hand that can't reach a settle boundary (e.g. an
-  // unresponsive opponent). The window itself closes only via the title-bar ✕.
+  // In-match Back is destructive (forfeits the stake to the opponent), so a live hand confirms first
+  // instead of routing straight through backOut/forfeit. Not live (matching/funding/settled/error) ⇒
+  // Back keeps its existing bail-out behavior below.
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const canForfeit = g.status === "playing";
+
+  // Back (not-live path) bails out via backOut: auto-fold → publish our settlement half → drop back to
+  // THIS window's lobby once the half is on the wire ("settled") or if settle errors — a failed/stuck
+  // close must never trap the player. A timeout backstops a hand that can't reach a settle boundary
+  // (e.g. an unresponsive opponent). Forfeit (the confirmed in-match Back) does NOT arm this watchdog:
+  // forfeit() has its own bounded teardown (peer wait capped at FORFEIT_SETTLE_TIMEOUT_MS, an RPC read,
+  // and an optional wallet-signed close) and never nulls `g.state`, so the window keeps rendering the
+  // table + "Play again" once `g.status` reaches "settled" (same fallthrough as the natural end-of-match
+  // settle below). Arming this 8s bail on the forfeit path would race that: it fires first, resets the
+  // hook (nulling state) out from under forfeit's still-running async work, and forfeit's late
+  // `finally { setStatus("settled") }` then lands on a reset hook with no state — a permanently blank
+  // window. The window itself closes only via the title-bar ✕.
   const [leaving, setLeaving] = useState(false);
   useEffect(() => {
     if (!leaving) return;
@@ -152,108 +166,112 @@ export function QuantumPokerPvpWindow(_props: GameWindowProps) {
   };
 
   return (
-    <div className="sketch grid h-full min-h-[14rem] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
-      <SketchDefs />
+    <>
+      <div className="sketch grid h-full min-h-[14rem] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
+        <SketchDefs />
 
-      <header className="qp-head">
-        <div className="flex min-w-0 items-center gap-[clamp(6px,2.2cqmin,14px)]">
-          <button
-            type="button"
-            className="sketch-btn"
-            onClick={() => {
-              setLeaving(true);
-              g.backOut(); // auto-fold out → settle this hand → back to the lobby when settled
-            }}
-          >
-            {leaving ? "Leaving…" : "Back"}
-          </button>
-          <div className="flex min-w-0 flex-col leading-none">
-            <span className="sketch-eyebrow">
-              PvP · you are {self}
-              {g.status === "settling" && " · settling…"}
-              {g.status === "settled" && " · settled ✓"}
-            </span>
-            <span className="qp-title truncate">Quantum Poker</span>
-          </div>
-        </div>
-        <div className="flex items-center gap-[clamp(5px,1.8cqmin,12px)]">
-          <span className="sketch-eyebrow tabular-nums">
-            hand {(s.handNo + 1n).toString()}/{HAND_CAP.toString()}
-          </span>
-          {g.status === "playing" && (
+        <header className="qp-head">
+          <div className="flex min-w-0 items-center gap-[clamp(6px,2.2cqmin,14px)]">
             <button
               type="button"
-              className={`sketch-btn${g.auto ? " sketch-btn--go" : ""}`}
-              onClick={() => g.setAuto(!g.auto)}
-              title={
-                g.auto
-                  ? "Auto on — a bot is making your bets"
-                  : "Let a bot play your hand"
-              }
+              className="sketch-btn"
+              onClick={() => {
+                if (canForfeit) {
+                  setConfirmOpen(true);
+                  return;
+                }
+                setLeaving(true);
+                g.backOut(); // auto-fold out → settle this hand → back to the lobby when settled
+              }}
             >
-              🤖 Auto{g.auto ? " ON" : ""}
+              {leaving ? "Leaving…" : "Back"}
             </button>
-          )}
-          {g.status === "playing" &&
-            !terminal &&
-            (g.endRequested ? (
+            <div className="flex min-w-0 flex-col leading-none">
+              <span className="sketch-eyebrow">
+                PvP · you are {self}
+                {g.status === "settling" && " · settling…"}
+                {g.status === "settled" && " · settled ✓"}
+              </span>
+              <span className="qp-title truncate">Quantum Poker</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-[clamp(5px,1.8cqmin,12px)]">
+            <span className="sketch-eyebrow tabular-nums">
+              hand {(s.handNo + 1n).toString()}/{HAND_CAP.toString()}
+            </span>
+            {g.status === "playing" && (
+              <button
+                type="button"
+                className={`sketch-btn${g.auto ? " sketch-btn--go" : ""}`}
+                onClick={() => g.setAuto(!g.auto)}
+                title={
+                  g.auto
+                    ? "Auto on — a bot is making your bets"
+                    : "Let a bot play your hand"
+                }
+              >
+                🤖 Auto{g.auto ? " ON" : ""}
+              </button>
+            )}
+            {g.status === "playing" && !terminal && g.endRequested && (
               <span className="sketch-eyebrow whitespace-nowrap">
                 ends after hand
               </span>
-            ) : (
-              <button
-                type="button"
-                className="sketch-btn"
-                onClick={g.requestSettle}
-                title="End the match after this hand and settle on-chain at the current stacks"
-              >
-                Settle
-              </button>
-            ))}
-        </div>
-      </header>
-
-      <main className="grid min-h-0 overflow-hidden p-[clamp(10px,3.6cqmin,36px)]">
-        <QuantumPokerTable
-          state={s}
-          hero={self}
-          holesA={holesA}
-          holesB={holesB}
-          nameA={nameA}
-          nameB={nameB}
-        />
-      </main>
-
-      <footer className="grid gap-[clamp(5px,1.6cqmin,12px)] p-[clamp(6px,2.4cqmin,16px)] pt-0">
-        {g.myTurnToBet && g.legal ? (
-          <div
-            className={`flex flex-col gap-[clamp(4px,1.4cqmin,10px)]${g.auto ? " opacity-40" : ""}`}
-          >
-            {g.auto && (
-              <span className="sketch-note">🤖 Bot is playing your hand</span>
-            )}
-            <PokerActionBar
-              legal={g.legal}
-              pot={pot}
-              onAct={onAct}
-              secondsLeft={g.secondsLeft}
-            />
-          </div>
-        ) : (
-          <div className="flex items-center gap-[clamp(5px,1.8cqmin,12px)]">
-            <span className="qp-stat__l">{banner}</span>
-            {g.status === "settled" && (
-              <button
-                type="button"
-                className="sketch-btn sketch-btn--go"
-                onClick={g.reset}
-              >
-                Play again
-              </button>
             )}
           </div>
-        )}
-      </footer>
-    </div>
+        </header>
+
+        <main className="grid min-h-0 overflow-hidden p-[clamp(10px,3.6cqmin,36px)]">
+          <QuantumPokerTable
+            state={s}
+            hero={self}
+            holesA={holesA}
+            holesB={holesB}
+            nameA={nameA}
+            nameB={nameB}
+          />
+        </main>
+
+        <footer className="grid gap-[clamp(5px,1.6cqmin,12px)] p-[clamp(6px,2.4cqmin,16px)] pt-0">
+          {g.myTurnToBet && g.legal ? (
+            <div
+              className={`flex flex-col gap-[clamp(4px,1.4cqmin,10px)]${g.auto ? " opacity-40" : ""}`}
+            >
+              {g.auto && (
+                <span className="sketch-note">🤖 Bot is playing your hand</span>
+              )}
+              <PokerActionBar
+                legal={g.legal}
+                pot={pot}
+                onAct={onAct}
+                secondsLeft={g.secondsLeft}
+              />
+            </div>
+          ) : (
+            <div className="flex items-center gap-[clamp(5px,1.8cqmin,12px)]">
+              <span className="qp-stat__l">{banner}</span>
+              {g.status === "settled" && (
+                <button
+                  type="button"
+                  className="sketch-btn sketch-btn--go"
+                  onClick={g.reset}
+                >
+                  Play again
+                </button>
+              )}
+            </div>
+          )}
+        </footer>
+      </div>
+      <ForfeitDialog
+        open={canForfeit && confirmOpen}
+        stake={`${POKER_BUYIN} MTPS`}
+        onKeepPlaying={() => setConfirmOpen(false)}
+        onForfeit={() => {
+          setConfirmOpen(false);
+          g.forfeit(); // no `leaving`/watchdog — g.status → "settled" drives the table's own Play-again fallthrough
+        }}
+      />
+    </>
   );
 }

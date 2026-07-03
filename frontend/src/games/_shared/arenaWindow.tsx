@@ -1,17 +1,22 @@
-import { type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import type { GameWindowProps } from "../types";
 import { ArenaScreen, type ArenaScreenTheme } from "./ArenaScreen";
+import { ForfeitDialog } from "@/pvp/ForfeitDialog";
 
 /** The pvp-match surface the window controller reads. */
 interface ArenaPvp {
   status: string; // PvpStatus, but the controller only string-compares it
   error: string | null;
   view: unknown;
+  /** Per-seat stake (MIST → surfaced whole, e.g. "500 MTPS"); the forfeit-confirm copy's amount. */
+  stake: number;
   reset: () => void;
   /** Idle "Play": reserve a server bot for this game and enter its tunnel. See pvpMatchHook.playArena. */
   playArena: () => void;
   /** Back/Cancel: settles (publishes a half) when a match is live, else resets. See pvpMatchHook. */
   leave: () => void;
+  /** Confirmed forfeit mid-match: concedes the pot to the bot, then returns to the lobby. */
+  forfeit: () => void;
 }
 
 export interface ArenaWindowSpec<Pvp extends ArenaPvp> {
@@ -45,6 +50,11 @@ export function createArenaWindow<Pvp extends ArenaPvp>(
     // lobby); on the matching/error/settled screens it just resets. So an in-game Back no longer
     // strands the staked tunnel — it publishes a settlement half on the way out.
     const backToLobby = () => pvp.leave();
+    // In-board Back is destructive (forfeits the stake), so ONLY a still-playing match confirms first.
+    // Once "settling"/"settled" a settle is already firing (forfeit() would no-op on its shared
+    // fire-once guard, leaving a dead dialog), so Back just returns to the lobby via backToLobby.
+    const [confirmOpen, setConfirmOpen] = useState(false);
+    const canForfeit = pvp.status === "playing";
 
     const screen = (
       children: ReactNode,
@@ -96,7 +106,23 @@ export function createArenaWindow<Pvp extends ArenaPvp>(
         pvp.status === "settled") &&
       pvp.view !== null
     )
-      return spec.renderPvpBoard(pvp, backToLobby);
+      return (
+        <>
+          {spec.renderPvpBoard(
+            pvp,
+            canForfeit ? () => setConfirmOpen(true) : backToLobby,
+          )}
+          <ForfeitDialog
+            open={canForfeit && confirmOpen}
+            stake={`${pvp.stake} MTPS`}
+            onKeepPlaying={() => setConfirmOpen(false)}
+            onForfeit={() => {
+              setConfirmOpen(false);
+              pvp.forfeit();
+            }}
+          />
+        </>
+      );
     return loading;
   };
 }

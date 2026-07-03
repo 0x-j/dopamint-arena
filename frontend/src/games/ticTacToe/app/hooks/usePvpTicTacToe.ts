@@ -10,7 +10,7 @@ import {
 import { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { settleViaBackend } from "@/backend/settle";
 import { defaultAuto, rememberAuto } from "@/pvp/autoPreference";
-import { coSignCloseFromPeerRoot } from "@/pvp/settleClose";
+import { coSignCloseFromPeerRoot, runForfeitClose } from "@/pvp/settleClose";
 import {
   MultiGameTicTacToeProtocol,
   MultiGameCaroProtocol,
@@ -55,6 +55,7 @@ import {
   clearResumeRecord,
   hasResumableMatch,
   flushResumeWrites,
+  keypairFromSecretHex,
 } from "@/pvp/resume";
 import { makeTttResumeAdapter } from "@/games/ticTacToe/app/lib/tttResumeAdapter";
 import { useSponsoredSignExec } from "@/onchain/useSponsoredSignExec";
@@ -166,15 +167,20 @@ export interface PvpTttView {
   auto: boolean;
   address: string; // the connected zkLogin wallet (this seat's on-chain party)
   balance: bigint; // the connected wallet's SUI balance (MIST)
+  /** This seat's per-seat stake (mode-scaled abandonment penalty) — shown in the forfeit dialog. */
+  stake: bigint;
   digests: { create?: string; deposit?: string; close?: string };
   queue: () => void;
   /** On-demand arena entry: reserve a server bot for this variant and play it now. */
   playArena: () => void;
   play: (cell: number) => void;
   next: () => void;
-  stop: () => void;
   setAuto: (on: boolean) => void;
   leave: () => void;
+  /** Forfeit the live match: concede the whole pot to the (bot) opponent, then return to the lobby.
+   *  Unlike `leave` (publish-only; the staying seat settles), this drives its own close: it asks the
+   *  bot for its co-signed root, co-signs the forced (0, total) half over it, and submits. */
+  forfeit: () => void;
   /** After a per-game settle: clear the closed match + resume record and find a new match. */
   requeue: () => void;
 }
@@ -255,6 +261,11 @@ export function usePvpTicTacToe(
   const matchIdRef = useRef<string>("");
   const settledRef = useRef(false);
   const stoppingRef = useRef(false);
+  // This seat's per-match signing KeyPair, rebuilt from the persisted secret hex in
+  // `activateTttSession` (uniform across onMatch/enterArenaMatch/resume — mirrors `roleRef`).
+  // Distinct from the hook-level `eph` above: arena entries sign with a different per-allocation key
+  // (`arenaEph`), so `forfeit()` must read the key actually baked into THIS match's tunnel.
+  const ephRef = useRef<KeyPair | null>(null);
   const onMatchRef = useRef<
     ((mp: MpClient, m: MatchInfo) => Promise<void>) | undefined
   >(undefined);
@@ -416,6 +427,10 @@ export function usePvpTicTacToe(
     ) => {
       tunnelRef.current = t;
       channelRef.current = channel;
+      // Rebuild the per-match signing KeyPair from the persisted secret — set uniformly here (not in
+      // each caller) so `forfeit()` has it whether this session came from onMatch, enterArenaMatch, or
+      // a cold-load resume.
+      ephRef.current = keypairFromSecretHex(info.selfEphemeralSecretHex);
       // Single source of the seat role for BOTH the match and resume paths. The resume path
       // (reconnect / reload of an active match) skips onMatch, so without setting it here roleRef
       // stays null → myMark 0 → the view shows "◯ (O)" for both seats. A = X, B = O.
@@ -1139,16 +1154,6 @@ export function usePvpTicTacToe(
     }
   }, [proto]);
 
-  const stop = useCallback(() => {
-    const t = tunnelRef.current;
-    const channel = channelRef.current;
-    if (!t || !channel) return;
-    if (t.state.inner.winner === 0) return; // settle cleanly between games
-    stoppingRef.current = true;
-    channel.sendPeer({ t: "stop" });
-    void finishSettle(t, channel, matchIdRef.current);
-  }, [finishSettle]);
-
   const setAuto = useCallback(
     (on: boolean) => {
       autoRef.current = on;
@@ -1230,6 +1235,7 @@ export function usePvpTicTacToe(
       bufferedSettleRef.current = null;
       helloResolveRef.current = null;
       bufferedHelloRef.current = null;
+      ephRef.current = null;
     },
     [variant],
   );
@@ -1241,6 +1247,81 @@ export function usePvpTicTacToe(
     teardownMatch(false);
     setPhase("idle");
   }, [teardownMatch]);
+
+  // Forfeit the live match: concede the whole pot to the bot. Send a bare `forfeit` intent, await the
+  // bot's co-signed `settleHalf` off the SAME onPeer dispatcher `finishSettle` awaits (its root +
+  // forced 0/total, timing out after FORFEIT_SETTLE_TIMEOUT_MS if the bot never answers), co-sign
+  // that exact half, submit via the same settleViaBackend + wallet-close fallback `finishSettle`
+  // uses, then land on the terminal "done" phase either way (mirrors poker/battleship's forfeit —
+  // never strand in "settling"). Fire-once via the shared `settledRef` guard, shared with
+  // `finishSettle` — mutually exclusive with the natural-terminal settle. Off a live tunnel, falls
+  // back to `leave()`.
+  const forfeit = useCallback(() => {
+    const t = tunnelRef.current;
+    const channel = channelRef.current;
+    const eph = ephRef.current;
+    const address = walletRef.current.address;
+    if (
+      !t ||
+      !channel ||
+      !eph ||
+      !address ||
+      (phase !== "playing" && phase !== "settling")
+    ) {
+      leave();
+      return;
+    }
+    // Fire-once guard SHARED with finishSettle: only one settle path may await the bot's settleHalf.
+    if (settledRef.current) return;
+    settledRef.current = true;
+    setPhase("settling");
+    void (async () => {
+      try {
+        const { a, b } = proto.balances(t.state);
+        await runForfeitClose({
+          dt: t,
+          wallet: address,
+          eph,
+          total: a + b,
+          // Single submitter = seat A, unified with finishSettle and every other game.
+          submits: roleRef.current === "A",
+          createdAt: createdAtRef.current,
+          sendForfeit: () => channel.sendPeer({ t: "forfeit" }),
+          // The bot's half arrives already decoded off the onPeer dispatcher (bytes, not hex).
+          awaitPeerHalf: () =>
+            bufferedSettleRef.current
+              ? Promise.resolve(bufferedSettleRef.current)
+              : new Promise<{ sig: Uint8Array; root: Uint8Array }>((res) => {
+                  settleResolveRef.current = res;
+                }),
+          submit: async (coSigned) => {
+            const closeDigest = await settleViaBackend({
+              tunnelId: t.tunnelId,
+              settlement: coSigned as any,
+              transcript: [],
+              label: "tictactoe",
+              fallbackClose: async () => {
+                const coinType = isMtpsConfigured ? MTPS_COIN_TYPE : undefined;
+                const res = await (isMtpsConfigured ? submitSponsored : submit)(
+                  buildCloseWithRootTx(t.tunnelId, coSigned, coinType),
+                );
+                return res.digest;
+              },
+            });
+            if (closeDigest) {
+              setDigests((d) => ({ ...d, close: closeDigest }));
+              channel.sendPeer({ t: "closed", digest: closeDigest });
+            }
+          },
+        });
+        await refreshBalance();
+      } catch (e) {
+        console.warn("[ttt pvp] forfeit failed; leaving", e);
+      } finally {
+        setPhase("done");
+      }
+    })();
+  }, [phase, proto, submit, submitSponsored, refreshBalance, leave]);
 
   // Find a new match after a per-game settle. Reuse the SAME socket (the relay runs many matches
   // per connection): release the settled match and re-quickMatch in place. Tearing the socket
@@ -1348,14 +1429,15 @@ export function usePvpTicTacToe(
     auto,
     address: wallet.address ?? "",
     balance,
+    stake: scaledStake,
     digests,
     queue,
     playArena,
     play,
     next,
-    stop,
     setAuto,
     leave,
+    forfeit,
     requeue,
   };
 }

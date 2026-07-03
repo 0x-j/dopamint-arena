@@ -13,6 +13,7 @@ import {
 } from "@/games/blackjack/app/components/app/chips";
 
 import { SketchDefs } from "@/games/blackjack/app/App";
+import { ForfeitDialog } from "@/pvp/ForfeitDialog";
 
 function statusText(g: ReturnType<typeof usePvpBlackjack>): string {
   if (g.phase === "opening") return "Opening tunnel on-chain…";
@@ -47,6 +48,10 @@ export default function PvpBlackjack() {
   const funded = isMtpsConfigured || g.walletBalance > 20_000_000n;
   const playing =
     g.phase === "playing" || g.phase === "settling" || g.phase === "done";
+  // In-match Back is destructive (forfeits the stake to the opponent), so a live table confirms
+  // first instead of routing straight through leave/forfeit.
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const canForfeit = g.phase === "playing";
   const myBal = g.myBalance;
   const oppBal = g.oppBalance;
   const finalResult = myBal > oppBal ? "win" : myBal < oppBal ? "lose" : "push";
@@ -239,13 +244,28 @@ export default function PvpBlackjack() {
   return (
     <div className="qp-sketch h-full w-full flex flex-col relative overflow-hidden select-none">
       <SketchDefs />
+      <ForfeitDialog
+        open={canForfeit && confirmOpen}
+        stake={`${g.stake} MTPS`}
+        onKeepPlaying={() => setConfirmOpen(false)}
+        onForfeit={() => {
+          setConfirmOpen(false);
+          g.forfeit();
+        }}
+      />
 
       {/* Play area felt wrapper */}
       <div className="relative z-10 flex-1 w-full flex items-center justify-center p-1 md:p-2">
         <div className="bj-felt w-full h-full relative">
           {playing && (
             <button
-              onClick={() => g.leave()}
+              onClick={() => {
+                if (canForfeit) {
+                  setConfirmOpen(true);
+                  return;
+                }
+                g.leave();
+              }}
               className="qp-btn !px-4 !py-2 !absolute !top-4 !left-4 z-30 !text-sm font-semibold cursor-pointer"
               title="Back"
             >
@@ -553,12 +573,6 @@ export default function PvpBlackjack() {
                     Player is betting…
                   </span>
                 )}
-                <button
-                  onClick={g.stop}
-                  className="qp-btn qp-btn--stop !px-3 !py-2 !text-xs font-black uppercase"
-                >
-                  Stop &amp; settle
-                </button>
               </>
             )}
             {g.phase === "done" && (

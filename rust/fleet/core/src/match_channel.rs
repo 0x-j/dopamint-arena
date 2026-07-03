@@ -19,16 +19,27 @@ use crate::relay_ws::RelayTransport;
 
 pub struct MatchChannel<T: RelayTransport> {
     transport: Arc<T>,
-    peer_rx: Mutex<UnboundedReceiver<PeerMsg>>,
+    /// Behind an `Arc` so [`watch_stop`]'s background task can share it without owning the channel —
+    /// that ownership split is what lets `Drop` abort the watcher instead of it detaching.
+    peer_rx: Arc<Mutex<UnboundedReceiver<PeerMsg>>>,
     /// Taken once by [`MatchChannel::take_frame_transport`]; the driver owns it thereafter.
     frame_rx: Option<UnboundedReceiver<Vec<u8>>>,
     demux: tokio::task::JoinHandle<()>,
+    /// Graceful-stop watcher spawned by [`watch_stop`]. Owned HERE (not by the play task) so it is
+    /// aborted in `Drop` alongside `demux`: a cancelled play loop — e.g. an arena forfeit dropping
+    /// the play future — must not detach it, or it keeps the shared transport `Arc` (and through it
+    /// the registered relay connection) alive for the process's lifetime.
+    stop_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<T: RelayTransport> Drop for MatchChannel<T> {
     fn drop(&mut self) {
-        // Stop the demux loop when the match ends — it would otherwise outlive the channel.
+        // Abort both background tasks when the match ends — either outliving the channel keeps the
+        // shared transport `Arc` alive and leaks the relay connection (it never unregisters).
         self.demux.abort();
+        if let Some(watcher) = self.stop_watcher.take() {
+            watcher.abort();
+        }
     }
 }
 
@@ -62,9 +73,10 @@ impl<T: RelayTransport> MatchChannel<T> {
         });
         MatchChannel {
             transport,
-            peer_rx: Mutex::new(peer_rx),
+            peer_rx: Arc::new(Mutex::new(peer_rx)),
             frame_rx: Some(frame_rx),
             demux,
+            stop_watcher: None,
         }
     }
 
@@ -78,6 +90,25 @@ impl<T: RelayTransport> MatchChannel<T> {
     /// Next control peer message, or `None` when the match channel closes.
     pub async fn recv_peer(&self) -> Option<PeerMsg> {
         self.peer_rx.lock().await.recv().await
+    }
+
+    /// Spawn a background watcher that runs `on_stop` once when the peer sends `{t:"stop"}` (the FE's
+    /// graceful "settle now"). Non-terminal protocols never wind down otherwise. The task is OWNED by
+    /// this channel and aborted in `Drop` — unlike a caller-spawned task that would detach and pin the
+    /// relay connection if the play loop is cancelled (arena forfeit). Call once, after the hello.
+    pub fn watch_stop(&mut self, on_stop: impl FnOnce() + Send + 'static) {
+        let peer_rx = self.peer_rx.clone();
+        self.stop_watcher = Some(tokio::spawn(async move {
+            let mut on_stop = Some(on_stop);
+            while let Some(msg) = peer_rx.lock().await.recv().await {
+                if msg == PeerMsg::Stop {
+                    if let Some(f) = on_stop.take() {
+                        f();
+                    }
+                    break;
+                }
+            }
+        }));
     }
 
     /// Take the frame transport the `PartyDriver` runs on (callable once).

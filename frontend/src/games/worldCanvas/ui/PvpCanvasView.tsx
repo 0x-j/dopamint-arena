@@ -16,6 +16,7 @@ import {
   type CanvasFocus,
 } from "../canvasShared";
 import { WC, ERASER_COLOR, PALETTE } from "./tokens";
+import { ForfeitDialog } from "@/pvp/ForfeitDialog";
 
 const CHUNK = 256;
 /** Fixed canvas backdrop (matches solo) — Excalidraw-style white, passed to WorldCanvas so
@@ -95,6 +96,12 @@ function Board({ m }: { m: ReturnType<typeof usePvpWorldCanvas> }) {
   const [color, setColor] = useState(13);
   const [brushSize, setBrushSize] = useState(1);
   const [revision, setRevision] = useState(0);
+  // Leave is destructive (forfeits the stake), so a live match confirms first instead of routing
+  // straight through `leave`/`forfeit`.
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  // Only a still-playing match confirms before leaving; once settling a settle is already firing
+  // (forfeit() no-ops on its guard), so Back/Leave just resets rather than opening a dead dialog.
+  const canForfeit = m.status === "playing";
 
   // Your toolbar color drives YOUR seat's bot too (like solo): the autopilot's randomMove
   // reads this hint, so toggling Auto on paints in your chosen color. (Brush size already
@@ -288,17 +295,27 @@ function Board({ m }: { m: ReturnType<typeof usePvpWorldCanvas> }) {
           onClick={() => viewParticipant("opp")}
         />
         <span style={ctlDividerStyle} />
-        {/* Leave: publish our settlement half and return to the lobby — the staying seat / grace
-            path submits the close, so leaving the shared canvas settles instead of stranding it. */}
+        {/* Leave: a live match confirms first (forfeits the stake to the opponent) instead of
+            routing straight through; publishing a half / a bare reset only happens once confirmed. */}
         <button
           type="button"
-          onClick={m.leave}
-          title="Publish your half and leave the canvas"
+          onClick={() => (canForfeit ? setConfirmOpen(true) : m.leave())}
+          title="Leave the canvas"
           style={ctlButtonStyle}
         >
           Leave
         </button>
       </div>
+
+      <ForfeitDialog
+        open={canForfeit && confirmOpen}
+        stake={`${m.stake} MTPS`}
+        onKeepPlaying={() => setConfirmOpen(false)}
+        onForfeit={() => {
+          setConfirmOpen(false);
+          m.forfeit();
+        }}
+      />
     </div>
   );
 }

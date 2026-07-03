@@ -9,7 +9,10 @@ import { defaultBackend } from "sui-tunnel-ts/core/crypto-native";
 import { makeEndpoint } from "sui-tunnel-ts/core/tunnel";
 import { fromHex, toHex } from "sui-tunnel-ts/core/bytes";
 import { DistributedTunnel } from "sui-tunnel-ts/core/distributedTunnel";
-import { coSignCloseFromPeerRoot } from "../../pvp/settleClose";
+import {
+  coSignCloseFromPeerRoot,
+  runForfeitClose,
+} from "../../pvp/settleClose";
 import { registerWindowDisposer } from "@/lib/windowSessions";
 import { defaultAuto, rememberAuto } from "@/pvp/autoPreference";
 import { useTelemetry } from "../../telemetry/TelemetryProvider";
@@ -68,6 +71,7 @@ import {
   readResumeRecord,
   listActiveTunnels,
   clearResumeRecord,
+  keypairFromSecretHex,
 } from "@/pvp/resume";
 import { makeBattleshipResumeAdapter } from "./battleshipResumeAdapter";
 
@@ -75,7 +79,7 @@ import { makeBattleshipResumeAdapter } from "./battleshipResumeAdapter";
  *  arena-store consumer (below) and `GameModule.arenaGameId` (index.ts). */
 export const BATTLESHIP_ARENA_GAME_ID = "battleship";
 
-const STAKE_BALANCE = 1n; // locked per seat: 1 MTPS (0 decimals; ADR-0023)
+export const STAKE_BALANCE = 1n; // locked per seat: 1 MTPS (0 decimals; ADR-0023)
 const STAKE_SHIFT = 1n; // winner-take-all: the loser's 1 MTPS stake moves to the winner (0 decimals; ADR-0023)
 
 export type PvpStatus =
@@ -104,9 +108,10 @@ export interface BattleshipPvp {
   /** Toggle autopilot for your seat; flipping it on fires immediately if it's your turn. */
   setAuto: (on: boolean) => void;
   reset: () => void;
-  /** Back / Settle: publish this seat's settlement half and stop (status → settled). Unlike `reset`
-   *  (a bare disconnect), this settles — the staying seat / grace path submits the close. */
-  endMatch: () => void;
+  /** Forfeit the live match: concede the whole pot to the opponent, then return to the placement menu.
+   *  Unlike `reset` (a bare disconnect), this drives its own close: it asks the peer for its co-signed
+   *  root, co-signs the forced (0, total) half over it, and submits. */
+  forfeit: () => void;
 }
 
 type BattleshipTunnel = DistributedTunnel<BattleshipState, BattleshipMove>;
@@ -198,8 +203,16 @@ class PvpSession {
   private auto = defaultAuto("battleship", true);
   // Monotonic id for "My Activity" rows pushed per finished match.
   private txnId = 0;
-  /** Set per live match to `settle(publishOnly)`; lets `endMatch()` publish a half outside `onConfirmed`. */
-  private settleNow: ((publishOnly: boolean) => void) | null = null;
+  /** Per-match handles bound in `activateSession` so `forfeit()` can drive its own peer exchange
+   *  without re-deriving the channel/waiter/signing key that findMatch/enterArenaMatch/resume
+   *  already hold locally. */
+  private channel: PvpChannel | null = null;
+  private waitPeer: (<T>(t: string) => Promise<T>) | null = null;
+  private selfEph: KeyPair | null = null;
+  /** Fire-once guard for the ONE cooperative close a session may run — shared by the natural-terminal
+   *  settle (`triggerSettle`, in `activateSession`) and `forfeit()`. `makeInbox` allows only one waiter
+   *  per tag, so a second concurrent settle path would orphan its `waitPeer("settleHalf")` forever. */
+  private settleFired = false;
 
   subscribe = (cb: () => void): (() => void) => {
     this.listeners.add(cb);
@@ -289,21 +302,95 @@ class PvpSession {
     this.view = null;
     this.opponentWallet = null;
     this.error = null;
-    this.settleNow = null;
+    this.channel = null;
+    this.waitPeer = null;
+    this.selfEph = null;
+    this.settleFired = false;
     this.emit();
   };
 
-  /** End the match now (Back / Settle button): publish this seat's settlement half, then stop — the
-   *  staying seat / 1h grace path submits the cooperative close. Status advances settling→settled, so
-   *  the window can either close (Back) or show the settled screen (Settle). No live match ⇒ no-op
-   *  (the caller resets). Never blocks on a peer that won't co-sign an early end (the fleet bot). */
-  endMatch = () => {
+  /** Forfeit the live match: concede the whole pot to the opponent. Send a bare `forfeit` intent, await
+   *  the peer's co-signed `settleHalf` (its root + forced 0/total, timing out after
+   *  FORFEIT_SETTLE_TIMEOUT_MS if the peer never answers), co-sign that exact half, submit the close
+   *  (empty body — the peer owns the transcript; backend-down falls back to the wallet-submitted close,
+   *  mirroring `settle()`), then reset. Off a live tunnel, fall back to `reset()`. Fire-once via the
+   *  shared `settleFired` guard — mutually exclusive with the natural-terminal settle. */
+  forfeit = () => {
+    const dt = this.dt;
+    const ch = this.channel;
+    const wp = this.waitPeer;
+    const eph = this.selfEph;
+    const role = this.role;
+    const deps = this.deps;
     if (
-      this.settleNow &&
-      (this.status === "playing" || this.status === "settling")
+      !dt ||
+      !ch ||
+      !wp ||
+      !eph ||
+      !role ||
+      !deps?.account ||
+      (this.status !== "playing" && this.status !== "settling")
     ) {
-      this.settleNow(true);
+      this.reset();
+      return;
     }
+    // Fire-once guard SHARED with the natural-terminal settle (see the field's doc): only one settle
+    // path per session may run + await `waitPeer("settleHalf")`, else makeInbox's single
+    // waiter-per-tag orphans the other.
+    if (this.settleFired) return;
+    this.settleFired = true;
+    const wallet = deps.account.address;
+    const reads = deps.client as unknown as Parameters<typeof readCreatedAt>[0];
+    this.status = "settling";
+    this.emit();
+    void (async () => {
+      try {
+        const { a, b } = dt.protocol.balances(dt.state);
+        await runForfeitClose({
+          dt,
+          wallet,
+          eph,
+          total: a + b,
+          submits: role === "A",
+          createdAt: () => readCreatedAt(reads, dt.tunnelId),
+          sendForfeit: () => ch.sendPeer({ t: "forfeit" }),
+          awaitPeerHalf: async () => {
+            const other = await wp<{ sig: string; transcriptRoot: string }>(
+              "settleHalf",
+            );
+            return {
+              sig: fromHex(other.sig),
+              root: fromHex(other.transcriptRoot),
+            };
+          },
+          submit: async (co) => {
+            try {
+              await getControlPlaneClient().settle(
+                dt.tunnelId,
+                coSignedToSettleBody(co, []),
+              );
+            } catch (e) {
+              console.error(
+                "[battleship] backend settle failed; falling back to wallet close:",
+                e,
+              );
+              await closeCooperativeWithRoot({
+                signExec: (isMtpsConfigured
+                  ? deps.sponsoredSignExec
+                  : deps.signExec) as never,
+                tunnelId: dt.tunnelId,
+                settlement: co,
+                coinType: isMtpsConfigured ? MTPS_COIN_TYPE : undefined,
+              });
+            }
+          },
+        });
+      } catch (e) {
+        console.warn("[battleship] forfeit failed; leaving", e);
+      } finally {
+        this.reset();
+      }
+    })();
   };
 
   dispose = () => {
@@ -350,6 +437,10 @@ class PvpSession {
     // here, so set it here — the resume() path doesn't set it otherwise, which left a
     // resumed match with a null `dt` (no view → stuck at "Setting up…", dead fire).
     this.dt = dt;
+    // Bind the channel/waiter too, so `forfeit()` can drive its own peer exchange from outside this
+    // closure, same for both live and resumed sessions.
+    this.channel = channel;
+    this.waitPeer = waitPeer;
     const deps = this.deps!;
     const signExec = deps.signExec;
     const sponsoredSignExec = deps.sponsoredSignExec;
@@ -358,14 +449,13 @@ class PvpSession {
     >[0]["reads"];
     const coinType = isMtpsConfigured ? MTPS_COIN_TYPE : undefined;
     const proto = new BattleshipProtocol(STAKE_SHIFT);
-    let settling = false;
-    // One cooperative close, guarded to fire once. A natural terminal (all ships sunk) does the full
-    // half-exchange + submit; `publishOnly` (Back / Settle button) publishes our half and stops, so
-    // ending early never blocks on a peer that won't co-sign it (the fleet bot only settles at
-    // terminal). Stored on `settleNow` so `endMatch()` can drive the publish-only path.
+    // One cooperative close, guarded to fire once — the guard is `this.settleFired`, SHARED with
+    // `forfeit()` (a session may run only one settle path; see the field's doc). A natural terminal
+    // (all ships sunk) does the full half-exchange + submit; `publishOnly` is currently unused (no
+    // caller triggers it — the mid-match Back path forfeits instead) but `settle()` still honors it.
     const triggerSettle = (publishOnly: boolean) => {
-      if (settling) return;
-      settling = true;
+      if (this.settleFired) return;
+      this.settleFired = true;
       this.status = "settling";
       this.emit();
       void settle(
@@ -387,7 +477,6 @@ class PvpSession {
         (e) => this.fail(e),
       );
     };
-    this.settleNow = triggerSettle;
     dt.onConfirmed = () => {
       const st = dt.state;
       if (st.pendingShot && st.pendingShot.by !== info.role) {
@@ -400,7 +489,7 @@ class PvpSession {
       // move was due, the shot follows on the next confirmed tick instead.
       const proposed = proposeDue(dt, info.role, this.secret!);
       if (!proposed) this.autoFireIfDue();
-      if (proto.isTerminal(st) && !settling) {
+      if (proto.isTerminal(st) && !this.settleFired) {
         // One "My Activity" row per finished match, from this seat's perspective.
         const iWon = st.winner === (info.role === "A" ? 1 : 2);
         this.deps?.report.pushLocalTxn({
@@ -491,6 +580,9 @@ class PvpSession {
         this.role = rec.role;
         this.opponentWallet = rec.opponentWallet;
         const waitPeer = makeInbox(channel);
+        // Reconstruct the per-match signing key from the persisted record — `ephemeral` above is a
+        // FRESH key for this cold-load's MpClient identity only, not the match's co-signing key.
+        this.selfEph = keypairFromSecretHex(rec.selfEphemeralSecretHex!);
         this.activateSession(mp, channel, tunnel, waitPeer, {
           matchId: rec.matchId,
           role: rec.role,
@@ -546,6 +638,10 @@ class PvpSession {
     this.status = "idle";
     this.view = null;
     this.error = null;
+    this.channel = null;
+    this.waitPeer = null;
+    this.selfEph = null;
+    this.settleFired = false;
     this.emit();
   }
 
@@ -660,6 +756,7 @@ class PvpSession {
           { a: STAKE_BALANCE, b: STAKE_BALANCE },
         );
         this.dt = dt;
+        this.selfEph = ephemeral;
         this.activateSession(mp, channel, dt, waitPeer, {
           matchId: match.matchId,
           role: match.role,
@@ -768,6 +865,7 @@ class PvpSession {
           { a: STAKE_BALANCE, b: STAKE_BALANCE },
         );
         this.dt = dt;
+        this.selfEph = ephemeral;
         this.activateSession(mp, channel, dt, waitPeer, {
           matchId: match.matchId,
           role: match.role,
@@ -929,7 +1027,7 @@ export function useBattleshipPvp(windowId: string): BattleshipPvp {
     auto: snap.auto,
     setAuto: session.setAuto,
     reset: session.reset,
-    endMatch: session.endMatch,
+    forfeit: session.forfeit,
   };
 }
 

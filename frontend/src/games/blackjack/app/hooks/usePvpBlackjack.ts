@@ -39,12 +39,13 @@ import {
   clearResumeRecord,
   evictExpiredRecords,
   installResumePersistence,
+  keypairFromSecretHex,
   readResumeRecord,
   hasResumableMatch,
   flushResumeWrites,
 } from "@/pvp/resume";
 import { attachResume, resumeActiveTunnels } from "@/pvp/resumeSession";
-import { coSignCloseFromPeerRoot } from "@/pvp/settleClose";
+import { coSignCloseFromPeerRoot, runForfeitClose } from "@/pvp/settleClose";
 import { requestArenaGame } from "@/onchain/arenaLazyEntry";
 import {
   useCurrentAccount,
@@ -143,6 +144,7 @@ export interface PvpView {
   betOptions: number[]; // chip denominations the player may bet now (filtered to ≤ tableMax)
   rounds: RoundResult[];
   auto: boolean;
+  stake: bigint; // active per-seat stake (arena stakeEach, else DEFAULT_STAKE); read-only, dialog copy
   walletAddress: string;
   walletBalance: bigint;
   digests: { create?: string; deposit?: string; close?: string };
@@ -153,9 +155,12 @@ export interface PvpView {
   hit: () => void;
   stand: () => void;
   bet: (amount: number) => void; // player places the next round's bet (deals the round)
-  stop: () => void;
   setAuto: (on: boolean) => void;
   leave: () => void;
+  /** Forfeit the live match: concede the whole pot to the (bot) opponent, then return to the lobby.
+   *  Unlike `leave` (publish-only; the staying seat settles), this drives its own close: it asks the
+   *  bot for its co-signed root, co-signs the forced (0, total) half over it, and submits. */
+  forfeit: () => void;
 }
 
 export function usePvpBlackjack(): PvpView {
@@ -174,6 +179,10 @@ export function usePvpBlackjack(): PvpView {
   // Arena games autopilot by default (fallback true) so a resume/reload keeps playing; your
   // explicit toggle still sticks for the session. See autoPreference.
   const [auto, setAutoState] = useState(() => defaultAuto("blackjack", true));
+  // The per-seat stake actually at risk this match — the arena allocation's `stakeEach` (1000),
+  // NOT the public-queue `DEFAULT_STAKE` (100). Surfaced so the forfeit dialog states the real
+  // amount being conceded; the settlement itself uses live balances, so this is copy only.
+  const [activeStake, setActiveStake] = useState<bigint>(DEFAULT_STAKE);
   const [walletBalance, setWalletBalance] = useState<bigint>(0n);
   const [digests, setDigests] = useState<{
     create?: string;
@@ -203,6 +212,10 @@ export function usePvpBlackjack(): PvpView {
   const matchIdRef = useRef<string>("");
   const settledRef = useRef(false);
   const stoppingRef = useRef(false);
+  // This seat's per-match signing KeyPair, rebuilt from the persisted secret hex in `activateSession`
+  // (uniform across onMatch/enterArenaMatch/resume — mirrors `roleRef`). `forfeit()` needs the raw
+  // KeyPair (not just the tunnel) to build its forced-balances half via `coSignForfeitFromPeerRoot`.
+  const ephRef = useRef<KeyPair | null>(null);
   const onMatchRef =
     useRef<(mp: MpClient, m: MatchInfo) => Promise<void>>(undefined);
   const openedResolveRef = useRef<((id: string) => void) | null>(null);
@@ -375,6 +388,10 @@ export function usePvpBlackjack(): PvpView {
       // Warm the store from the (possibly cold-load-restored) state so an adopt before the next
       // commit can't lose the in-flight draw secret.
       secretStoreRef.current.own(t.state);
+      // Rebuild the per-match signing KeyPair from the persisted secret — set uniformly here (not in
+      // each caller) so `forfeit()` has it whether this session came from onMatch, enterArenaMatch, or
+      // a cold-load resume.
+      ephRef.current = keypairFromSecretHex(info.selfEphemeralSecretHex);
       // Per-round log: record the player's (party A) result's updates.
       let lastLoggedRound = 0;
       // Initialize from the live checkpoint so the first delta is correct for both the live
@@ -1007,6 +1024,7 @@ export function usePvpBlackjack(): PvpView {
           // No create/deposit: the fleet pre-created the tunnel + funded seat B, and seat A was funded
           // by the batched `enterArena` PTB. Both seats stake the fixed arena buy-in (allocation).
           const stake = BigInt(allocation.stakeEach);
+          setActiveStake(stake); // the real per-seat stake — the forfeit dialog reads this, not DEFAULT_STAKE
           // `created_at` is only needed at settle (see finishSettle / leave). Fetching it HERE blocks
           // the tunnel build on a Sui RPC, and under RPC load that stalls the whole match — the bet
           // can never fire because `tunnelRef` never gets set (this is why blackjack "never" started
@@ -1181,17 +1199,6 @@ export function usePvpBlackjack(): PvpView {
     [proto],
   );
 
-  // Stop & settle the tunnel from a round boundary (either seat). Co-signed; the dealer closes.
-  const stop = useCallback(() => {
-    const t = tunnelRef.current;
-    const channel = channelRef.current;
-    if (!t || !channel) return;
-    if (t.state.phase !== "round_over") return; // settle cleanly between rounds
-    stoppingRef.current = true;
-    channel.sendPeer({ t: "stop" });
-    void finishSettle(t, channel, matchIdRef.current);
-  }, [finishSettle]);
-
   const setAuto = useCallback(
     (on: boolean) => {
       autoRef.current = on;
@@ -1307,7 +1314,90 @@ export function usePvpBlackjack(): PvpView {
     bufferedStakeRef.current = null;
     helloResolveRef.current = null;
     bufferedHelloRef.current = null;
+    ephRef.current = null;
   }, []);
+
+  // Forfeit the live match: concede the whole pot to the dealer bot. Send a bare `forfeit` intent,
+  // await the bot's co-signed `settleHalf` off the SAME onPeer dispatcher `finishSettle` awaits (its
+  // root + forced 0/total, timing out after FORFEIT_SETTLE_TIMEOUT_MS if the bot never answers),
+  // co-sign that exact half, submit via the same settleViaBackend + wallet-close fallback
+  // `finishSettle` uses, then land on the terminal "done" phase either way (mirrors
+  // poker/battleship's forfeit — never strand in "settling"). Fire-once via the shared `settledRef`
+  // guard, shared with `finishSettle` — mutually exclusive with the natural-terminal settle. Off a
+  // live tunnel, falls back to `leave()`.
+  const forfeit = useCallback(() => {
+    const t = tunnelRef.current;
+    const channel = channelRef.current;
+    const eph = ephRef.current;
+    if (
+      !t ||
+      !channel ||
+      !eph ||
+      !walletAddress ||
+      (phase !== "playing" && phase !== "settling")
+    ) {
+      leave();
+      return;
+    }
+    // Fire-once guard SHARED with finishSettle: only one settle path may await the bot's settleHalf.
+    if (settledRef.current) return;
+    settledRef.current = true;
+    setPhase("settling");
+    void (async () => {
+      try {
+        const { a, b } = proto.balances(t.state);
+        await runForfeitClose({
+          dt: t,
+          wallet: walletAddress,
+          eph,
+          total: a + b,
+          // Single submitter = seat A, unified with finishSettle and every other game.
+          submits: roleRef.current === "A",
+          createdAt: createdAtRef.current,
+          sendForfeit: () => channel.sendPeer({ t: "forfeit" }),
+          // The bot's half arrives already decoded off the onPeer dispatcher (bytes, not hex).
+          awaitPeerHalf: () =>
+            bufferedSettleRef.current
+              ? Promise.resolve(bufferedSettleRef.current)
+              : new Promise<{ sig: Uint8Array; root: Uint8Array }>((res) => {
+                  settleResolveRef.current = res;
+                }),
+          submit: async (coSigned) => {
+            const closeDigest = await settleViaBackend({
+              tunnelId: t.tunnelId,
+              settlement: coSigned as any,
+              transcript: [],
+              label: "blackjack",
+              fallbackClose: async () => {
+                const coinType = isMtpsConfigured ? MTPS_COIN_TYPE : undefined;
+                const res = await (isMtpsConfigured ? submitSponsored : submit)(
+                  buildCloseWithRootTx(t.tunnelId, coSigned, coinType),
+                );
+                return res.digest;
+              },
+            });
+            if (closeDigest) {
+              setDigests((d) => ({ ...d, close: closeDigest }));
+              channel.sendPeer({ t: "closed", digest: closeDigest });
+            }
+          },
+        });
+        await refreshBalance();
+      } catch (e) {
+        console.warn("[blackjack] forfeit failed; leaving", e);
+      } finally {
+        setPhase("done");
+      }
+    })();
+  }, [
+    walletAddress,
+    phase,
+    proto,
+    submit,
+    submitSponsored,
+    refreshBalance,
+    leave,
+  ]);
 
   // Find a new match after a settle, reusing the SAME socket (the relay runs many matches per
   // connection): release the settled match and re-quickMatch in place — keeping Auto on so the
@@ -1443,6 +1533,7 @@ export function usePvpBlackjack(): PvpView {
     betOptions,
     rounds,
     auto,
+    stake: activeStake,
     walletAddress,
     walletBalance,
     digests,
@@ -1452,8 +1543,8 @@ export function usePvpBlackjack(): PvpView {
     hit,
     stand,
     bet,
-    stop,
     setAuto,
     leave,
+    forfeit,
   };
 }

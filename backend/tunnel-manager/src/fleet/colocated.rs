@@ -14,12 +14,12 @@
 use anyhow::bail;
 use transcript_store::TranscriptChunkWriter;
 use transcript_stream::{ChunkUpload, S3StreamingRecorder};
-use tunnel_harness::Signer;
+use tunnel_harness::{Signer, TranscriptRecorder};
 
 use fleet_core::match_channel::MatchChannel;
 use fleet_core::play_match::{
     play_battleship, play_blackjack_v2, play_bomb_it, play_caro, play_chicken_cross, play_flash,
-    play_quantum_poker, play_regular_payments, play_tic_tac_toe, play_world_canvas,
+    play_quantum_poker, play_regular_payments, play_tic_tac_toe, play_world_canvas, profile_for,
 };
 use fleet_core::signer_durable::DurableSigner;
 use fleet_core::Role;
@@ -197,6 +197,7 @@ pub async fn join_and_spawn(
             &rec.seat_a,
             rec.created_at_ms,
             match_key,
+            secret,
             conn,
             chunk_upload_tx,
             chunk_writer,
@@ -222,12 +223,17 @@ async fn drive_arena_bot(
     opponent_wallet: &str,
     created_at_ms: u64,
     match_key: DurableSigner,
+    secret: [u8; 32],
     conn: std::sync::Arc<BusRelayConnection>,
     chunk_upload_tx: Option<tokio::sync::mpsc::Sender<ChunkUpload>>,
     chunk_writer: Option<std::sync::Arc<dyn TranscriptChunkWriter>>,
     responder: Option<std::sync::Arc<dyn tunnel_flash::ChatResponder>>,
 ) -> anyhow::Result<()> {
-    let transport = BusRelayTransport::new(conn.clone(), match_id.to_owned());
+    // The FE's bare `forfeit` frame is diverted out-of-band by the bot's transport onto this channel;
+    // `play_game` races it against play and leads a forced close. One-shot (`(1)` capacity).
+    let (forfeit_tx, forfeit_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let transport =
+        BusRelayTransport::new(conn.clone(), match_id.to_owned()).forfeit_to(forfeit_tx);
     let channel = MatchChannel::new(transport);
     // `created_at` is captured at allocate and carried in the reservation — the bot does ZERO chain IO
     // before its first move. A slow Sui RPC HERE previously left the bot spawned but silent (no hello,
@@ -238,6 +244,15 @@ async fn drive_arena_bot(
         game = %game,
         created_at_ms,
         "arena bot entering play (created_at from reservation, no chain IO)"
+    );
+    // A second anchor for the forfeit path: the play anchor is MOVED into the driver future (dropped
+    // on forfeit), so leading the forced-close half needs an independent handle. Both share the same
+    // relay `conn` (Arc), tunnel id, and `created_at`, so the forced half commits to identical bytes.
+    let forfeit_anchor = RelayBridgedAnchor::new(
+        tunnel_id.to_owned(),
+        conn.clone(),
+        match_id.to_owned(),
+        created_at_ms,
     );
     let anchor = RelayBridgedAnchor::new(
         tunnel_id.to_owned(),
@@ -250,6 +265,9 @@ async fn drive_arena_bot(
         channel,
         anchor,
         match_key,
+        secret,
+        forfeit_anchor,
+        forfeit_rx,
         opponent_wallet,
         tunnel_id,
         chunk_upload_tx,
@@ -277,6 +295,9 @@ async fn play_game(
     channel: MatchChannel<BusRelayTransport>,
     anchor: RelayBridgedAnchor,
     match_key: DurableSigner,
+    secret: [u8; 32],
+    forfeit_anchor: RelayBridgedAnchor,
+    mut forfeit_rx: tokio::sync::mpsc::Receiver<()>,
     opponent_wallet: &str,
     tunnel_id: &str,
     chunk_upload_tx: Option<tokio::sync::mpsc::Sender<ChunkUpload>>,
@@ -285,6 +306,11 @@ async fn play_game(
     // game ignores it (they aren't chat protocols).
     responder: Option<std::sync::Arc<dyn tunnel_flash::ChatResponder>>,
 ) -> anyhow::Result<u64> {
+    // The tunnel's full pot = both seats' stake. Sourced from the game's `GameProfile` — the SAME
+    // per-seat stake `play_match` co-signs the initial balances against and the FE echoes as
+    // `allocation.stakeEach` — so the forced `(0, total)` split sums to the on-chain total. `None`
+    // only for an unwired game, whose match arm bails before any forfeit branch runs.
+    let forfeit_total = profile_for(game).map(|p| 2 * p.stake_each);
     // Every game drives the identical party-B seam (Role::B + a fresh transcript recorder); only the
     // protocol's `play_*` entry differs, so each game is one arm. The recorder folds the O(log N) root
     // AND streams the co-signed transcript to S3 in chunks during play through the shared bounded
@@ -294,21 +320,44 @@ async fn play_game(
         // Standard games: fixed party-B seam, no extra strategy input.
         ($play_fn:ident) => {{
             let recorder = S3StreamingRecorder::new(tunnel_id, chunk_upload_tx, chunk_writer);
-            // Seal on EVERY terminal exit, including abandon: a disconnect makes `$play_fn` return
-            // Err, so finishing before `?` is what flushes the tail chunk + seals the manifest for an
-            // errored/abandoned match. (A hung or panicking match still won't reach here; the SIGTERM
-            // uploader drain and the co-signed checkpoint bound that residual — see A.2 in the design.)
-            let result = $play_fn(
-                channel,
-                anchor,
-                match_key,
-                Role::B,
-                opponent_wallet,
-                recorder.clone(),
-            )
-            .await;
-            recorder.finish().await;
-            result?
+            // Race play against an inbound forfeit. On a natural terminal, seal on EVERY exit
+            // (including abandon: a disconnect makes `$play_fn` return Err, so finishing before `?`
+            // flushes the tail + seals the manifest). On forfeit, `select!` DROPS the driver future —
+            // a clean cancellation because `record` is synchronous, so the shared root/buffer is never
+            // torn — then the RETAINED recorder handle (Arc-shared state with the driver's clone) yields
+            // the real folded root and seals S3. The bot LEADS the forced `(0, total)` half over that
+            // root; the FE pairs it and submits the cooperative close.
+            // `biased;` + the play arm FIRST: a completed natural close must always win over a
+            // same-poll forfeit signal. Without it, `select!`'s random poll order can, on a
+            // forfeit-then-terminal-move back-to-back arrival, take the forfeit arm even though
+            // `$play_fn` already emitted the natural `settleHalf` as a side effect — sending the
+            // FE a second, conflicting `(0, total)` half. Polling top-to-bottom means the forfeit
+            // arm is only ever taken while the driver is genuinely `Pending`.
+            tokio::select! {
+                biased;
+                result = $play_fn(
+                    channel,
+                    anchor,
+                    match_key,
+                    Role::B,
+                    opponent_wallet,
+                    recorder.clone(),
+                ) => {
+                    recorder.finish().await;
+                    result?.moves
+                }
+                _ = forfeit_rx.recv() => {
+                    let root = recorder.canonical_root_for_tunnel(tunnel_id)?;
+                    let Some(total) = forfeit_total else {
+                        anyhow::bail!("no GameProfile for {game}; cannot compute forfeit total");
+                    };
+                    forfeit_anchor
+                        .emit_forfeit_half(total, root, &DurableSigner::from_secret(&secret))
+                        .await;
+                    recorder.finish().await;
+                    0
+                }
+            }
         }};
         // Flash chat: same seam plus the optional LLM responder (last arg).
         ($play_fn:ident, $responder:expr) => {{
@@ -324,10 +373,10 @@ async fn play_game(
             )
             .await;
             recorder.finish().await;
-            result?
+            result?.moves
         }};
     }
-    let outcome = match game {
+    let moves = match game {
         "blackjack" => play!(play_blackjack_v2),
         "quantum_poker" => play!(play_quantum_poker),
         "bomb_it" => play!(play_bomb_it),
@@ -340,7 +389,7 @@ async fn play_game(
         "flash" => play!(play_flash, responder),
         other => bail!("co-located fleet has no protocol wired for game '{other}'"),
     };
-    Ok(outcome.moves)
+    Ok(moves)
 }
 
 /// A bot's stable on-chain address — distinct per (game, idx), the same across its matches (only
@@ -538,5 +587,163 @@ mod tests {
             2 * BLACKJACK.stake_each,
             "stakes are conserved across the genuine two-party match",
         );
+    }
+
+    // Test-only `RelayTransport` wrapper around the human's real bus transport: flags the first
+    // real game-move envelope (`{"t":"frame",...}`, either direction — a proposed move or its ack)
+    // it observes. Lets the forfeit-seal test below know, without a fixed sleep, that the bot's
+    // recorder has almost certainly folded at least one entry before injecting forfeit — the wait
+    // is bounded by the actual match progressing, not a guessed duration that could race a loaded
+    // CI runner.
+    struct MoveWatchTransport {
+        inner: BusRelayTransport,
+        frames_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl fleet_core::relay_ws::RelayTransport for MoveWatchTransport {
+        async fn send_payload(
+            &self,
+            payload: Vec<u8>,
+        ) -> Result<(), tunnel_harness::FrameTransportError> {
+            if String::from_utf8_lossy(&payload).contains("\"t\":\"frame\"") {
+                self.frames_seen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.send_payload(payload).await
+        }
+
+        async fn recv_payload(
+            &self,
+        ) -> Result<Option<Vec<u8>>, tunnel_harness::FrameTransportError> {
+            let got = self.inner.recv_payload().await?;
+            if let Some(bytes) = &got {
+                if String::from_utf8_lossy(bytes).contains("\"t\":\"frame\"") {
+                    self.frames_seen
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Ok(got)
+        }
+    }
+
+    // The forfeit branch of the `play!` macro's `select!` must reach `recorder.finish()` and seal a
+    // real manifest — the money-adjacent regression the Task 5 review flagged: a `select!` silently
+    // DROPS the non-winning branch's future, so a future edit that moved the seal onto the play_fn
+    // branch alone (relying on the recorder's `Drop`, never actually calling `finish()`) would lose
+    // the tail chunk on every forfeit and pass every OTHER test (which never forfeits). This drives
+    // a real match (tic_tac_toe: few, fast, deterministic moves) far enough to fold at least one
+    // transcript entry, forfeits, and asserts the S3 chunk store actually received a sealed manifest
+    // — the same seal path (`writer.put_chunk` + `writer.seal`) the natural-terminal arm takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forfeit_path_seals_the_recorder_not_a_select_drop() {
+        use fleet_core::play_match::play_tic_tac_toe;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use transcript_store::testing::FakeChunkStore;
+        use transcript_store::TranscriptChunkReader;
+
+        const TUNNEL_ID: &str = "0xdeadfeed";
+
+        let fake = std::sync::Arc::new(FakeChunkStore::default());
+        // `in_memory_for_test` has no seam for a chunk writer; unwrap the freshly-minted (single-
+        // owner) Arc to inject one, mirroring the explorer crate's `testing`-feature pattern.
+        let mut inner = std::sync::Arc::try_unwrap(AppState::in_memory_for_test())
+            .ok()
+            .expect("freshly constructed state has a single owner");
+        inner.chunk_writer =
+            Some(fake.clone() as std::sync::Arc<dyn transcript_store::TranscriptChunkWriter>);
+        let state: SharedState = std::sync::Arc::new(inner);
+
+        let slot = reserve_arena_slot(&state, "tic_tac_toe");
+        let match_id = slot.match_id.clone();
+        state
+            .mp
+            .put_arena_reservation(
+                &match_id,
+                ArenaReservation {
+                    game: "tic_tac_toe".into(),
+                    seat_a: "0xuser".into(),
+                    seat_b: slot.bot_address.clone(),
+                    tunnel_id: TUNNEL_ID.into(),
+                    eph_secret_hex: slot.eph_secret_hex.clone(),
+                    created_at_ms: 0,
+                },
+            )
+            .await;
+
+        let human_conn = BusRelayConnection::register(state.clone());
+        join_and_spawn(&state, &match_id, human_conn.conn_ref(), "0xuser", false)
+            .await
+            .expect("join claims the reservation and spawns the bot");
+        human_conn
+            .recv_for_test()
+            .await
+            .expect("human receives match.found");
+
+        let frames_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let human_transport = MoveWatchTransport {
+            inner: BusRelayTransport::new(human_conn.clone(), match_id.clone()),
+            frames_seen: frames_seen.clone(),
+        };
+        let human_channel = MatchChannel::new(human_transport);
+        let human_anchor = RelayBridgedAnchor::new(
+            TUNNEL_ID.to_owned(),
+            human_conn.clone(),
+            match_id.clone(),
+            0,
+        );
+        let bot_address = slot.bot_address.clone();
+        let human_play = tokio::spawn(async move {
+            play_tic_tac_toe(
+                human_channel,
+                human_anchor,
+                DurableSigner::from_secret(&[42u8; 32]),
+                Role::A,
+                &bot_address,
+                tunnel_harness::NullTranscriptRecorder,
+            )
+            .await
+        });
+
+        // Wait for a full round trip (a proposed move + its ack — 2 frame envelopes) so the bot's
+        // recorder has actually folded an entry, not just seen a proposal in flight.
+        let progressed = tokio::time::timeout(Duration::from_secs(10), async {
+            while frames_seen.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            progressed.is_ok(),
+            "the match exchanged a real move before forfeit (no hang)"
+        );
+
+        human_conn
+            .send_to_peer(&match_id, r#"{"t":"forfeit"}"#.to_owned())
+            .await;
+
+        // Bounded poll, not a fixed sleep: fails fast on a genuine regression (finish() skipped)
+        // instead of racing wall-clock, and doesn't wait longer than the match actually needs.
+        let sealed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if fake
+                    .read_manifest(TUNNEL_ID)
+                    .await
+                    .expect("fake store never errors")
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            sealed.is_ok(),
+            "forfeit must seal the transcript manifest (recorder.finish() reached the writer), \
+             not truncate the tail via a select! drop"
+        );
+
+        human_play.abort();
     }
 }

@@ -36,7 +36,7 @@ import {
   resumeWatchdogShouldArm,
   RESUME_WATCHDOG_MS,
 } from "@/pvp/resumeWatchdog";
-import { coSignCloseFromPeerRoot } from "@/pvp/settleClose";
+import { coSignCloseFromPeerRoot, runForfeitClose } from "@/pvp/settleClose";
 import {
   getControlPlaneClient,
   resolveBackendUrl,
@@ -72,6 +72,7 @@ import {
   readResumeRecord,
   listActiveTunnels,
   clearResumeRecord,
+  keypairFromSecretHex,
 } from "@/pvp/resume";
 
 export type PvpStatus =
@@ -145,6 +146,10 @@ export interface PvpMatch<State extends { winner: unknown }, Intent, View> {
   /** Back / leave mid-match: publish this seat's settlement half, then return to the lobby. Unlike
    *  `reset` (a bare disconnect), this settles — the staying seat / grace path submits the close. */
   leave: () => void;
+  /** Forfeit mid-match: concede the whole pot to the (bot) opponent, then return to the lobby. Unlike
+   *  `leave` (publish-only; the staying seat settles), this drives its own close: it asks the bot for
+   *  its co-signed root, co-signs the forced (0, total) half over it, and submits. */
+  forfeit: () => void;
 }
 
 interface PvpDeps {
@@ -207,7 +212,10 @@ function turn(nonce: bigint): Role {
  * minimized or reflowed window stays CONNECTED in the background instead of dropping the opponent.
  * The component subscribes; only an explicit window close disposes it. See `lib/windowSessions`.
  */
-class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
+// Exported (only) so the forfeit-orchestration regression test can drive `forfeit()` directly
+// against hand-built mocks, bypassing the full matchmaking/on-chain `activateSession` wiring —
+// see pvpMatchHook.forfeit.test.ts. Not part of the public hook API (`createPvpMatchHook` below is).
+export class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
   deps: PvpDeps | null = null;
 
   private status: PvpStatus = "idle";
@@ -229,6 +237,16 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
   private settleNow: ((publishOnly: boolean) => void) | null = null;
   /** True between `leave()` and teardown, so the publish-only settle returns to the lobby once sent. */
   private leaving = false;
+  /** Per-match handles bound in `activateSession` so `forfeit()` can drive its own peer exchange
+   *  without re-deriving the channel/waiter/signing key that `findMatch`/`enterArenaMatch`/`resume`
+   *  already hold locally. */
+  private channel: PvpChannel | null = null;
+  private waitPeer: (<T>(t: string) => Promise<T>) | null = null;
+  private selfEph: KeyPair | null = null;
+  /** Fire-once guard for the ONE cooperative close a session may run — shared by the natural-terminal
+   *  settle (`triggerSettle`, below) and `forfeit()`. `makeInbox` allows only one waiter per tag, so a
+   *  second concurrent settle path would orphan its `waitPeer("settleHalf")` forever. */
+  private settleFired = false;
 
   constructor(private readonly spec: PvpMatchSpec<State, Move, Intent, View>) {
     this.intent = spec.idleIntent;
@@ -363,6 +381,10 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
     this.error = null;
     this.settleNow = null;
     this.leaving = false;
+    this.channel = null;
+    this.waitPeer = null;
+    this.selfEph = null;
+    this.settleFired = false;
     this.emit();
   };
 
@@ -380,6 +402,87 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
     } else {
       this.reset();
     }
+  };
+
+  /** Forfeit the live match: concede the whole pot to the bot. Send a bare `forfeit` intent, await the
+   *  bot's co-signed `settleHalf` (its root + forced 0/total, timing out after
+   *  `FORFEIT_SETTLE_TIMEOUT_MS` if the peer never answers), co-sign that exact half, submit the close
+   *  (empty body — the bot owns the transcript; backend-down falls back to the wallet-submitted close,
+   *  mirroring `settle()`), then reset. Off a live tunnel, fall back to leave(). Fire-once via the
+   *  shared `settleFired` guard — mutually exclusive with the natural-terminal settle. */
+  forfeit = () => {
+    const dt = this.dt;
+    const ch = this.channel;
+    const wp = this.waitPeer;
+    const eph = this.selfEph;
+    const deps = this.deps;
+    if (
+      !dt ||
+      !ch ||
+      !wp ||
+      !eph ||
+      !deps?.account ||
+      (this.status !== "playing" && this.status !== "settling")
+    ) {
+      this.leave();
+      return;
+    }
+    // Fire-once guard SHARED with the natural-terminal settle (see below): only one settle path per
+    // session may run + await `waitPeer("settleHalf")`, else makeInbox's single waiter-per-tag orphans.
+    if (this.settleFired) return;
+    this.settleFired = true;
+    const wallet = deps.account.address;
+    const reads = deps.client as unknown as Parameters<typeof readCreatedAt>[0];
+    this.status = "settling";
+    this.emit();
+    void (async () => {
+      try {
+        const { a, b } = dt.protocol.balances(dt.state);
+        await runForfeitClose({
+          dt,
+          wallet,
+          eph,
+          total: a + b,
+          submits: this.role === "A",
+          createdAt: () => readCreatedAt(reads, dt.tunnelId),
+          sendForfeit: () => ch.sendPeer({ t: "forfeit" }),
+          awaitPeerHalf: async () => {
+            const other = await wp<{ sig: string; transcriptRoot: string }>(
+              "settleHalf",
+            );
+            return {
+              sig: fromHex(other.sig),
+              root: fromHex(other.transcriptRoot),
+            };
+          },
+          submit: async (co) => {
+            try {
+              await getControlPlaneClient().settle(
+                dt.tunnelId,
+                coSignedToSettleBody(co, []),
+              );
+            } catch (e) {
+              console.error(
+                `[${this.spec.game}] backend settle failed; falling back to wallet close:`,
+                e,
+              );
+              await closeCooperativeWithRoot({
+                signExec: (isMtpsConfigured
+                  ? deps.sponsoredSignExec
+                  : deps.signExec) as never,
+                tunnelId: dt.tunnelId,
+                settlement: co,
+                coinType: isMtpsConfigured ? MTPS_COIN_TYPE : undefined,
+              });
+            }
+          },
+        });
+      } catch (e) {
+        console.warn(`[${this.spec.game}] forfeit failed; leaving`, e);
+      } finally {
+        this.reset();
+      }
+    })();
   };
 
   dispose = () => {
@@ -420,6 +523,10 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
     // so set it here — the resume() cold-load path doesn't set it otherwise, which left a resumed
     // match with a null `dt` (no view → stuck loading, the propose loop never schedules).
     this.dt = dt;
+    // Bind the channel/waiter too, so `forfeit()` can drive its own peer exchange from outside this
+    // closure (mirroring `settleNow` below), same for both live and resumed sessions.
+    this.channel = channel;
+    this.waitPeer = waitPeer;
     const deps = this.deps!;
     const signExec = deps.signExec;
     const sponsoredSignExec = deps.sponsoredSignExec;
@@ -428,14 +535,14 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
       typeof openAndFundSharedTunnel
     >[0]["reads"];
     const proto = this.spec.makeProtocol();
-    let settling = false;
-    // One cooperative close, guarded to fire once. A natural terminal waits for the bot's settle half
-    // and submits over the bot's root; `publishOnly` (leaver/Back) has nothing to publish — the bot
-    // owns the transcript and settles at its own terminal — so it just returns to the lobby. Stored on
-    // `settleNow` so `leave()` can drive it from outside this closure.
+    // One cooperative close, guarded to fire once — the guard is `this.settleFired`, SHARED with
+    // `forfeit()` (a session may run only one settle path; see the field's doc). A natural terminal
+    // waits for the bot's settle half and submits over the bot's root; `publishOnly` (leaver/Back) has
+    // nothing to publish — the bot owns the transcript and settles at its own terminal — so it just
+    // returns to the lobby. Stored on `settleNow` so `leave()` can drive it from outside this closure.
     const triggerSettle = (publishOnly: boolean) => {
-      if (settling) return;
-      settling = true;
+      if (this.settleFired) return;
+      this.settleFired = true;
       this.status = "settling";
       this.emit();
       void settle(
@@ -541,6 +648,9 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
         const rec = readResumeRecord(tunnel.tunnelId)!;
         this.role = rec.role;
         const waitPeer = makeInbox(channel);
+        // Reconstruct the per-match signing key from the persisted record — `ephemeral` above is a
+        // FRESH key for this cold-load's MpClient identity only, not the match's co-signing key.
+        this.selfEph = keypairFromSecretHex(rec.selfEphemeralSecretHex!);
         this.activateSession(mp, channel, tunnel, waitPeer, {
           matchId: rec.matchId,
           role: rec.role,
@@ -701,6 +811,7 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
           { a: this.spec.stake, b: this.spec.stake },
         );
         this.dt = dt;
+        this.selfEph = ephemeral;
         this.activateSession(mp, channel, dt, waitPeer, {
           matchId: match.matchId,
           role: match.role,
@@ -801,6 +912,7 @@ class PvpSession<State extends { winner: unknown }, Move, Intent, View> {
           { a: this.spec.stake, b: this.spec.stake },
         );
         this.dt = dt;
+        this.selfEph = ephemeral;
         this.activateSession(mp, channel, dt, waitPeer, {
           matchId: match.matchId,
           role: match.role,
@@ -978,6 +1090,7 @@ export function createPvpMatchHook<
       toggleAuto: session.toggleAuto,
       reset: session.reset,
       leave: session.leave,
+      forfeit: session.forfeit,
     };
   };
 }

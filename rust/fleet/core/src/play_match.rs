@@ -199,22 +199,20 @@ where
     let opponent_pk = recv_hello(&channel).await?;
 
     // Graceful stop: the FE's `{t:"stop"}` (Pay now) must wind the bot down and emit `settleHalf`.
-    // Non-terminal protocols (regular payments, world canvas, …) never finish otherwise.
+    // Non-terminal protocols (regular payments, world canvas, …) never finish otherwise. The watcher
+    // is OWNED by `channel` (aborted in its `Drop`), so a cancelled play future — the arena forfeit
+    // dropping this future via `select!` — can't detach it and leak the relay connection. See
+    // `MatchChannel::watch_stop`; the old caller-spawned task leaked one conn + two tasks per forfeit.
     let run_control = DriverRunControl::graceful_unbounded();
     let stop_control = run_control.clone();
     let game_id = profile.game_id;
     let frame_transport = channel.take_frame_transport();
-    let stop_listener = tokio::spawn(async move {
-        while let Some(msg) = channel.recv_peer().await {
-            if msg == PeerMsg::Stop {
-                tracing::info!(
-                    game = game_id,
-                    "peer stop received — requesting graceful settle"
-                );
-                stop_control.request_stop();
-                break;
-            }
-        }
+    channel.watch_stop(move || {
+        tracing::info!(
+            game = game_id,
+            "peer stop received — requesting graceful settle"
+        );
+        stop_control.request_stop();
     });
 
     // 2. Hand the driver the demuxed frame transport + the anchor; it opens, plays, and settles.
@@ -231,15 +229,22 @@ where
     let driver = PartyDriver::new(parts, strategy, frame_transport, anchor, recorder)
         .with_run_control(run_control);
     let mut ts = 1u64;
-    let driver_result = driver
+    // INVARIANT (load-bearing for the co-located arena forfeit): `driver.run` emits this seat's
+    // co-signed `settleHalf` as its LAST suspension point, and nothing below `.await`s after it
+    // returns. The forfeit path races `play_match` against a forfeit signal in a `biased` `select!`
+    // (play arm first — `fleet/colocated.rs`); "a completed natural close always wins a same-poll
+    // forfeit" holds ONLY while there is no `.await` between the natural `settleHalf` and this return.
+    // Do NOT add an `.await` below — it reopens the double-half window (a forfeit half emitted after
+    // the natural one, sending the FE two conflicting closes).
+    let (outcome, _recorder) = driver
         .run(MAX_MOVES, move || {
             ts += 1;
             ts
         })
         .await
-        .map_err(|e| anyhow!("party driver run: {e:?}"));
-    stop_listener.abort();
-    let (outcome, _recorder) = driver_result?;
+        .map_err(|e| anyhow!("party driver run: {e:?}"))?;
+    // `channel` drops here (or on a cancelled future); its `Drop` aborts the stop watcher + demux,
+    // releasing the shared transport `Arc` so the relay connection unregisters.
     Ok(outcome)
 }
 

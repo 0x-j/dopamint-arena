@@ -48,12 +48,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # `FrameTransport`/`RelayTransport` error type the seam returns.
 fleet-core = { path = "../../rust/fleet/core" }
 tunnel-harness = { path = "../../rust/engine/tunnel-harness" }
+# The canonical settlement-v2 wire serializer (`serialize_settlement_with_root`) the bot signs its
+# forced forfeit half over. Promoted from a dev-dep to a normal dep so the arena forfeit path (not
+# just tests) can reach it — `tunnel-harness` re-exports `wire_hex`/`transcript`, not `wire`.
+tunnel-core = { path = "../../rust/engine/tunnel-core" }
 # Streaming transcript: the bot streams the co-signed transcript to S3 in chunks during play.
 # `transcript-store` = the S3 chunk store; `transcript-stream` = the recorder + bounded uploader.
 transcript-store = { path = "../transcript-store" }
 transcript-stream = { path = "../transcript-stream" }
 # Flash self-play loop (Mode 2): drives the flash protocol in-process with both seats.
-tunnel-core = { path = "../../rust/engine/tunnel-core" }
 tunnel-flash = { path = "../../rust/protocols/flash" }
 # Funded seat-B identities for on-demand arena bots (PR #124): the 1M-member pool, opened once at
 # startup, gives each bot a real on-chain address from `get_member_key`. Gated by WALLET_POOL_ID.
@@ -66,8 +69,8 @@ bech32.workspace = true
 [dev-dependencies]
 tokio-tungstenite = "0.24"
 wiremock = "0.6"
-# Constructing a ProtocolId for anchor open() requests in fleet tests.
-tunnel-core = { path = "../../rust/engine/tunnel-core" }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["redis"] }
 ctor = "0.2"
+# in-memory FakeChunkStore for the forfeit recorder-seal regression (colocated.rs)
+transcript-store = { path = "../transcript-store", features = ["testing"] }

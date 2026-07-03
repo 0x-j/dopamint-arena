@@ -23,11 +23,13 @@
 use std::sync::Arc;
 
 use tunnel_harness::{
-    Balances, OpenedTunnel, SettledTunnel, SettlementMode, TunnelAnchor, TunnelAnchorError,
+    Balances, OpenedTunnel, SettledTunnel, SettlementMode, Signer, TunnelAnchor, TunnelAnchorError,
     TunnelOpenRequest, TunnelSettleRequest,
 };
 
 use fleet_core::peer::PeerMsg;
+use fleet_core::signer_durable::DurableSigner;
+use tunnel_core::wire::{serialize_settlement_with_root, Settlement};
 
 use crate::fleet::bus_transport::BusRelayConnection;
 
@@ -63,6 +65,65 @@ impl RelayBridgedAnchor {
             match_id,
             created_at_ms,
         }
+    }
+
+    /// Serialize the `settleHalf` wire and route it to the human seat. The single emit path shared by
+    /// the driver-run `settle` (co-signing the human's split) and `emit_forfeit_half` (leading a
+    /// forced split), so both put byte-identical frames on the bus — camelCase keys, hex
+    /// `sig`/`transcriptRoot`, decimal-string numerics (the FE's `PeerMessage` `settleHalf`).
+    async fn send_settle_half(
+        &self,
+        party_a_balance: u64,
+        party_b_balance: u64,
+        final_nonce: u64,
+        timestamp: u64,
+        transcript_root: [u8; 32],
+        sig: [u8; 64],
+    ) {
+        let half = FeSettleHalf {
+            t: "settleHalf",
+            party_a_balance: party_a_balance.to_string(),
+            party_b_balance: party_b_balance.to_string(),
+            final_nonce: final_nonce.to_string(),
+            timestamp: timestamp.to_string(),
+            transcript_root: hex::encode(transcript_root),
+            sig: hex::encode(sig),
+        };
+        self.conn
+            .send_to_peer(
+                &self.match_id,
+                serde_json::to_string(&half).expect("FeSettleHalf serializes"),
+            )
+            .await;
+    }
+
+    /// The bot LEADS a cooperative close by forfeit: it signs and emits a forced
+    /// `(party_a = 0, party_b = total)` half over its OWN transcript `root` — it does NOT co-sign a
+    /// human-supplied settlement. `total` is the tunnel's full pot (`2 * stake_each`); `root` is the
+    /// bot recorder's live canonical root; `match_key` is the bot's per-match ephemeral signer.
+    ///
+    /// Nonce is 1 (a freshly opened tunnel's first co-signed state — same as the natural close) and
+    /// `timestamp = created_at_ms` so the bytes match the FE half. `(0, total)` is monotonically safe
+    /// for the bot: the Move contract accepts any co-signed split summing to `total`, and awarding the
+    /// full pot to the honest bot never over-pays it. The human FE pairs this with its own signature
+    /// and submits `close_cooperative_with_root`; the bot never submits.
+    pub async fn emit_forfeit_half(&self, total: u64, root: [u8; 32], match_key: &DurableSigner) {
+        let settlement = Settlement {
+            tunnel_id: self.tunnel_id.clone(),
+            party_a_balance: 0,
+            party_b_balance: total,
+            final_nonce: 1,
+            timestamp: self.created_at_ms,
+        };
+        // Guard the money invariant: the forced split is the WHOLE pot to the bot, nothing else. A
+        // future edit that broke conservation or the `b == total` shape would fail loudly here.
+        assert!(
+            settlement.party_a_balance == 0 && settlement.party_b_balance == total,
+            "forfeit half must force (0, total): the full pot to the bot",
+        );
+        let sig = match_key.sign(&serialize_settlement_with_root(&settlement, &root));
+        self.send_settle_half(0, total, 1, self.created_at_ms, root, sig)
+            .await;
     }
 }
 
@@ -145,21 +206,15 @@ impl TunnelAnchor for RelayBridgedAnchor {
         // wire stays symmetric. `sig`/root are lowercase no-`0x` hex (TS `bytesToHex`); balances/nonce/
         // timestamp are decimal strings (TS `.toString()`). This is NOT `PeerMsg::Settle` (tag
         // `settle`): every FE hook waits on tag `settleHalf`, so the old tag deadlocked the handshake.
-        let half = FeSettleHalf {
-            t: "settleHalf",
-            party_a_balance: request.party_a_balance.to_string(),
-            party_b_balance: request.party_b_balance.to_string(),
-            final_nonce: request.final_nonce.to_string(),
-            timestamp: request.timestamp.to_string(),
-            transcript_root: hex::encode(root),
-            sig: hex::encode(request.signature),
-        };
-        self.conn
-            .send_to_peer(
-                &self.match_id,
-                serde_json::to_string(&half).expect("FeSettleHalf serializes"),
-            )
-            .await;
+        self.send_settle_half(
+            request.party_a_balance,
+            request.party_b_balance,
+            request.final_nonce,
+            request.timestamp,
+            root,
+            request.signature,
+        )
+        .await;
         // The human FE pairs this half with its own and submits the cooperative close; the bot does
         // not submit. Return the agreed balances; the on-chain digest is unknown on this side.
         Ok(SettledTunnel {
@@ -296,6 +351,128 @@ mod tests {
         assert_eq!(half["partyBBalance"], "80");
         assert_eq!(half["finalNonce"], "1");
         assert_eq!(half["timestamp"], "42");
+    }
+
+    // Forfeit: the bot LEADS with a forced `(party_a=0, party_b=total)` half over its OWN root — it
+    // does not co-sign a human settlement. The emitted half must force A→0, award the whole pot to
+    // the bot, sign nonce 1 + `timestamp = created_at`, and carry a `sig` that verifies over the v2
+    // settlement bytes (`serialize_settlement_with_root`) under the bot pubkey. This is the
+    // money-critical seam: a wrong split, nonce, timestamp, or an unverifiable sig would let the FE
+    // submit a close the Move contract rejects (or, worse, one that pays the wrong seat).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forfeit_half_forces_zero_total_and_verifies() {
+        use fleet_core::signer_durable::DurableSigner;
+        use tunnel_core::crypto::verify;
+        use tunnel_core::wire::{serialize_settlement_with_root, Settlement};
+        use tunnel_harness::Signer;
+
+        // A valid 32-byte hex address: `serialize_settlement_with_root` parses the tunnel id.
+        const TUNNEL: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+        let state = AppState::in_memory_for_test();
+        let bot_conn = BusRelayConnection::register(state.clone());
+        let user_conn = BusRelayConnection::register(state.clone());
+        let match_id = "m-forfeit";
+        state
+            .mp
+            .put_match(
+                match_id,
+                MatchRecord {
+                    game: "blackjack".into(),
+                    seat_a: "0xuserA".into(),
+                    seat_b: "0xbotB".into(),
+                    conn_a: user_conn.conn_ref(),
+                    conn_b: bot_conn.conn_ref(),
+                    tunnel_id: Some(TUNNEL.into()),
+                    latest_checkpoint: None,
+                },
+            )
+            .await;
+
+        let created_at = 1_700_000_000_000u64;
+        let anchor = RelayBridgedAnchor::new(TUNNEL.into(), bot_conn, match_id.into(), created_at);
+        let match_key = DurableSigner::from_secret(&[5u8; 32]);
+        let root = [9u8; 32];
+        let total = 2000u64; // 2 * stake_each (blackjack stake_each = 1000)
+
+        anchor.emit_forfeit_half(total, root, &match_key).await;
+
+        let inbound = user_conn
+            .recv_for_test()
+            .await
+            .expect("user receives the bot's forfeit half");
+        let ServerMsg::Relay { payload, .. } =
+            serde_json::from_str::<ServerMsg>(&inbound).expect("relay frame")
+        else {
+            panic!("expected a Relay frame");
+        };
+        let half: serde_json::Value = serde_json::from_str(&payload).expect("settle half is JSON");
+        assert_eq!(half["t"], "settleHalf", "FE waits on tag `settleHalf`");
+        assert_eq!(half["partyABalance"], "0", "forfeit forces party A to 0");
+        assert_eq!(
+            half["partyBBalance"],
+            total.to_string(),
+            "forfeit awards the whole pot to the bot"
+        );
+        assert_eq!(half["finalNonce"], "1", "the forced close signs nonce 1");
+        assert_eq!(
+            half["timestamp"],
+            created_at.to_string(),
+            "the bot signs `timestamp = created_at` (matches the FE half)"
+        );
+        assert_eq!(half["transcriptRoot"], hex::encode(root));
+
+        // Conservation + the `b == total` safety invariant on the emitted wire.
+        let a: u64 = half["partyABalance"].as_str().unwrap().parse().unwrap();
+        let b: u64 = half["partyBBalance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(a + b, total, "stakes are conserved (0 + total == total)");
+        assert_eq!(
+            b, total,
+            "party_b == total: the whole pot, never a partial split"
+        );
+
+        // The bot's sig verifies over the v2 settlement bytes under its own pubkey.
+        let settlement = Settlement {
+            tunnel_id: TUNNEL.into(),
+            party_a_balance: 0,
+            party_b_balance: total,
+            final_nonce: 1,
+            timestamp: created_at,
+        };
+        let sig_bytes: [u8; 64] = hex::decode(half["sig"].as_str().unwrap())
+            .expect("sig is hex")
+            .try_into()
+            .expect("64-byte sig");
+        assert!(
+            verify(
+                &match_key.public_key(),
+                &serialize_settlement_with_root(&settlement, &root),
+                &sig_bytes,
+            ),
+            "the bot's forfeit sig verifies over serialize_settlement_with_root",
+        );
+    }
+
+    // Cross-language golden: pins `serialize_settlement_with_root` over the forfeit `(0, total)`
+    // split byte-for-byte against the FE (frontend/src/pvp/forfeit.test.ts, same tunnel id/values).
+    // The bytes-given-a-root are unchanged from a normal close — this specifically locks the forced
+    // split so a wire-layout edit on either side gets caught here instead of at on-chain settlement.
+    #[test]
+    fn forfeit_settlement_bytes_match_the_fe_golden() {
+        let settlement = Settlement {
+            tunnel_id: format!("0x{}07", "00".repeat(31)),
+            party_a_balance: 0,
+            party_b_balance: 2000,
+            final_nonce: 1,
+            timestamp: 42,
+        };
+        let root = [9u8; 32];
+        let bytes = serialize_settlement_with_root(&settlement, &root);
+        assert_eq!(bytes.len(), 121);
+        assert_eq!(
+            hex::encode(&bytes),
+            "7375695f74756e6e656c3a3a736574746c656d656e745f76320000000000000000000000000000000000000000000000000000000000000007000000000000000000000000000007d00000000000000001000000000000002a0909090909090909090909090909090909090909090909090909090909090909",
+        );
     }
 
     // v1 (rootless) settlement is rejected: the arena close is always v2, so a missing root is a

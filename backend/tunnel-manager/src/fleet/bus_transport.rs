@@ -174,6 +174,16 @@ fn resync_nonce(payload: &str) -> Option<u64> {
     v.get("nonce").and_then(|n| n.as_str())?.parse().ok()
 }
 
+/// Whether `payload` is the human's bare `forfeit` frame (`{ "t": "forfeit" }`, no body). The bot
+/// diverts it out-of-band at the transport so it never reaches the fleet_core demux (which would
+/// drop the unknown tag) — the play task races this signal and leads a forced-close half instead.
+fn is_forfeit(payload: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    v.get("t").and_then(|t| t.as_str()) == Some("forfeit")
+}
+
 /// A [`RelayTransport`] over the in-process bus, scoped to one match. `send_payload` routes through
 /// the SAME [`crate::mp::ws::relay_to_other`] the human WS path uses (so move-counting + seat
 /// routing are identical); `recv_payload` yields the next inbound `Relay` payload for this match.
@@ -196,11 +206,24 @@ pub struct BusRelayTransport {
     recent_frames: Mutex<VecDeque<(u64, Vec<u8>)>>,
     /// Grace to wait for a dropped human before ending the match; injectable so tests run fast.
     resume_grace: Duration,
+    /// Out-of-band sink for an inbound bare `forfeit` frame. `Some` on the co-located bot's transport
+    /// (the arena forfeit seam); `None` on the human-side / test transports, which surface no forfeit.
+    /// A `(1)`-capacity channel: forfeit is a one-shot, and a full channel (already forfeited) drops.
+    forfeit_tx: Option<mpsc::Sender<()>>,
 }
 
 impl BusRelayTransport {
     pub fn new(conn: Arc<BusRelayConnection>, match_id: String) -> BusRelayTransport {
         Self::with_resume_grace(conn, match_id, PEER_RESUME_GRACE)
+    }
+
+    /// Divert an inbound bare `forfeit` frame to `forfeit_tx` (which the play task races to lead a
+    /// forced close) instead of surfacing it to the play loop. The co-located bot chains this onto
+    /// `new`; the human-side / test transports leave it unset (no forfeit). Entirely fleet-layer — no
+    /// harness change; a diverted frame never reaches the fleet_core demux.
+    pub fn forfeit_to(mut self, forfeit_tx: mpsc::Sender<()>) -> BusRelayTransport {
+        self.forfeit_tx = Some(forfeit_tx);
+        self
     }
 
     fn with_resume_grace(
@@ -215,6 +238,7 @@ impl BusRelayTransport {
             peer_online: AtomicBool::new(true),
             recent_frames: Mutex::new(VecDeque::new()),
             resume_grace,
+            forfeit_tx: None,
         }
     }
 
@@ -299,6 +323,16 @@ impl RelayTransport for BusRelayTransport {
                     if let Some(k) = resync_nonce(&payload) {
                         self.replay_since(k).await;
                         continue;
+                    }
+                    // A bare `forfeit` is diverted out-of-band to the play task (which leads a forced
+                    // close) and never surfaced as a frame — the fleet_core demux would drop the tag.
+                    if let Some(forfeit_tx) = &self.forfeit_tx {
+                        if is_forfeit(&payload) {
+                            // Non-blocking: forfeit is one-shot, and a full channel (already
+                            // forfeited) drops rather than waiting, matching the field doc below.
+                            let _ = forfeit_tx.try_send(());
+                            continue;
+                        }
                     }
                     return Ok(Some(payload.into_bytes()));
                 }
@@ -473,6 +507,94 @@ mod tests {
             got.as_deref(),
             Some(frame_env.as_bytes()),
             "parked past the drop and delivered the next frame instead of ending the match",
+        );
+    }
+
+    // The bare `forfeit` frame is recognized; ordinary frames / other control tags are not, so the
+    // diversion never swallows a real move.
+    #[test]
+    fn is_forfeit_recognizes_only_the_bare_forfeit_frame() {
+        assert!(is_forfeit(r#"{"t":"forfeit"}"#));
+        assert!(!is_forfeit(r#"{"t":"frame","kind":"move","data":"{}"}"#));
+        assert!(!is_forfeit(r#"{"t":"resync","nonce":"3"}"#));
+        assert!(!is_forfeit("not json"));
+    }
+
+    // On the bot's transport, an inbound `forfeit` is diverted out-of-band onto the forfeit channel
+    // and NOT surfaced to the play loop (the fleet_core demux would drop the unknown tag). `recv_payload`
+    // skips it and returns the next real frame, exactly like the resync interception. Without the
+    // `forfeit_to` sink (human/test transports) the same frame WOULD surface — see the second assert.
+    #[tokio::test]
+    async fn forfeit_frame_is_diverted_not_surfaced() {
+        let state = AppState::in_memory_for_test();
+        let conn = BusRelayConnection::register(state.clone());
+        let match_id = "m-forfeit-divert";
+        let (forfeit_tx, mut forfeit_rx) = mpsc::channel::<()>(1);
+        let transport =
+            BusRelayTransport::new(conn.clone(), match_id.into()).forfeit_to(forfeit_tx);
+
+        let frame_env = r#"{"t":"frame","kind":"move","data":"{}"}"#;
+        for payload in [r#"{"t":"forfeit"}"#, frame_env] {
+            state
+                .bus
+                .deliver(
+                    &conn.conn_ref(),
+                    ServerMsg::Relay {
+                        match_id: match_id.into(),
+                        payload: payload.into(),
+                    }
+                    .to_text(),
+                )
+                .await;
+        }
+
+        let got = transport.recv_payload().await.expect("recv ok");
+        assert_eq!(
+            got.as_deref(),
+            Some(frame_env.as_bytes()),
+            "the forfeit was diverted; recv_payload surfaced the next real frame, not the forfeit",
+        );
+        assert_eq!(
+            forfeit_rx.try_recv(),
+            Ok(()),
+            "the forfeit signal reached the play task's channel out-of-band",
+        );
+    }
+
+    // Regression (Theodore's forfeit review): an arena forfeit drops the play future via `select!`,
+    // which drops its `MatchChannel`. That drop MUST release the bot's relay connection. The old
+    // `play_match` spawned a stop task that OWNED the whole channel, so dropping the play future
+    // detached it — the channel never dropped, its demux never aborted, and the conn stayed registered
+    // (one conn + two tasks leaked per forfeit, for the process's lifetime). Now the watcher is owned
+    // by the channel and aborted in its `Drop`. Here we stand in for the cancellation by dropping the
+    // channel directly and assert the conn `Arc` is fully released — its `Drop` is what unregisters it.
+    #[tokio::test]
+    async fn dropping_the_match_channel_releases_the_bot_conn() {
+        let state = AppState::in_memory_for_test();
+        let conn = BusRelayConnection::register(state.clone());
+        let weak = Arc::downgrade(&conn);
+
+        let mut channel = MatchChannel::new(BusRelayTransport::new(conn.clone(), "m-leak".into()));
+        let frame_transport = channel.take_frame_transport();
+        // Arm the stop watcher exactly as `play_match` does after the hello exchange.
+        channel.watch_stop(|| {});
+
+        // Forfeit cancellation stand-in: the play future (owning the channel + its frame transport)
+        // is dropped. Then release the test's own conn handle — only a leaked task could still pin it.
+        drop(frame_transport);
+        drop(channel);
+        drop(conn);
+
+        // The demux + watcher aborts are asynchronous; let the runtime run them to completion.
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "dropping the channel released the bot conn (Drop → bus.unregister); no forfeit leak",
         );
     }
 

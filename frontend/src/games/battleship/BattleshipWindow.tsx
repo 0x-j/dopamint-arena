@@ -7,8 +7,9 @@ import { cn } from "@/lib/utils";
 import type { GameWindowProps } from "../types";
 import { PlacementBoard } from "./components/PlacementBoard";
 import { BattleView } from "./components/BattleView";
-import { useBattleshipPvp } from "./useBattleshipPvp";
+import { STAKE_BALANCE, useBattleshipPvp } from "./useBattleshipPvp";
 import { SketchDefs } from "../sketch";
+import { ForfeitDialog } from "@/pvp/ForfeitDialog";
 import "./battleship.css";
 
 // Big pill action in the shared hand-drawn "sketch" skin (matches Quantum Poker):
@@ -102,7 +103,7 @@ function AutoToggle({
 }
 
 /** Every mode renders inside this frame: a thin control strip carries the back button
- *  and optional trailing actions (Auto / Settle) — NOT a title, since the desktop window
+ *  and an optional trailing action (Auto) — NOT a title, since the desktop window
  *  chrome above already shows one — with the mode's own UI filling the space below it. */
 function ModeFrame({
   onBack,
@@ -116,7 +117,7 @@ function ModeFrame({
   return (
     <div className="flex h-full w-full flex-col">
       {/* A thin in-game control strip. The window chrome above already shows the title,
-          so this carries only the game actions (Back / Auto / Settle), kept compact.
+          so this carries only the game actions (Back / Auto), kept compact.
           Back is omitted on the placement menu — closing is the title-bar ✕'s job. */}
       <header className="bs-head shrink-0 py-[clamp(4px,1.4cqmin,9px)]">
         {onBack && (
@@ -172,7 +173,7 @@ function PvpGame({ windowId }: { windowId: string }) {
     auto,
     setAuto,
     reset,
-    endMatch,
+    forfeit,
   } = useBattleshipPvp(windowId);
   const account = useCurrentAccount();
 
@@ -203,31 +204,18 @@ function PvpGame({ windowId }: { windowId: string }) {
     return () => clearTimeout(t);
   }, [status, auto, view?.myTurn, setAuto]);
 
-  // Back: publish our settlement half, then drop back to the placement menu once it's on the wire
-  // (status → settled) or if it errors — a failed/stuck close must never trap the player. A timeout
-  // backstops an unreachable settle boundary. The window itself closes only via the title-bar ✕ or
-  // Back on the placement menu (idle).
-  const [leaving, setLeaving] = useState(false);
-  useEffect(() => {
-    if (!leaving) return;
-    if (status === "settled" || status === "error") {
-      setLeaving(false);
-      reset();
+  // In-match Back is destructive (forfeits the stake to the opponent), so a live match confirms first
+  // instead of routing straight through forfeit(). Not live (matching/funding/error) ⇒ Back just resets
+  // — there's no live tunnel yet (or it already errored out) to forfeit. The window itself closes only
+  // via the title-bar ✕ or Back on the placement menu (idle).
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const canForfeit = status === "playing";
+  const back = () => {
+    if (canForfeit) {
+      setConfirmOpen(true);
       return;
     }
-    const bail = window.setTimeout(() => {
-      setLeaving(false);
-      reset();
-    }, 8000);
-    return () => window.clearTimeout(bail);
-  }, [leaving, status, reset]);
-  const back = () => {
-    if (status === "playing" || status === "settling") {
-      setLeaving(true);
-      endMatch(); // publish our half; the leaving effect returns to the menu on "settled"
-    } else {
-      reset(); // matching / funding / error → back to the placement menu
-    }
+    reset(); // matching / funding / error → back to the placement menu
   };
   let content: ReactNode;
   if (!account && !view) {
@@ -260,9 +248,6 @@ function PvpGame({ windowId }: { windowId: string }) {
         view={view}
         statusLabel={settleLabel(status)}
         onFire={fire}
-        // End the match early without leaving the window: publish our half + show the settled screen
-        // (BattleView hides this once settled). Back instead closes the window — same publish path.
-        onSettle={endMatch}
         // "Find next match": after the match settles, reset to placement (stay in PvP)
         // so the next Find Match is one tap away — not back out to the arena.
         onPlayAgain={reset}
@@ -278,11 +263,22 @@ function PvpGame({ windowId }: { windowId: string }) {
       <AutoToggle on={auto} onChange={setAuto} />
     ) : undefined;
   return (
-    <ModeFrame
-      onBack={status === "idle" ? undefined : back}
-      headerExtra={headerExtra}
-    >
-      {content}
-    </ModeFrame>
+    <>
+      <ModeFrame
+        onBack={status === "idle" ? undefined : back}
+        headerExtra={headerExtra}
+      >
+        {content}
+      </ModeFrame>
+      <ForfeitDialog
+        open={canForfeit && confirmOpen}
+        stake={`${STAKE_BALANCE} MTPS`}
+        onKeepPlaying={() => setConfirmOpen(false)}
+        onForfeit={() => {
+          setConfirmOpen(false);
+          forfeit();
+        }}
+      />
+    </>
   );
 }

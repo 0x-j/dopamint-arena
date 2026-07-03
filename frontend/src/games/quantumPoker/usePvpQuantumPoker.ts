@@ -26,7 +26,10 @@ import {
   type Role,
 } from "../../pvp/mpClient";
 import { defaultAuto, rememberAuto } from "../../pvp/autoPreference";
-import { coSignCloseFromPeerRoot } from "../../pvp/settleClose";
+import {
+  coSignCloseFromPeerRoot,
+  runForfeitClose,
+} from "../../pvp/settleClose";
 import {
   getControlPlaneClient,
   resolveBackendUrl,
@@ -58,6 +61,7 @@ import {
   listActiveTunnels,
   clearResumeRecord,
   flushResumeWrites,
+  keypairFromSecretHex,
 } from "@/pvp/resume";
 import { makePokerResumeAdapter } from "./pokerResumeAdapter";
 import { requestArenaGame } from "@/onchain/arenaLazyEntry";
@@ -148,10 +152,12 @@ export interface PvpQuantumPoker {
   bet: (amount: bigint) => void;
   /** True once this seat or the opponent asked to end early; the current hand finishes, then it settles. */
   endRequested: boolean;
-  /** End the match cooperatively after the current hand — stop dealing and settle at the current balances. */
-  requestSettle: () => void;
   /** Bail out now: auto-fold this seat's remaining action so the hand ends immediately, then settle. */
   backOut: () => void;
+  /** Forfeit the live match: concede the whole pot to the opponent, then return to the lobby. Unlike
+   *  `backOut` (publish-only; the staying seat settles), this drives its own close: it asks the peer
+   *  for its co-signed root, co-signs the forced (0, total) half over it, and submits. */
+  forfeit: () => void;
   /** True when the persona bot is auto-playing this seat's bets. */
   auto: boolean;
   /** Toggle auto-play: when on, a persona bot makes this seat's betting moves. */
@@ -310,6 +316,13 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
   // Holds the latest `findMatch` so the settle handler can auto-open a fresh tunnel (new 5000 buy-in)
   // when a match ends by a seat running out of money — see the natural-end branch in `triggerSettle`.
   const findMatchRef = useRef<(() => void) | null>(null);
+  // Per-match handles `forfeit()` needs to drive its own peer exchange without re-deriving the
+  // channel/waiter/signing key that findMatch/enterArenaMatch/resume already hold locally. `waitPeerRef`
+  // is the ORIGINAL makeInbox waiter (channel.onPeer allows only one live callback — a second makeInbox
+  // over the same channel would silently replace it and orphan the endMatch listener). `ephemeralRef`
+  // is rebuilt from the persisted secret hex so it's set uniformly across findMatch/enterArenaMatch/resume.
+  const waitPeerRef = useRef<(<T>(t: string) => Promise<T>) | null>(null);
+  const ephemeralRef = useRef<KeyPair | null>(null);
 
   const sync = useCallback(() => {
     const dt = dtRef.current;
@@ -337,6 +350,8 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
     peerLeftRef.current = false;
     settlingRef.current = false;
     settleNowRef.current = null;
+    waitPeerRef.current = null;
+    ephemeralRef.current = null;
     setStatus("idle");
     setRole(null);
     setState(null);
@@ -454,17 +469,6 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
     [propose],
   );
 
-  // End the match early by mutual agreement: stop dealing new hands and settle at the current
-  // (between-hands) balances. The current hand finishes first — we never settle mid-pot. Tell the
-  // opponent so their client stops + settles too; if we're already parked at hand_over, settle now.
-  const requestSettle = useCallback(() => {
-    if (endRef.current || settlingRef.current) return;
-    endRef.current = true;
-    setEndRequested(true);
-    channelRef.current?.sendPeer({ t: "endMatch" });
-    if (dtRef.current?.state.phase === "hand_over") settleNowRef.current?.();
-  }, []);
-
   // Bail out on Back: auto-fold this seat's action so the hand ends now, then publish our signed
   // settlement half and leave — the STAYING seat collects our half and submits the close, so we never
   // block on the on-chain settle (~one fold round-trip, then out). The window exits once we're settled.
@@ -480,6 +484,99 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
       settleNowRef.current?.(true);
     else maybeAutoPropose();
   }, [maybeAutoPropose]);
+
+  // Forfeit the live match: concede the whole pot to the opponent. Send a bare `forfeit` intent, await
+  // the peer's co-signed `settleHalf` (its root + forced 0/total, timing out after
+  // FORFEIT_SETTLE_TIMEOUT_MS if the peer never answers), co-sign that exact half, submit the close
+  // (empty body — the peer owns the transcript; backend-down falls back to the wallet-submitted close,
+  // mirroring the module's `settle()`). Fire-once via the shared `settlingRef` guard — mutually
+  // exclusive with the natural-terminal settle. Off a live tunnel (or not actually mid-match — mirrors
+  // battleship/the shared reference's status gate), fall back to `backOut()`.
+  const forfeit = useCallback(() => {
+    const dt = dtRef.current;
+    const ch = channelRef.current;
+    const wp = waitPeerRef.current;
+    const eph = ephemeralRef.current;
+    const selfRole = selfPartyRef.current;
+    if (
+      !dt ||
+      !ch ||
+      !wp ||
+      !eph ||
+      !selfRole ||
+      !account ||
+      (status !== "playing" && status !== "settling")
+    ) {
+      backOut();
+      return;
+    }
+    // Fire-once guard SHARED with the natural-terminal settle: only one settle path may run + await
+    // waitPeer("settleHalf"), else makeInbox's single waiter-per-tag orphans the other.
+    if (settlingRef.current) return;
+    settlingRef.current = true;
+    setStatus("settling");
+    const wallet = account.address;
+    const reads = client as unknown as Parameters<typeof readCreatedAt>[0];
+    const signExec = async (
+      tx: Parameters<typeof signAndExecute>[0]["transaction"],
+    ) => {
+      const r = await signAndExecute({ transaction: tx });
+      return { digest: r.digest };
+    };
+    const coinType = isMtpsConfigured ? MTPS_COIN_TYPE : undefined;
+    void (async () => {
+      try {
+        const { a, b } = dt.protocol.balances(dt.state);
+        await runForfeitClose({
+          dt,
+          wallet,
+          eph,
+          total: a + b,
+          // Single submitter: the seat that stays when a peer bailed out, else seat A by convention —
+          // exactly the gate the module's `settle()` uses.
+          submits: peerLeftRef.current || selfRole === "A",
+          createdAt: () => readCreatedAt(reads, dt.tunnelId),
+          sendForfeit: () => ch.sendPeer({ t: "forfeit" }),
+          awaitPeerHalf: async () => {
+            const other = await wp<{ sig: string; transcriptRoot: string }>(
+              "settleHalf",
+            );
+            return {
+              sig: fromHex(other.sig),
+              root: fromHex(other.transcriptRoot),
+            };
+          },
+          submit: async (co) => {
+            try {
+              await getControlPlaneClient().settle(
+                dt.tunnelId,
+                coSignedToSettleBody(co, []),
+              );
+            } catch (e) {
+              console.error(
+                "[quantum-poker] backend settle failed; falling back to wallet close:",
+                e,
+              );
+              await closeCooperativeWithRoot({
+                signExec: isMtpsConfigured
+                  ? sponsored.signExec
+                  : (signExec as never),
+                tunnelId: dt.tunnelId,
+                settlement: co,
+                coinType,
+              });
+            }
+          },
+        });
+      } catch (e) {
+        console.warn("[quantum-poker] forfeit failed; leaving", e);
+      } finally {
+        // Teardown to the game's terminal phase — mirrors backOut's publish-only settle, so the
+        // window's existing "settled" screen (Play again) handles both outcomes uniformly.
+        setStatus("settled");
+      }
+    })();
+  }, [account, client, signAndExecute, sponsored, backOut, status]);
 
   // Wire the per-move loop, settle triggers, and resume onto a freshly built/rebuilt tunnel.
   // Shared by the live (findMatch) and cold-load (resume) paths. The readiness handshake and the
@@ -524,6 +621,14 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
         AUTO_BOT_CTX,
       );
       autoNonceRef.current = -1n;
+      // Bind the waiter/eph so `forfeit()` can drive its own peer exchange from outside this closure
+      // (mirroring `channelRef`, set by the caller). `waitPeer` is the SAME makeInbox instance the
+      // caller built over `channel` — channel.onPeer allows only one live callback, so a second
+      // makeInbox here would silently replace it and orphan the endMatch listener below. `ephemeral` is
+      // rebuilt from the persisted secret hex so it's set uniformly whether we just came from
+      // findMatch/enterArenaMatch (a live KeyPair) or resume (cold-load, secret hex only).
+      waitPeerRef.current = waitPeer;
+      ephemeralRef.current = keypairFromSecretHex(info.selfEphemeralSecretHex);
 
       // Single cooperative close — at match end, or early once a seat asked to settle. Guarded so
       // both seats' triggers (onConfirmed, the button, the peer's endMatch) close exactly once.
@@ -1271,8 +1376,8 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
     call,
     bet,
     endRequested,
-    requestSettle,
     backOut,
+    forfeit,
     auto,
     setAuto,
     reset,
