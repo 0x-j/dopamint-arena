@@ -92,6 +92,10 @@ impl ControlStore for InMemoryControlStore {
             .or_insert(0) += delta;
     }
 
+    // The in-memory map is already the game index and is enumerated directly in `snapshot`,
+    // so there is nothing to rebuild.
+    async fn seed_stats_index(&self) {}
+
     async fn snapshot(&self) -> StatsSnapshot {
         let actions = self.per_game_actions.read().unwrap();
         let tunnels = self.per_game_tunnels.read().unwrap();

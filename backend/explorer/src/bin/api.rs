@@ -101,12 +101,18 @@ async fn main() -> anyhow::Result<()> {
         let store = state.store.clone();
         let tx = stats_tx.clone();
         tokio::spawn(async move {
-            // Current TPS averages over WINDOW_SECS (smooth — kills the flicker); PEAK is the sharp
-            // 1s-resolution max, maintained DURABLY via bump_peak_tps (GREATEST) so it matches
-            // /v1/stats/history's peak, survives restarts, and stays coherent across replicas. Fetch
-            // a touch more than the window so a 5s rate always has two in-window points under ~1s lag.
-            const WINDOW_SECS: i64 = 5;
-            const FETCH_SECS: i64 = 8;
+            // Current TPS is the counter slope over a WIDE trailing window. It must be wide because
+            // `metric_bucket` is sparse: the fleet's snapshot publishes land only ~every 2-3s (gaps
+            // up to ~13s observed), so a short 5s window held ~2 points — and a single one of those
+            // being a laggy/out-of-order read (the per-second GREATEST collapse only orders WITHIN a
+            // second, not across seconds) drove the slope to 0, i.e. the 1-2M↔0 flicker. Over 30s the
+            // window holds ~10 points and ~30s of real growth dwarfs any single ~2M cross-second dip,
+            // so the number stays a stable trailing rate. Verified on 641 real rows: 27 spurious 0s at
+            // 5s → 0 at 30s. PEAK is separate and stays 1s-resolution (bursts still show there),
+            // maintained durably via bump_peak_tps (GREATEST). FETCH a touch beyond the window so the
+            // oldest in-window bucket is always fetched despite gaps.
+            const WINDOW_SECS: i64 = 30;
+            const FETCH_SECS: i64 = 36;
             const GAP_MAX_SECS: i64 = 10;
             let unix_secs = || {
                 std::time::SystemTime::now()

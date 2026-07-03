@@ -382,7 +382,19 @@ async fn main() -> anyhow::Result<()> {
              to gate house on-chain spend (B5); the gate stays OFF until it is set"
         );
     }
-    stats::spawn_stats_broadcaster(state.clone());
+    // Seed the `stats:games` index (so `snapshot`, which enumerates via the index rather than a
+    // keyspace SCAN, still counts pre-existing games and the total doesn't drop after deploy), then
+    // start the broadcaster. Do it in a spawned task — NOT inline — because the seed runs an
+    // O(cache) SCAN, and blocking boot on it would couple the core relay/matchmaking startup (and
+    // Redis health) to a stats-only scan. `snapshot` degrades gracefully (fewer games) if read
+    // before the seed completes, so the only cost is a brief boot-time under-count.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state.control.seed_stats_index().await;
+            stats::spawn_stats_broadcaster(state);
+        });
+    }
     spawn_action_flusher(state.clone());
 
     // Settle-worker pool (ADR-0029): N workers drain the settle queue, each coalescing a claim

@@ -439,6 +439,25 @@ mod tests {
         assert_eq!(current_tps(&rows, 5), 0.0);
     }
 
+    // The live-flicker fix, distilled: `metric_bucket` is sparse (~1 row per 2-3s), so a short
+    // window holds ~2 points, and a single laggy/out-of-order newest read (the per-second GREATEST
+    // collapse only orders WITHIN a second) drives the slope negative → clamped to 0 → the 1-2M↔0
+    // flicker. A wide window spans enough real growth that one cross-second dip can't zero it. This
+    // is why the derive task uses a 30s window. Reproduced from real dev rows (27 zeros at 5s → 0).
+    #[test]
+    fn current_tps_wide_window_survives_a_sparse_out_of_order_window() {
+        // Sparse ~3s buckets climbing ~800k/s, with the newest bucket a ~1.7M cross-second dip.
+        let rows = [
+            (0i64, 10_000_000i64),
+            (3, 12_400_000),
+            (6, 14_800_000),
+            (9, 17_200_000),
+            (12, 15_500_000), // laggy/out-of-order newest read: below the prior bucket
+        ];
+        assert_eq!(current_tps(&rows, 5), 0.0); // short window: dip dominates → spurious 0 (the bug)
+        assert!(current_tps(&rows, 30) > 300_000.0); // wide window: real growth dominates → stable
+    }
+
     // No divide-by-zero on empty or single-row input.
     #[test]
     fn current_tps_empty_or_single_row_is_zero() {

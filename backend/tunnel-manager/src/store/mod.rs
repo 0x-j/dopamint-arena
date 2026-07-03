@@ -37,7 +37,15 @@ pub trait ControlStore: Send + Sync {
     async fn add_actions(&self, game: &str, delta: u64);
     /// Cumulative counter snapshot. The TPS rate is derived downstream (explorer, from the deduped
     /// `metric_bucket` series), not filled here — raw counters keep derivation single-source.
+    /// Enumerates games via the `stats:games` index (see `seed_stats_index`), NOT by scanning the
+    /// keyspace — this runs every ~500ms on every instance, so it must be O(games), not O(cache).
     async fn snapshot(&self) -> crate::state::StatsSnapshot;
+    /// Rebuild the `stats:games` index from any per-game counters already in the store (one-time
+    /// SCAN at startup). Games are added to the index at write time (`add_actions`/`put_session`),
+    /// but pre-existing counters from before this code shipped, or after a cache flush, would be
+    /// invisible to `snapshot` until re-touched; seeding makes them enumerable immediately so the
+    /// total does not drop. Idempotent — safe on every boot and every replica. No-op in-memory.
+    async fn seed_stats_index(&self);
     /// Append a displayable lifecycle row to the bounded recent-events ring, idempotent by
     /// `tx_digest` (cursor-restart replays and multi-instance indexers must not double-insert).
     async fn push_recent_event(&self, ev: crate::state::TunnelEvent);

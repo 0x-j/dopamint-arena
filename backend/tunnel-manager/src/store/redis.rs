@@ -119,6 +119,11 @@ impl ControlStore for RedisControlStore {
         if let Err(e) = res {
             tracing::warn!(error = %e, "redis put_session incr tunnels failed");
         }
+        // Index the game so `snapshot` enumerates it via `stats:games` (see `add_actions`).
+        let res: Result<i64, _> = self.pool.sadd("stats:games", rec.game.as_str()).await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "redis put_session sadd games index failed");
+        }
         for t in &rec.tunnels {
             let res: Result<(), _> = self
                 .pool
@@ -201,15 +206,40 @@ impl ControlStore for RedisControlStore {
     }
 
     async fn add_actions(&self, game: &str, delta: u64) {
-        // Per-game only: the total is derived in `snapshot` as the sum of per-game keys.
-        // Writing a separate total would be a redundant, single-slot write-hotspot (every
-        // instance, every second) and could diverge from the per-game sum on partial failure.
+        // Bump the per-game counter and record the game in the `stats:games` index. `snapshot`
+        // enumerates games via that index (SMEMBERS + MGET) instead of SCANning the whole cache
+        // every ~500ms — the SCAN was O(cache) (~521k keys → ~2.5s/tick) and starved the live
+        // stats. Total stays the sum of per-game keys (no separate total counter). SADD is
+        // idempotent and O(1); a rare SADD miss self-heals on the next action or the boot seed.
         let res: Result<i64, _> = self
             .pool
             .incr_by(format!("stats:actions:game:{game}"), delta as i64)
             .await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "redis add_actions incr per-game failed");
+        }
+        let res: Result<i64, _> = self.pool.sadd("stats:games", game).await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "redis add_actions sadd games index failed");
+        }
+    }
+
+    async fn seed_stats_index(&self) {
+        // Rebuild `stats:games` from existing per-game counters. This runs the O(cache) SCAN, but
+        // once at startup (not on the ~500ms snapshot path), so its cost is paid off the hot path.
+        let mut games: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for prefix in ["stats:actions:game:", "stats:tunnels:game:"] {
+            for key in self.scan_keys(&format!("{prefix}*")).await {
+                games.insert(key.trim_start_matches(prefix).to_owned());
+            }
+        }
+        if games.is_empty() {
+            return;
+        }
+        let members: Vec<String> = games.into_iter().collect();
+        let res: Result<i64, _> = self.pool.sadd("stats:games", members).await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "redis seed_stats_index sadd failed");
         }
     }
 
@@ -223,27 +253,40 @@ impl ControlStore for RedisControlStore {
             .flatten()
             .unwrap_or(0);
 
+        // Enumerate games from the `stats:games` index and batch-read their counters: SMEMBERS +
+        // two MGETs, instead of a full-keyspace SCAN + a GET per key. The SCAN was O(cache)
+        // (~521k keys → ~2.5s per call) and, run every ~500ms by the broadcaster, throttled live
+        // stats publishing into sparse `metric_bucket` rows. Total is still the sum of per-game
+        // action keys. (MGET requires same-slot keys under cluster mode; the cache is cluster-mode
+        // disabled, so a single MGET is fine.)
+        let games: Vec<String> = self.pool.smembers("stats:games").await.unwrap_or_default();
         let mut total_actions: u64 = 0;
         let mut per_game: HashMap<String, GameStat> = HashMap::new();
-        for (prefix, is_actions) in [
-            ("stats:actions:game:", true),
-            ("stats:tunnels:game:", false),
-        ] {
-            let keys = self.scan_keys(&format!("{prefix}*")).await;
-            for key in keys {
-                let v: i64 = self.pool.get(&key).await.ok().flatten().unwrap_or(0);
-                let game = key.trim_start_matches(prefix).to_owned();
-                let entry = per_game.entry(game).or_insert(GameStat {
-                    tps: 0.0,
-                    tunnels: 0,
-                    total_actions: 0,
-                });
-                if is_actions {
-                    entry.total_actions = v as u64;
-                    total_actions += v as u64;
-                } else {
-                    entry.tunnels = v as u64;
-                }
+        if !games.is_empty() {
+            let action_keys: Vec<String> = games
+                .iter()
+                .map(|g| format!("stats:actions:game:{g}"))
+                .collect();
+            let tunnel_keys: Vec<String> = games
+                .iter()
+                .map(|g| format!("stats:tunnels:game:{g}"))
+                .collect();
+            let action_vals: Vec<Option<i64>> =
+                self.pool.mget(action_keys).await.unwrap_or_default();
+            let tunnel_vals: Vec<Option<i64>> =
+                self.pool.mget(tunnel_keys).await.unwrap_or_default();
+            for (i, game) in games.into_iter().enumerate() {
+                let a = action_vals.get(i).copied().flatten().unwrap_or(0).max(0) as u64;
+                let t = tunnel_vals.get(i).copied().flatten().unwrap_or(0).max(0) as u64;
+                total_actions += a;
+                per_game.insert(
+                    game,
+                    GameStat {
+                        tps: 0.0,
+                        tunnels: t,
+                        total_actions: a,
+                    },
+                );
             }
         }
 
@@ -1416,6 +1459,40 @@ mod tests {
             }
             other => panic!("expected CtrlMsg::Populate, got {other:?}"),
         }
+    }
+
+    // snapshot enumerates games via the `stats:games` index, NOT a keyspace SCAN. A per-game
+    // counter written directly (as pre-deploy data would be) is invisible until `seed_stats_index`
+    // rebuilds the index — which is exactly the startup path that stops the total from dropping to
+    // near-zero after this change ships.
+    #[tokio::test]
+    async fn snapshot_reads_via_games_index_and_seed_recovers_preexisting_counters() {
+        let (_redis, pool) = redis_fixture().await;
+        let s = RedisControlStore::new(pool.clone());
+        // Pre-existing counter written directly, not via add_actions, so it has no index entry.
+        let _: i64 = pool
+            .incr_by("stats:actions:game:legacy", 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.snapshot().await.total_actions,
+            0,
+            "un-indexed counter must not be counted (proves no keyspace SCAN)"
+        );
+        s.seed_stats_index().await; // the startup rebuild
+        let snap = s.snapshot().await;
+        assert_eq!(snap.total_actions, 500, "seed makes the counter enumerable");
+        assert_eq!(snap.per_game["legacy"].total_actions, 500);
+
+        // Multiple games via the normal write path: exercises the SMEMBERS↔MGET index
+        // correspondence that builds `per_game` for routes/ws (order-sensitive, unlike the sum).
+        s.add_actions("ttt", 7).await;
+        s.add_actions("caro", 9).await;
+        let snap = s.snapshot().await;
+        assert_eq!(snap.total_actions, 500 + 7 + 9);
+        assert_eq!(snap.per_game["legacy"].total_actions, 500);
+        assert_eq!(snap.per_game["ttt"].total_actions, 7);
+        assert_eq!(snap.per_game["caro"].total_actions, 9);
     }
 
     // "Total tunnels" is a count-once counter, not a growing SADD set: a replayed Closed event
