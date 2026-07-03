@@ -392,6 +392,83 @@ pub(crate) async fn auth_session(State(state): State<SharedState>, headers: Head
     }
 }
 
+/// Max clock skew / replay window (ms) for a keypair-session proof (below). Wide enough for real
+/// client-clock drift, tight enough that a captured proof can only re-mint the SAME address's token
+/// for a couple of minutes — and re-minting a token the signer could mint anyway grants nothing new.
+const KEYPAIR_SESSION_MAX_SKEW_MS: u64 = 120_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthSessionKeypairRequest {
+    /// The Sui address the caller claims — must equal what `public_key` derives to.
+    address: String,
+    /// The caller's ed25519 public key (hex).
+    public_key: String,
+    /// ed25519 signature (hex) over `keypair_session_message(address, issued_at_ms)`.
+    signature: String,
+    /// Client clock (unix ms) at signing; bounds replay against the server clock.
+    issued_at_ms: u64,
+}
+
+/// Mint a session JWT from a raw keypair self-proof — the NON-zkLogin path onto the B5 gate, for the
+/// walletless flash spectator bot. The caller signs a time-bounded message with its ed25519 key; we
+/// verify the signature AND that the key derives to the claimed address, then bind the JWT to it.
+/// Unlike zkLogin this authorizes ANY key for its OWN address (it proves key control, not humanity),
+/// so on-chain-spend abuse is bounded by the faucet's per-address rate limit, not by this endpoint.
+/// Fails closed (503) when the gate is unconfigured; 401 on any bad/foreign/stale proof.
+pub(crate) async fn auth_session_keypair(
+    State(state): State<SharedState>,
+    Json(req): Json<AuthSessionKeypairRequest>,
+) -> Response {
+    let Some(secret) = state.session_jwt_secret.as_deref() else {
+        return ApiError::resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_disabled",
+            "session auth is not configured (SESSION_JWT_SECRET unset)",
+        )
+        .into_response();
+    };
+    let address = match crate::mp::auth::verify_keypair_session(
+        &req.address,
+        &req.public_key,
+        &req.signature,
+        req.issued_at_ms,
+        unix_now_ms(),
+        KEYPAIR_SESSION_MAX_SKEW_MS,
+    ) {
+        Ok(addr) => addr,
+        Err(reason) => {
+            let msg = match reason {
+                crate::mp::auth::KeypairAuthError::Stale => {
+                    "keypair proof is stale (clock skew or replay window exceeded)"
+                }
+                crate::mp::auth::KeypairAuthError::BadSignature => {
+                    "keypair proof signature is invalid"
+                }
+                crate::mp::auth::KeypairAuthError::AddressMismatch => {
+                    "public key does not derive to the claimed address"
+                }
+            };
+            return ApiError::resp(StatusCode::UNAUTHORIZED, "invalid_identity", msg)
+                .into_response();
+        }
+    };
+    match crate::auth::mint_session_jwt(secret, &address, SESSION_TTL_SECS, unix_now()) {
+        Ok(session_jwt) => Json(AuthSessionResponse {
+            session_jwt,
+            address,
+            expires_in_secs: SESSION_TTL_SECS,
+        })
+        .into_response(),
+        Err(e) => ApiError::resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mint_failed",
+            &e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
 /// Max tunnel opens per batched PTB (Design 1). ~7 catalog games fit comfortably; 30 is a flood cap
 /// well under the ~1024-command / event ceilings (30 games ≈ 120 commands, ≈ 90 events). Larger
 /// requests chunk into ceil(N / 30) PTBs. Matches the frontend deposit-batch cap.
@@ -1135,6 +1212,15 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Unix time in MILLISECONDS — the resolution the keypair-session proof's freshness check compares
+/// against the client's `issued_at_ms`.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 

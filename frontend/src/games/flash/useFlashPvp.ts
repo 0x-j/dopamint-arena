@@ -39,6 +39,8 @@ import {
   reportArenaOpened,
   type ArenaAllocation,
 } from "@/onchain/arenaEnter";
+import { allocateArenaGameForPlay } from "@/onchain/arenaPlay";
+import { mintBotSessionJwt } from "@/onchain/arenaBotSession";
 import {
   consumeArenaEntry,
   subscribeArena,
@@ -117,6 +119,12 @@ interface FlashDeps {
   client: unknown;
   signExec: (tx: never) => Promise<{ digest: string }>;
   sponsoredSignExec: (tx: never) => Promise<{ digest: string }>;
+  /** Stake-coin pickers for the shared arena deposit (`allocateArenaGameForPlay`), same as every
+   *  other game's PvP deps: faucet-top-up + coin-merge so the sponsored deposit works with a
+   *  zero-gas wallet and fragmented MTPS coins. */
+  prepareStake: (min: bigint) => Promise<string>;
+  selectStakeCoin: (min: bigint) => Promise<string>;
+  ensureStakeBalance: (min: bigint) => Promise<void>;
   report: TelemetryWriter;
 }
 
@@ -262,8 +270,11 @@ class FlashPvpSession {
     this.emit();
   };
 
-  /** Start a chat. First try the real arena; if no bot is available locally,
-   *  fall back to an in-browser local protocol session so the UI works offline. */
+  /** Start a chat. Reserve a bot + fund seat A through the SAME shared arena-Play path every other
+   *  game uses (`allocateArenaGameForPlay`): a sponsored, faucet-topped-up, coin-merging staked
+   *  deposit that works with a zero-gas wallet and fragmented MTPS coins, and authenticates the
+   *  allocate via `enterArena` (B5). If no backend bot is free, fall back to an in-browser local
+   *  session so the UI still works offline. */
   start = async () => {
     if (this.spectator) return this.startSpectator();
     const deps = this.deps;
@@ -278,30 +289,27 @@ class FlashPvpSession {
     this.emit();
 
     try {
-      const eph = generateKeyPair();
-      const allocs = await allocateArenaBots(
-        [{ id: FLASH_ARENA_GAME_ID, userEphPubkey: toHex(eph.publicKey) }],
-        deps.account.address,
-        { apiBase: resolveBackendUrl() },
-      );
-      if (allocs.length === 0) {
-        // No backend bot available → local protocol session.
+      const entry = await allocateArenaGameForPlay({
+        arenaGameId: FLASH_ARENA_GAME_ID,
+        wallet: deps.account.address,
+        label: FLASH_ARENA_GAME_ID,
+        stakePerGame: STAKE,
+        stake: {
+          sponsoredSignExec: deps.sponsoredSignExec as never,
+          walletSignExec: deps.signExec as never,
+          prepareStake: deps.prepareStake,
+          selectStakeCoin: deps.selectStakeCoin,
+          ensureStakeBalance: deps.ensureStakeBalance,
+        },
+      });
+      if (!entry) {
+        // No backend bot available → in-browser local session.
         this.startLocalMatch();
         return;
       }
-      // Real arena path: requestArenaGame deposits seat A and publishes the entry;
-      // the arena-store consumer below calls enterArenaMatch.
-      void requestArenaGame(FLASH_ARENA_GAME_ID, deps.account.address).catch(
-        (e) => {
-          this.error = String((e as Error)?.message ?? e);
-          this.status = "error";
-          this.emit();
-        },
-      );
+      this.enterArenaMatch(entry.allocation, entry.keypair);
     } catch (e) {
-      this.error = String((e as Error)?.message ?? e);
-      this.status = "error";
-      this.emit();
+      this.fail(e);
     }
   };
 
@@ -326,16 +334,23 @@ class FlashPvpSession {
     this.emit();
 
     try {
+      const bot = this.ensureSpectatorBot();
       const botAddress = deps.account.address;
       const botSignExec = deps.signExec;
       const reads = deps.client as unknown as SuiReads;
       const eph = generateKeyPair();
 
-      // 1. Reserve a backend bot for seat B (the fleet pre-creates + funds seat B's half).
+      // 1. Authenticate the walletless bot onto the B5 gate: it self-signs a proof with its own
+      // ed25519 key and mints a session JWT bound to its OWN address (`/v1/auth/session/keypair`).
+      // No zkLogin needed. `undefined` when the gate is off — allocate then proceeds unauthenticated.
+      const sessionJwt = await mintBotSessionJwt(bot.keypair, {
+        apiBase: resolveBackendUrl(),
+      });
+      // 2. Reserve a backend bot for seat B (the fleet pre-creates + funds seat B's half).
       const allocs = await allocateArenaBots(
         [{ id: FLASH_ARENA_GAME_ID, userEphPubkey: toHex(eph.publicKey) }],
         botAddress,
-        { apiBase: resolveBackendUrl() },
+        { apiBase: resolveBackendUrl(), sessionJwt },
       );
       const alloc = allocs[0];
       if (!alloc) {
@@ -344,7 +359,7 @@ class FlashPvpSession {
         return;
       }
 
-      // 2. Deposit seat A with the BOT's own sponsored signer (no wallet), funded from MTPS faucet.
+      // 3. Deposit seat A with the BOT's own sponsored signer (no wallet), funded from MTPS faucet.
       const amount = BigInt(alloc.stakeEach);
       await ensureMtpsAddressBalance({
         client: deps.client as never,
@@ -366,7 +381,7 @@ class FlashPvpSession {
         stakeFromBalance: { amount, coinType: MTPS_COIN_TYPE },
       });
 
-      // 3. Announce the join so the fleet cues seat B, then wire the relay as seat A.
+      // 4. Announce the join so the fleet cues seat B, then wire the relay as seat A.
       await reportArenaOpened(
         [{ matchId: alloc.matchId, tunnelId: alloc.tunnelId }],
         { apiBase: resolveBackendUrl() },
@@ -884,6 +899,9 @@ export function useFlashPvp(
       client,
       signExec: botSignExec,
       sponsoredSignExec: botSignExec,
+      prepareStake: sponsored.prepareStake,
+      selectStakeCoin: sponsored.selectStakeCoin,
+      ensureStakeBalance: sponsored.ensureStakeBalance,
       report,
     };
   } else {
@@ -897,6 +915,9 @@ export function useFlashPvp(
         return { digest: r.digest };
       }) as never,
       sponsoredSignExec: sponsored.signExec as never,
+      prepareStake: sponsored.prepareStake,
+      selectStakeCoin: sponsored.selectStakeCoin,
+      ensureStakeBalance: sponsored.ensureStakeBalance,
       report,
     };
   }

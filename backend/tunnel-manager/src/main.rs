@@ -482,6 +482,11 @@ async fn main() -> anyhow::Result<()> {
         // Session auth (B5): exchange a fresh Enoki id_token for a short-lived session JWT that gates
         // `/v1/arena/allocate`. Enforced only when SESSION_JWT_SECRET is set (else the gate is off).
         .route("/v1/auth/session", post(routes::auth_session))
+        // Non-zkLogin session mint: a raw keypair self-proof (walletless flash spectator bot).
+        .route(
+            "/v1/auth/session/keypair",
+            post(routes::auth_session_keypair),
+        )
         .route("/v1/chat", post(routes::chat))
         .route("/v1/chat/topic", get(routes::chat_topic))
         .route("/v1/chat/live/publish", post(routes::chat_publish))
