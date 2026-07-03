@@ -2,7 +2,9 @@
 //! one message per move. Fixed-size rolling-digest state; nominal stake, no
 //! value movement; move count capped at 1,000,000 (`FLASH_MAX_MOVES`).
 
+pub mod responder;
 pub mod strategy;
+pub use responder::{ChatReply, ChatResponder, ChatRole, ChatTurn};
 pub use strategy::FlashStrategy;
 
 use markov_str::MarkovChain;
@@ -12,7 +14,7 @@ use tunnel_core::crypto::blake2b256;
 use tunnel_harness::{Balances, Protocol, ProtocolError, Seat, TunnelContext};
 
 const DOMAIN: &[u8] = b"sui_tunnel::proto::flash.v1";
-const MAX_MESSAGE_BYTES: usize = 256;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct FlashState {

@@ -5,7 +5,6 @@ import { FlashMessage } from "./components/FlashMessage";
 import { FlashInput } from "./components/FlashInput";
 import { canSend } from "./session-core";
 import { useFlashPvp } from "./useFlashPvp";
-import { useFlashSpectator } from "./useFlashSpectator";
 import "./flash.css";
 
 /** Auto-scroll a message container to the bottom whenever its deps change. */
@@ -122,29 +121,38 @@ function PlayTab({ windowId }: { windowId: string }) {
     </>
   );
 }
-function SpectatorTab(_props: { windowId: string }) {
-  const { messages, running, error, start, stop } = useFlashSpectator();
-  const bodyRef = useScrollToBottom([messages]);
-  const last = messages.at(-1);
+function SpectatorTab({ windowId }: { windowId: string }) {
+  // Spectator = the Play arena flow, auto-driven: the browser bot plays seat A against the
+  // co-located backend bot on seat B, over the relay. A distinct session key keeps it separate
+  // from the Play tab's session in the same window.
+  const { status, messages, error, state, start, endChat, reset } = useFlashPvp(
+    windowId,
+    { sessionKey: `${windowId}::spectator`, auto: true },
+  );
+  const bodyRef = useScrollToBottom([messages, status]);
+  const running = status === "playing" || status === "joining";
+  const moveNo = state ? Number(state.messageCount) : 0;
   return (
     <>
       <div className="flash-head">
         <span>Bot vs Bot</span>
         <span className="flash-counter">
-          {last
-            ? `move #${last.moveNo.toLocaleString()} · ${messages.length} shown`
-            : "idle"}
+          {status === "idle"
+            ? "idle"
+            : `move #${moveNo.toLocaleString()} · ${status}`}
         </span>
       </div>
       <div className="flash-body" ref={bodyRef}>
         {error && <div style={{ color: "var(--sketch-red)" }}>{error}</div>}
-        {messages.length === 0 && <p>Press Start to watch two bots chat.</p>}
-        {messages.map((m) => (
+        {status === "idle" && (
+          <p>Press Start to watch two bots chat over a tunnel.</p>
+        )}
+        {messages.map((m, i) => (
           <FlashMessage
-            key={`${m.sender}-${m.moveNo}`}
-            sender={m.sender}
+            key={`${m.sender}-${i}`}
+            sender={m.sender === "You" ? "Bot A" : "Bot B"}
             text={m.text}
-            isMe={m.sender === "B"}
+            isMe={m.sender === "You"}
           />
         ))}
       </div>
@@ -155,7 +163,7 @@ function SpectatorTab(_props: { windowId: string }) {
         <button
           className="flash-btn flash-btn--stop"
           disabled={!running}
-          onClick={stop}
+          onClick={() => (status === "joining" ? reset() : endChat())}
         >
           Stop
         </button>

@@ -1,5 +1,6 @@
-//! Thin proxy client for a local Ollama instance.
-// TODO(chat-v2): remove this allow once a route actually consumes the client.
+//! Thin proxy client for a local Ollama instance. The live consumer is [`OllamaClient::reply`]
+//! (the flash chat bot, via `flash_responder`); `chat`/`topic` are retained for tests and future
+//! chat-v2 routes, hence the module-level dead-code allowance.
 #![allow(dead_code)]
 
 use std::time::Duration;
@@ -10,6 +11,14 @@ use serde::{Deserialize, Serialize};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TOPIC_PROMPT: &str =
     "Give me one short, fun conversation topic for two chat bots. Answer with the topic only, no extra text.";
+
+/// Output-token cap for a chat reply. Flash frames are 256 bytes; a short cap also keeps the bot
+/// fast (generation time is roughly linear in tokens produced).
+const REPLY_NUM_PREDICT: u32 = 64;
+
+/// Keep the model resident between replies so back-to-back turns skip the cold-load penalty — the
+/// single biggest latency win for a live chat loop.
+const REPLY_KEEP_ALIVE: &str = "10m";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaMessage {
@@ -29,11 +38,29 @@ struct OllamaChatResponse {
     message: OllamaMessage,
 }
 
-#[derive(Debug)]
+/// Cheap to clone — `reqwest::Client` is an `Arc` handle over a shared connection pool, so every
+/// clone reuses the same warm connections. The co-located flash bot clones one per match.
+#[derive(Debug, Clone)]
 pub struct OllamaClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+}
+
+/// Tuning knobs for a low-latency reply. Serialized into Ollama's `options` object.
+#[derive(Debug, Serialize)]
+struct OllamaOptions {
+    num_predict: u32,
+    temperature: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaReplyRequest<'a> {
+    model: &'a str,
+    messages: &'a [OllamaMessage],
+    stream: bool,
+    keep_alive: &'a str,
+    options: OllamaOptions,
 }
 
 impl OllamaClient {
@@ -68,6 +95,35 @@ impl OllamaClient {
             .send()
             .await
             .context("ollama request failed")?
+            .error_for_status()
+            .context("ollama returned error")?
+            .json()
+            .await
+            .context("ollama returned non-json")?;
+        Ok(resp.message.content)
+    }
+
+    /// Low-latency chat reply for the live flash bot: caps output length, keeps the model warm, and
+    /// reuses the pooled HTTP client. Non-streaming — one flash move carries one whole message.
+    pub async fn reply(&self, messages: &[OllamaMessage]) -> anyhow::Result<String> {
+        let url = format!("{}/api/chat", self.base_url);
+        let req = OllamaReplyRequest {
+            model: &self.model,
+            messages,
+            stream: false,
+            keep_alive: REPLY_KEEP_ALIVE,
+            options: OllamaOptions {
+                num_predict: REPLY_NUM_PREDICT,
+                temperature: 0.8,
+            },
+        };
+        let resp: OllamaChatResponse = self
+            .http
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .context("ollama reply request failed")?
             .error_for_status()
             .context("ollama returned error")?
             .json()

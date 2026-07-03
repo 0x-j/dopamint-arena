@@ -19,6 +19,12 @@ pub trait MoveStrategy<P: Protocol>: Send + Sync + 'static {
     /// committed into the local party runtime.
     fn confirm_move(&mut self, _state: &P::State) {}
 
+    /// Called after the *peer's* move is committed into the local party runtime,
+    /// with the decoded move. This is the only place a strategy sees the peer's
+    /// plaintext (the co-signed state exposes just the folded digest), so an
+    /// LLM-backed strategy taps it here to build its reply context. Default no-op.
+    fn observe_peer_move(&mut self, _mv: &P::Move) {}
+
     /// Called when the driver exits with an error before normal completion.
     fn abort(&mut self) {}
 }

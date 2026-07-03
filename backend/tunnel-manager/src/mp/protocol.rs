@@ -66,7 +66,13 @@ pub enum ClientMsg {
     /// the server completes the `MatchRecord` and replies `MatchFound` (always party A). Valid only
     /// after `Connect`; authorized by wallet == the match's allocator.
     #[serde(rename = "arena.join")]
-    ArenaJoin { match_id: String },
+    ArenaJoin {
+        match_id: String,
+        /// Flash Play (chat) mode opts the co-located bot into LLM replies. Absent/false (Spectator,
+        /// every non-chat game, older clients) keeps the offline Markov reply. Wire field: `chatLlm`.
+        #[serde(default)]
+        chat_llm: bool,
+    },
 }
 
 /// Messages the server sends to the client. `Deserialize` is for the co-located fleet (ADR-0027):
@@ -218,12 +224,29 @@ mod tests {
     // pre-allocated match. A rename of the tag or `matchId` field silently breaks that join.
     #[test]
     fn client_arena_join_deserializes_dotted_name() {
+        // Older clients omit `chatLlm`; it must default to false (Markov reply), not fail to parse.
         let m: ClientMsg =
             serde_json::from_str(r#"{"type":"arena.join","matchId":"arena_7"}"#).unwrap();
         assert_eq!(
             m,
             ClientMsg::ArenaJoin {
-                match_id: "arena_7".into()
+                match_id: "arena_7".into(),
+                chat_llm: false,
+            }
+        );
+    }
+
+    // Flash Play sends `chatLlm:true` to route the co-located bot to LLM replies.
+    #[test]
+    fn client_arena_join_reads_chat_llm_flag() {
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"type":"arena.join","matchId":"arena_7","chatLlm":true}"#)
+                .unwrap();
+        assert_eq!(
+            m,
+            ClientMsg::ArenaJoin {
+                match_id: "arena_7".into(),
+                chat_llm: true,
             }
         );
     }

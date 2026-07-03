@@ -594,6 +594,9 @@ where
                     // stale ACK handled as a no-op must not advance the move count. The per-tunnel
                     // gate must clear only on a real commit, so drain accounting stays balanced.
                     if let Some(entry) = seat.take_last_committed() {
+                        // The peer's move just committed — hand the strategy the decoded plaintext
+                        // (its one window onto the peer's actual message) before it plans a reply.
+                        move_strategy.observe_peer_move(&entry.mv);
                         moves += 1;
                         let ev = MoveCommitted {
                             by: our_seat.other(),
@@ -948,6 +951,31 @@ mod tests {
 
         fn abort(&mut self) {
             self.aborted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Seat A proposes the single move; seat B only listens. `observed` counts how many
+    /// times this seat's `observe_peer_move` fired — the hook an LLM strategy relies on.
+    struct ObservingStrategy {
+        seat: Seat,
+        observed: Arc<AtomicU64>,
+    }
+
+    impl MoveStrategy<OneMoveProtocol> for ObservingStrategy {
+        async fn plan_move(
+            &mut self,
+            state: &OneMoveState,
+            seat: Seat,
+            _ctx: &crate::MoveStrategyContext,
+        ) -> Option<OneMove> {
+            if self.seat == Seat::A && seat == Seat::A && !state.moved {
+                return Some(OneMove);
+            }
+            None
+        }
+
+        fn observe_peer_move(&mut self, _mv: &OneMove) {
+            self.observed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1650,6 +1678,55 @@ mod tests {
         assert_eq!(planned.load(Ordering::Relaxed), 1);
         assert_eq!(confirmed.load(Ordering::Relaxed), 1);
         assert_eq!(aborted.load(Ordering::Relaxed), 0);
+    }
+
+    // The driver must hand the receiving seat its peer's committed move via `observe_peer_move`
+    // (and never fire it for the seat's own move): the seam an LLM strategy uses to read the
+    // opponent's plaintext, which the co-signed state otherwise hides behind the folded digest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strategy_observes_only_the_peers_committed_move() {
+        let secret_a: [u8; 32] = std::array::from_fn(|i| (i + 1) as u8);
+        let secret_b: [u8; 32] = std::array::from_fn(|i| (i + 33) as u8);
+        let pk_a = keypair_from_secret(&secret_a).public_key();
+        let pk_b = keypair_from_secret(&secret_b).public_key();
+        let (ch_a, ch_b) = InMemoryFrameTransport::pair();
+        let observed_a = Arc::new(AtomicU64::new(0));
+        let observed_b = Arc::new(AtomicU64::new(0));
+
+        let anchor = InMemoryAnchor::with_fixed_id("0x1");
+        let driver_a = PartyDriver::new(
+            parts(Seat::A, &secret_a, pk_b),
+            ObservingStrategy {
+                seat: Seat::A,
+                observed: Arc::clone(&observed_a),
+            },
+            ch_a,
+            anchor.clone(),
+            NullTranscriptRecorder,
+        );
+        let driver_b = PartyDriver::new(
+            parts(Seat::B, &secret_b, pk_a),
+            ObservingStrategy {
+                seat: Seat::B,
+                observed: Arc::clone(&observed_b),
+            },
+            ch_b,
+            anchor.clone(),
+            NullTranscriptRecorder,
+        );
+
+        let (out_a, out_b) = tokio::join!(driver_a.run(10, || 1), driver_b.run(10, || 1));
+        out_a.unwrap();
+        out_b.unwrap();
+
+        // B received A's single move → observed exactly once; A proposed its own move and received
+        // nothing back, so its peer-observe hook never fires.
+        assert_eq!(observed_b.load(Ordering::Relaxed), 1, "B observes A's move");
+        assert_eq!(
+            observed_a.load(Ordering::Relaxed),
+            0,
+            "a seat never observes its own move"
+        );
     }
 
     // Silently drops the first frame this seat sends, then behaves normally — models

@@ -101,6 +101,9 @@ pub async fn join_and_spawn(
     match_id: &str,
     user_conn: ConnRef,
     wallet: &str,
+    // Flash Play (chat) mode opts in via the `arena.join` message; the co-located bot then answers
+    // with the LLM. Spectator (bot-vs-bot) and every non-chat game leave it false → Markov reply.
+    chat_llm: bool,
 ) -> Result<(), &'static str> {
     let rec = match state.mp.claim_arena(match_id, wallet).await {
         ArenaClaim::Claimed(rec) => rec,
@@ -175,6 +178,17 @@ pub async fn join_and_spawn(
     // Stream this match's co-signed transcript to S3 during play (both `None` = no S3, dev/test).
     let chunk_upload_tx = state.chunk_upload_tx.clone();
     let chunk_writer = state.chunk_writer.clone();
+    // Flash chat mode: hand the bot an Ollama-backed reply oracle. It falls back to the offline
+    // Markov reply on any miss, so a missing/slow model never stalls the match. Only built when the
+    // joining client opted in (Play, not Spectator) and only consumed by the flash arm.
+    let responder: Option<std::sync::Arc<dyn tunnel_flash::ChatResponder>> = if chat_llm {
+        tracing::info!(match_id, "flash chat: LLM reply oracle attached");
+        Some(std::sync::Arc::new(
+            crate::flash_responder::OllamaFlashResponder::new(state.ollama.clone()),
+        ))
+    } else {
+        None
+    };
     tokio::spawn(async move {
         if let Err(e) = drive_arena_bot(
             &rec.game,
@@ -186,6 +200,7 @@ pub async fn join_and_spawn(
             conn,
             chunk_upload_tx,
             chunk_writer,
+            responder,
         )
         .await
         {
@@ -210,6 +225,7 @@ async fn drive_arena_bot(
     conn: std::sync::Arc<BusRelayConnection>,
     chunk_upload_tx: Option<tokio::sync::mpsc::Sender<ChunkUpload>>,
     chunk_writer: Option<std::sync::Arc<dyn TranscriptChunkWriter>>,
+    responder: Option<std::sync::Arc<dyn tunnel_flash::ChatResponder>>,
 ) -> anyhow::Result<()> {
     let transport = BusRelayTransport::new(conn.clone(), match_id.to_owned());
     let channel = MatchChannel::new(transport);
@@ -238,6 +254,7 @@ async fn drive_arena_bot(
         tunnel_id,
         chunk_upload_tx,
         chunk_writer,
+        responder,
     )
     .await?;
     tracing::info!(
@@ -264,6 +281,9 @@ async fn play_game(
     tunnel_id: &str,
     chunk_upload_tx: Option<tokio::sync::mpsc::Sender<ChunkUpload>>,
     chunk_writer: Option<std::sync::Arc<dyn TranscriptChunkWriter>>,
+    // Flash chat mode only: the LLM reply oracle. `None` → the offline Markov reply; every other
+    // game ignores it (they aren't chat protocols).
+    responder: Option<std::sync::Arc<dyn tunnel_flash::ChatResponder>>,
 ) -> anyhow::Result<u64> {
     // Every game drives the identical party-B seam (Role::B + a fresh transcript recorder); only the
     // protocol's `play_*` entry differs, so each game is one arm. The recorder folds the O(log N) root
@@ -271,6 +291,7 @@ async fn play_game(
     // uploader (`chunk_upload_tx`); `finish()` flushes the tail + seals the manifest via `chunk_writer`.
     // A clone drives the game while the retained handle finishes. Both `None` (dev/test) → root only.
     macro_rules! play {
+        // Standard games: fixed party-B seam, no extra strategy input.
         ($play_fn:ident) => {{
             let recorder = S3StreamingRecorder::new(tunnel_id, chunk_upload_tx, chunk_writer);
             // Seal on EVERY terminal exit, including abandon: a disconnect makes `$play_fn` return
@@ -289,6 +310,22 @@ async fn play_game(
             recorder.finish().await;
             result?
         }};
+        // Flash chat: same seam plus the optional LLM responder (last arg).
+        ($play_fn:ident, $responder:expr) => {{
+            let recorder = S3StreamingRecorder::new(tunnel_id, chunk_upload_tx, chunk_writer);
+            let result = $play_fn(
+                channel,
+                anchor,
+                match_key,
+                Role::B,
+                opponent_wallet,
+                recorder.clone(),
+                $responder,
+            )
+            .await;
+            recorder.finish().await;
+            result?
+        }};
     }
     let outcome = match game {
         "blackjack" => play!(play_blackjack_v2),
@@ -300,7 +337,7 @@ async fn play_game(
         "caro" => play!(play_caro),
         "battleship" => play!(play_battleship),
         "regular_payments" => play!(play_regular_payments),
-        "flash" => play!(play_flash),
+        "flash" => play!(play_flash, responder),
         other => bail!("co-located fleet has no protocol wired for game '{other}'"),
     };
     Ok(outcome.moves)
@@ -379,12 +416,12 @@ mod tests {
             .await;
 
         let c1 = BusRelayConnection::register(state.clone());
-        join_and_spawn(&state, &slot.match_id, c1.conn_ref(), "0xuser")
+        join_and_spawn(&state, &slot.match_id, c1.conn_ref(), "0xuser", false)
             .await
             .expect("first join claims + spawns");
         let c2 = BusRelayConnection::register(state.clone());
         assert_eq!(
-            join_and_spawn(&state, &slot.match_id, c2.conn_ref(), "0xuser").await,
+            join_and_spawn(&state, &slot.match_id, c2.conn_ref(), "0xuser", false).await,
             Err("unknown_arena_match"),
             "a second join finds the match already claimed"
         );
@@ -411,7 +448,7 @@ mod tests {
             .await;
         let c = BusRelayConnection::register(state.clone());
         assert_eq!(
-            join_and_spawn(&state, &slot.match_id, c.conn_ref(), "0xattacker").await,
+            join_and_spawn(&state, &slot.match_id, c.conn_ref(), "0xattacker", false).await,
             Err("unknown_arena_match"),
             "only the allocator may join"
         );
@@ -458,7 +495,7 @@ mod tests {
 
         // Human side: register the relay conn (the WS), then join — which claims + spawns the bot HERE.
         let human_conn = BusRelayConnection::register(state.clone());
-        join_and_spawn(&state, &match_id, human_conn.conn_ref(), "0xuser")
+        join_and_spawn(&state, &match_id, human_conn.conn_ref(), "0xuser", false)
             .await
             .expect("join claims the reservation and spawns the bot");
 

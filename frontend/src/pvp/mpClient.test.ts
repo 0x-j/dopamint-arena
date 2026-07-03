@@ -123,6 +123,12 @@ test("joinMatch sends arena.join with the matchId and resolves on its match.foun
     true,
     "expected an arena.join frame for arena_7",
   );
+  // Without the opt-in there is no chatLlm flag (server defaults to the offline reply).
+  assert.equal(
+    sent.some((m) => m.type === "arena.join" && "chatLlm" in m),
+    false,
+    "arena.join omits chatLlm unless opted in",
+  );
   // The server replies with match.found for the bound match; the waiter resolves with it.
   ws.recv({
     type: "match.found",
@@ -135,6 +141,24 @@ test("joinMatch sends arena.join with the matchId and resolves on its match.foun
   assert.equal(info.matchId, "arena_7");
   assert.equal(info.role, "A");
   assert.equal(info.game, "quantum_poker");
+});
+
+test("joinMatch carries chatLlm when opted in (flash chat mode)", async () => {
+  const { mp } = mkClient();
+  await connect(mp);
+  const ws = FakeWebSocket.instances[0];
+  void mp.joinMatch("arena_9", { chatLlm: true });
+  const sent = ws.sent.map((s) => JSON.parse(s));
+  assert.equal(
+    sent.some(
+      (m) =>
+        m.type === "arena.join" &&
+        m.matchId === "arena_9" &&
+        m.chatLlm === true,
+    ),
+    true,
+    "expected arena.join with chatLlm:true",
+  );
 });
 
 test("relay handlers and match waiters survive the socket swap", async () => {

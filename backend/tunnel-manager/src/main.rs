@@ -7,6 +7,7 @@ mod config;
 mod enoki;
 mod error;
 mod flash_loop;
+mod flash_responder;
 mod flash_store;
 mod fleet;
 mod mp;

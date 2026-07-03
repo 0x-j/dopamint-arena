@@ -343,8 +343,15 @@ export class MpClient {
    *  Never consumes the `#matchQueue` buffer: a buffered `match.found` belongs to a prior
    *  `quickMatch` (a different match id), so stealing it would cross-wire the arena join. The
    *  arena match's own `match.found` arrives after the bot binds and resolves this waiter. */
-  joinMatch(matchId: string): Promise<MatchInfo> {
-    this.#send({ type: "arena.join", matchId });
+  joinMatch(matchId: string, opts?: { chatLlm?: boolean }): Promise<MatchInfo> {
+    // `chatLlm` opts the co-located bot into LLM replies (flash Play/chat mode only). Omitted for
+    // every other game and for flash Spectator, which keep the server's default offline reply.
+    const frame: { type: "arena.join"; matchId: string; chatLlm?: boolean } = {
+      type: "arena.join",
+      matchId,
+    };
+    if (opts?.chatLlm) frame.chatLlm = true;
+    this.#send(frame);
     return new Promise((resolve, reject) =>
       this.#matchWaiters.push({ resolve, reject }),
     );

@@ -5,6 +5,7 @@ import {
   useSuiClient,
 } from "@mysten/dapp-kit";
 import { generateKeyPair, type KeyPair } from "sui-tunnel-ts/core/crypto";
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { defaultBackend } from "sui-tunnel-ts/core/crypto-native";
 import { makeEndpoint } from "sui-tunnel-ts/core/tunnel";
 import { fromHex, toHex } from "sui-tunnel-ts/core/bytes";
@@ -21,12 +22,23 @@ import {
 import { resolveBackendUrl } from "@/backend/controlPlane";
 import {
   closeCooperativeWithRoot,
+  depositSeatAMany,
   readCreatedAt,
   type SuiReads,
 } from "@/onchain/tunnelTx";
 import { useSponsoredSignExec } from "@/onchain/useSponsoredSignExec";
-import { isMtpsConfigured, MTPS_COIN_TYPE } from "@/onchain/mtps";
-import { allocateArenaBots, type ArenaAllocation } from "@/onchain/arenaEnter";
+import { makeKeypairSponsoredSignExec } from "@/onchain/sponsor";
+import {
+  ensureMtpsAddressBalance,
+  isMtpsAddressBalance,
+  isMtpsConfigured,
+  MTPS_COIN_TYPE,
+} from "@/onchain/mtps";
+import {
+  allocateArenaBots,
+  reportArenaOpened,
+  type ArenaAllocation,
+} from "@/onchain/arenaEnter";
 import {
   consumeArenaEntry,
   subscribeArena,
@@ -61,8 +73,13 @@ import {
   type FlashChatMessage,
   type FlashSessionStatus,
 } from "./session-core";
+import { flashSpectatorReply } from "./flashReplies";
 
 export const FLASH_ARENA_GAME_ID = "flash";
+
+/** Cadence between the browser bot's auto-sent messages in spectator mode. Flash is strict A/B
+ *  alternation, so the real rate is bounded by the relay round-trip; this just paces it watchably. */
+const SPECTATOR_AUTO_PACE_MS = 250;
 
 const STAKE = 1n;
 const LOCAL_REPLY_DELAY_MS = 500;
@@ -160,6 +177,27 @@ class FlashPvpSession {
   private txnId = 0;
   /** Guards the once-per-mount cold-load resume attempt. */
   private resumeTried = false;
+  /** Spectator mode: seat A is a self-funded browser bot (no wallet), not the connected user. Set by
+   *  the hook when `auto` is on. Routes `start` to the self-funded allocate path and keeps this
+   *  session off the shared arena store, so Play and Spectator never contend. */
+  spectator = false;
+  /** The spectator's self-funded seat-A bot identity — created once, reused across restarts. */
+  private spectatorBot: { keypair: Ed25519Keypair; address: string } | null =
+    null;
+
+  /** The spectator seat-A bot (created once per session). Its own ephemeral wallet — gas is
+   *  sponsored and MTPS is faucet-funded, so it needs no connected wallet (bjBots-style). */
+  ensureSpectatorBot(): { keypair: Ed25519Keypair; address: string } {
+    if (!this.spectatorBot) {
+      const seed = generateKeyPair().secretKey;
+      const keypair = Ed25519Keypair.fromSecretKey(seed);
+      this.spectatorBot = {
+        keypair,
+        address: keypair.getPublicKey().toSuiAddress(),
+      };
+    }
+    return this.spectatorBot;
+  }
 
   /** Persist the visible chat alongside the resume record so a reload keeps the bubbles. */
   private persistMessages() {
@@ -227,6 +265,7 @@ class FlashPvpSession {
   /** Start a chat. First try the real arena; if no bot is available locally,
    *  fall back to an in-browser local protocol session so the UI works offline. */
   start = async () => {
+    if (this.spectator) return this.startSpectator();
     const deps = this.deps;
     if (!deps?.account) {
       this.error = "connect a wallet first";
@@ -263,6 +302,78 @@ class FlashPvpSession {
       this.error = String((e as Error)?.message ?? e);
       this.status = "error";
       this.emit();
+    }
+  };
+
+  /**
+   * Spectator start: the self-funded browser bot (seat A) runs the arena allocate flow ITSELF —
+   * no connected wallet, no shared arena store. It reserves a backend bot for seat B, deposits its
+   * own seat A (`depositSeatAMany`, gas sponsored + MTPS faucet-funded), reports the join, then wires
+   * the relay via the shared `enterArenaMatch`. The backend co-located bot fills seat B; the two then
+   * exchange over the relay (moves counted by `relay_to_other`) with the auto-driver typing seat A.
+   */
+  private startSpectator = async () => {
+    const deps = this.deps;
+    if (!deps?.account) return; // hook sets a bot account for spectator sessions
+    if (!isMtpsConfigured || !isMtpsAddressBalance) {
+      this.error = "MTPS address-balance mode is required (VITE_MTPS_* env).";
+      this.status = "error";
+      this.emit();
+      return;
+    }
+    this.error = null;
+    this.status = "joining";
+    this.emit();
+
+    try {
+      const botAddress = deps.account.address;
+      const botSignExec = deps.signExec;
+      const reads = deps.client as unknown as SuiReads;
+      const eph = generateKeyPair();
+
+      // 1. Reserve a backend bot for seat B (the fleet pre-creates + funds seat B's half).
+      const allocs = await allocateArenaBots(
+        [{ id: FLASH_ARENA_GAME_ID, userEphPubkey: toHex(eph.publicKey) }],
+        botAddress,
+        { apiBase: resolveBackendUrl() },
+      );
+      const alloc = allocs[0];
+      if (!alloc) {
+        // No free backend bot → offline fallback so the UI still works (no relay, no TPS).
+        this.startLocalMatch();
+        return;
+      }
+
+      // 2. Deposit seat A with the BOT's own sponsored signer (no wallet), funded from MTPS faucet.
+      const amount = BigInt(alloc.stakeEach);
+      await ensureMtpsAddressBalance({
+        client: deps.client as never,
+        signExec: botSignExec as never,
+        owner: botAddress,
+        need: amount,
+      });
+      await depositSeatAMany({
+        reads,
+        signExec: botSignExec as never,
+        specs: [
+          {
+            tunnelId: alloc.tunnelId,
+            partyA: { address: botAddress, publicKey: eph.publicKey },
+            amount,
+          },
+        ],
+        coinType: MTPS_COIN_TYPE,
+        stakeFromBalance: { amount, coinType: MTPS_COIN_TYPE },
+      });
+
+      // 3. Announce the join so the fleet cues seat B, then wire the relay as seat A.
+      await reportArenaOpened(
+        [{ matchId: alloc.matchId, tunnelId: alloc.tunnelId }],
+        { apiBase: resolveBackendUrl() },
+      );
+      this.enterArenaMatch(alloc, eph);
+    } catch (e) {
+      this.fail(e);
     }
   };
 
@@ -616,7 +727,11 @@ class FlashPvpSession {
         );
         this.mp = mp;
         await mp.connect();
-        const match = await mp.joinMatch(allocation.matchId);
+        // Play (chat) opts the co-located bot into LLM replies; Spectator (bot-vs-bot) stays on the
+        // fast offline Markov reply so its throughput isn't gated on the model.
+        const match = await mp.joinMatch(allocation.matchId, {
+          chatLlm: !this.spectator,
+        });
         this.selfParty = match.role;
         this.emit();
 
@@ -708,55 +823,122 @@ class FlashPvpSession {
 
 const flashSessions = new Map<string, FlashPvpSession>();
 
-function getFlashSession(windowId: string): FlashPvpSession {
-  let session = flashSessions.get(windowId);
+/**
+ * One session per `sessionKey`, torn down under the real `windowId`. The Play tab and the auto-driven
+ * Spectator tab live in the SAME window but need SEPARATE sessions (human chat vs bot-vs-bot), so
+ * they pass distinct `sessionKey`s; both register their disposer under `windowId` (what `Desktop.close`
+ * knows) with a key derived from the session so neither overwrites the other's teardown.
+ */
+function getFlashSession(
+  windowId: string,
+  sessionKey: string,
+): FlashPvpSession {
+  let session = flashSessions.get(sessionKey);
   if (!session) {
     session = new FlashPvpSession();
-    flashSessions.set(windowId, session);
+    flashSessions.set(sessionKey, session);
     const created = session;
-    registerWindowDisposer(windowId, "flash-pvp", () => {
+    registerWindowDisposer(windowId, `flash-pvp:${sessionKey}`, () => {
       created.dispose();
-      flashSessions.delete(windowId);
+      flashSessions.delete(sessionKey);
     });
   }
   return session;
 }
 
-export function useFlashPvp(windowId: string): FlashPvpApi {
+/**
+ * Drive one flash arena chat for a window.
+ *
+ * `opts.auto` turns it into the SPECTATOR: the browser bot occupies seat A (the "user" seat) via the
+ * exact same allocate flow Play uses — one deposit, then the co-located backend bot is spawned on
+ * seat B at `arena.join`. Instead of a human typing, this AUTO-SENDS a canned reply on seat A's turn,
+ * so the two bots exchange over the relay and every move counts via `relay_to_other` (like all arena
+ * moves). `opts.sessionKey` scopes the session so it never collides with the Play tab's.
+ */
+export function useFlashPvp(
+  windowId: string,
+  opts?: { sessionKey?: string; auto?: boolean },
+): FlashPvpApi {
+  const sessionKey = opts?.sessionKey ?? windowId;
+  const auto = opts?.auto ?? false;
   const account = useCurrentAccount();
   const client = useSuiClient();
   const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
   const sponsored = useSponsoredSignExec();
   const { report } = useTelemetry();
 
-  const session = getFlashSession(windowId);
-  session.deps = {
-    account,
-    client,
-    signExec: (async (
-      tx: Parameters<typeof signAndExecute>[0]["transaction"],
-    ) => {
-      const r = await signAndExecute({ transaction: tx });
-      return { digest: r.digest };
-    }) as never,
-    sponsoredSignExec: sponsored.signExec as never,
-    report,
-  };
+  const session = getFlashSession(windowId, sessionKey);
+  session.spectator = auto;
+  if (auto) {
+    // Spectator: seat A is a self-funded bot (bjBots-style), NOT the connected wallet. Its own
+    // sponsored signer covers the allocate deposit + settle close; gas is sponsored, stake is
+    // faucet-funded MTPS — so it runs with no wallet connected.
+    const bot = session.ensureSpectatorBot();
+    const botSignExec = makeKeypairSponsoredSignExec({
+      address: bot.address,
+      keypair: bot.keypair,
+      client: client as never,
+    }) as never;
+    session.deps = {
+      account: { address: bot.address },
+      client,
+      signExec: botSignExec,
+      sponsoredSignExec: botSignExec,
+      report,
+    };
+  } else {
+    session.deps = {
+      account,
+      client,
+      signExec: (async (
+        tx: Parameters<typeof signAndExecute>[0]["transaction"],
+      ) => {
+        const r = await signAndExecute({ transaction: tx });
+        return { digest: r.digest };
+      }) as never,
+      sponsoredSignExec: sponsored.signExec as never,
+      report,
+    };
+  }
 
   const snap = useSyncExternalStore(session.subscribe, session.getSnapshot);
+
+  // Spectator auto-driver: when it's seat A's turn, auto-send the next canned reply after a short
+  // pace. The backend bot (seat B) answers, we re-arm on the resulting state change — strict A/B
+  // alternation, so the loop is self-limiting (a missing reply just stalls, never spins). Each send
+  // is a real co-signed move over the relay, so it counts toward TPS exactly like a human's.
+  useEffect(() => {
+    if (
+      !auto ||
+      snap.status !== "playing" ||
+      !canSend(snap.state, snap.selfParty)
+    )
+      return;
+    const count = snap.state?.messageCount ?? 0n;
+    const id = setTimeout(
+      () => session.send(flashSpectatorReply(count)),
+      SPECTATOR_AUTO_PACE_MS,
+    );
+    return () => clearTimeout(id);
+  }, [auto, session, snap.status, snap.state, snap.selfParty]);
 
   // Cold-load resume: on mount (and once the wallet connects) restore a persisted in-flight chat.
   // Runs BEFORE the arena-entry effect and sets `status = "playing"` synchronously when it finds a
   // record, so a fresh arena entry (gated on `status === "idle"`) never double-enters over it.
   useEffect(() => {
+    // Spectator runs a self-funded bot with its own lifecycle (startSpectator) — it neither
+    // restores a wallet-scoped resume record nor consumes the shared arena store.
+    if (auto) return;
     session.resumeIfActive();
-  }, [session, account?.address]);
+  }, [auto, session, account?.address]);
 
   // Centralized batched arena entry: the on-connect orchestrator deposited flash's
   // seat A in one batched PTB and published {allocation, keypair} to the arena store.
-  // Consume it once and auto-enter the bot match.
+  // Consume it once and auto-enter the bot match. Spectator sessions opt OUT (they allocate
+  // directly via `startSpectator`), so Play and Spectator never contend for the store.
   const arenaEntered = useRef(false);
   useEffect(() => {
+    if (auto) return;
     const tryEnter = () =>
       consumeArenaEntry(
         FLASH_ARENA_GAME_ID,
@@ -766,7 +948,7 @@ export function useFlashPvp(windowId: string): FlashPvpApi {
       );
     tryEnter();
     return subscribeArena(tryEnter);
-  }, [session, snap.status]);
+  }, [auto, session, snap.status]);
 
   // A "true new chat": mirror a page reload. `session.reset()` returns the session to idle and drops
   // the settled tunnel's resume record; re-arming `arenaEntered` (which a reload gets fresh) lets the
@@ -775,18 +957,22 @@ export function useFlashPvp(windowId: string): FlashPvpApi {
   const newChat = useCallback(() => {
     session.reset();
     arenaEntered.current = false;
+    // Spectator has no store-published entry to re-consume — Start begins a fresh self-funded match.
+    if (auto) return;
     const addr = account?.address;
     if (addr) void requestArenaGame(FLASH_ARENA_GAME_ID, addr);
-  }, [session, account?.address]);
+  }, [auto, session, account?.address]);
 
   // End chat: settle the current tunnel in the background, clear the UI to idle, and roll straight
   // into a fresh chat — same re-arm + allocate as `newChat`, but it closes the old tunnel first.
   const endChat = useCallback(() => {
     session.settleAndDetach();
     arenaEntered.current = false;
+    // Spectator: settle + return to idle (no auto-restart); Start spins up a fresh self-funded match.
+    if (auto) return;
     const addr = account?.address;
     if (addr) void requestArenaGame(FLASH_ARENA_GAME_ID, addr);
-  }, [session, account?.address]);
+  }, [auto, session, account?.address]);
 
   return {
     status: snap.status,

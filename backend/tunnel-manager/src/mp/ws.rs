@@ -514,13 +514,20 @@ async fn handle_authed(
             state.bus.evict(&opp_conn, &match_id).await;
             Ok(())
         }
-        ClientMsg::ArenaJoin { match_id } => {
+        ClientMsg::ArenaJoin { match_id, chat_llm } => {
             // Claim the pre-allocated arena match and spawn its bot HERE — co-located with this WS,
             // so the match relays in-process (ADR-0005). This delivers `MatchFound` to us (party A)
             // and starts the bot. An unknown/expired id, a foreign wallet, or a second (already
-            // claimed) join all surface as `unknown_arena_match`.
-            crate::fleet::colocated::join_and_spawn(state, &match_id, here(state, conn_id), wallet)
-                .await
+            // claimed) join all surface as `unknown_arena_match`. `chat_llm` (flash Play only) routes
+            // the bot to LLM replies.
+            crate::fleet::colocated::join_and_spawn(
+                state,
+                &match_id,
+                here(state, conn_id),
+                wallet,
+                chat_llm,
+            )
+            .await
         }
         ClientMsg::Connect { .. } => Err("already_connected"),
     }

@@ -9,6 +9,8 @@
 //! (bot-vs-bot, both seats sharing one anchor instance); the Sui anchor / a relay-bridged anchor is
 //! the on-chain genuine-two-party path.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail, Context, Result};
 use tunnel_battleship::{Battleship, BattleshipStrategy};
 use tunnel_blackjack::v2::{BlackjackV2, BlackjackV2Strategy};
@@ -16,7 +18,7 @@ use tunnel_blackjack::{Blackjack, BlackjackStrategy};
 use tunnel_bomb_it::{BombIt, BombItStrategy};
 use tunnel_caro::{CaroSeries, CaroSeriesStrategy, CaroStrength};
 use tunnel_cross::{Cross, CrossStrategy};
-use tunnel_flash::{Flash, FlashStrategy};
+use tunnel_flash::{ChatResponder, Flash, FlashStrategy};
 use tunnel_harness::{
     Balances, DriverOutcome, DriverRunControl, MoveStrategy, PartyDriver, Protocol, SeatParts,
     Signer, TranscriptRecorder, TunnelAnchor,
@@ -576,7 +578,8 @@ where
     .await
 }
 
-/// Flash: `flash.v1`, deterministic strategy with no per-role seed.
+/// Flash: `flash.v1`. In chat mode the co-located bot answers with `responder`'s LLM reply to the
+/// user's plaintext; pass `None` (bench self-play, offline) for the digest-seeded Markov fallback.
 pub async fn play_flash<T, A, R>(
     channel: MatchChannel<T>,
     anchor: A,
@@ -584,6 +587,7 @@ pub async fn play_flash<T, A, R>(
     role: Role,
     opponent_wallet: &str,
     recorder: R,
+    responder: Option<Arc<dyn ChatResponder>>,
 ) -> Result<DriverOutcome>
 where
     T: RelayTransport,
@@ -595,15 +599,12 @@ where
         role,
         opponent_wallet: opponent_wallet.to_owned(),
     };
+    let strategy = match responder {
+        Some(responder) => FlashStrategy::with_responder(responder),
+        None => FlashStrategy::new(),
+    };
     play_match(
-        Flash,
-        FlashStrategy::new(),
-        &FLASH,
-        &info,
-        channel,
-        anchor,
-        signer,
-        recorder,
+        Flash, strategy, &FLASH, &info, channel, anchor, signer, recorder,
     )
     .await
 }
