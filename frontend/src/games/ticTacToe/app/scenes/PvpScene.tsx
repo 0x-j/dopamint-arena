@@ -71,7 +71,7 @@ export function PvpScene({ isPortrait = false }: { isPortrait?: boolean }) {
         <section className="qp-panel qp-stroke @container w-[95%] max-w-2xl my-auto p-6 md:p-10 flex flex-col items-center gap-5 text-center mx-auto">
           <div className="w-full flex items-center justify-center">
             <span className="qp-eyebrow !text-sm md:!text-base">
-              PvP Tic-Tac-Toe
+              Tic-Tac-Toe
             </span>
           </div>
 

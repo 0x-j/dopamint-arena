@@ -2,9 +2,11 @@ import type { GameModule, Workspace } from "./types";
 
 const modules = new Map<string, GameModule>();
 
-/** Register a game module. Throws on duplicate id to catch copy-paste mistakes. */
+/** Register a game module. Throws on duplicate id in production / cold start to
+ *  catch copy-paste mistakes, but silently overwrites during Vite HMR where
+ *  module-level state survives while each game's barrel re-executes. */
 export function register(module: GameModule): void {
-  if (modules.has(module.id)) {
+  if (modules.has(module.id) && !import.meta.hot) {
     throw new Error(`duplicate game module id: ${module.id}`);
   }
   modules.set(module.id, module);

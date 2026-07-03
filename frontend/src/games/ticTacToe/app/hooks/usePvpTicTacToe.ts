@@ -516,7 +516,6 @@ export function usePvpTicTacToe(
     (mp: MpClient): boolean => {
       const selfWallet = walletRef.current.address;
       if (!selfWallet) {
-        console.log("[ttt:tryResume] no wallet");
         return false;
       }
       installResumePersistence();
@@ -537,10 +536,9 @@ export function usePvpTicTacToe(
         { selfWallet },
       );
       if (restored.length === 0) {
-        console.log("[ttt:tryResume] no restored tunnels");
         return false;
       }
-      console.log("[ttt:tryResume] restored", restored.length, "tunnel(s)");
+
       const { tunnel, channel } = restored[0]; // one active match per game in practice
       const rec = readResumeRecord(tunnel.tunnelId)!;
       activateTttSession(mp, channel, tunnel, {
@@ -609,9 +607,6 @@ export function usePvpTicTacToe(
           // Cold-load: before joining a queue, rebuild any persisted in-flight match for this
           // variant and re-attach to it. The opening handshake then carries resume{matchId}.
           if (tryResume(mp)) {
-            console.log(
-              "[ttt:queue] tryResume succeeded — connecting for resume",
-            );
             try {
               await mp.connect();
               return; // skip quickMatch — we are continuing an in-flight match
@@ -621,10 +616,7 @@ export function usePvpTicTacToe(
               // record on the first failure: close the raced socket, wait for the relay to clean up
               // the old session, and retry WITH the record so the next attempt can still resume.
               // Only clear the record after exhausting retries (the match is truly gone).
-              console.warn(
-                "[ttt:queue] resume connect failed, will retry",
-                connErr,
-              );
+
               const resumedTid = tunnelRef.current?.tunnelId;
               mp.close();
               mpRef.current = null;
@@ -641,9 +633,7 @@ export function usePvpTicTacToe(
               // fresh arena allocation (the batch already ran and skipped this game), and return to
               // idle so the arena-entry subscriber can pick up the new allocation.
               if (resumedTid) clearResumeRecord(resumedTid);
-              console.warn(
-                "[ttt:queue] resume exhausted, requesting fresh arena allocation",
-              );
+
               setPhase("idle");
               arenaEnteredRef.current = false;
               const w = walletRef.current;
@@ -653,9 +643,6 @@ export function usePvpTicTacToe(
             }
           }
           await mp.connect();
-          console.log(
-            "[ttt:queue] tryResume=false — falling through to quickMatch",
-          );
           setPhase("queuing");
           // The queue key encodes the variant (+ board size for caro) so only players who chose the
           // SAME setup match — otherwise the two seats would run incompatible protocols and diverge.
@@ -679,17 +666,11 @@ export function usePvpTicTacToe(
   // a fresh quickMatch, so a stale/terminal record just drops back to the menu. Idempotent (no-ops if
   // already connected or nothing to restore); mirrors the arena-entry effect below.
   const resume = useCallback(() => {
-    console.log("[ttt:resume] called", { hasMp: !!mpRef.current, variant });
     if (mpRef.current) return;
     const w = walletRef.current;
     const selfWallet = w.address;
-    console.log("[ttt:resume] wallet", {
-      isConnected: w.isConnected,
-      selfWallet,
-    });
     if (!w.isConnected || !selfWallet) return;
     const hasMatch = hasResumableMatch(variant);
-    console.log("[ttt:resume] hasResumableMatch", { variant, hasMatch });
     if (!hasMatch) return;
     // Route cold-load resume through queue(): its resume branch (tryResume) restores the in-flight
     // match WITH the connect-error recovery, and a stale/terminal record falls through to a fresh
@@ -1115,17 +1096,11 @@ export function usePvpTicTacToe(
     const arenaId = arenaGameIdFor(variant);
     const tryEnter = () => {
       const isIdle = phaseRef.current === "idle";
-      console.log("[ttt:arenaEntry] tryEnter", {
-        arenaId,
-        isIdle,
-        entered: arenaEnteredRef.current,
-      });
       consumeArenaEntry(
         arenaId,
         arenaEnteredRef,
         () => phaseRef.current === "idle",
         (...args) => {
-          console.log("[ttt:arenaEntry] CONSUMING arena entry!");
           enterArenaMatchRef.current(...args);
         },
       );

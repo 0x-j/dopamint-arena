@@ -71,18 +71,7 @@ function arenaGameIdsForOpenWindows(): string[] {
   const activeTunnels = listActiveTunnels();
   const records = activeTunnels.map((id) => readResumeRecord(id));
   const resumingGameKeys = resumingGameKeysOf(records);
-  console.log(
-    "[arenaAutoEnter] activeTunnels",
-    activeTunnels,
-    "records",
-    records?.map((r) => (r ? { game: r.game, terminal: r.terminal } : null)),
-    "resumingKeys",
-    resumingGameKeys,
-    "idsBeforeSkip",
-    ids,
-  );
   const result = arenaIdsExcludingResuming(ids, resumingGameKeys);
-  console.log("[arenaAutoEnter] idsAfterSkip (will allocate)", result);
   return result;
 }
 

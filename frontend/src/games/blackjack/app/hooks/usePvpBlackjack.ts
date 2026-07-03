@@ -84,13 +84,11 @@ const MP_URL =
       ? location.origin
       : "http://127.0.0.1:8080")
   ).replace(/^http/, "ws");
-/** Default buy-in (bankroll) deposited on-chain per seat — whole MTPS (0-decimal; ADR-0023), shown
- *  1:1 as chips. Each player chooses their own before matchmaking; the bet protocol caps each round
- *  at min(both balances). */
+/** Fixed buy-in (bankroll) deposited on-chain per seat — whole MTPS (0-decimal; ADR-0023), shown
+ *  1:1 as chips. Arena play deposits the backend's `allocation.stakeEach` (the single source of
+ *  truth); this is the self-play/queue stake and the on-demand back-compat fallback. The bet
+ *  protocol caps each round at min(both balances). */
 const DEFAULT_STAKE = 100n;
-/** Buy-in options offered before "Find match" — whole MTPS (0-decimal), shown 1:1 as chips. Stacks
- *  big enough for many rounds (min-bet 1, bet options up to 10); each fits a single faucet pull. */
-const FUND_OPTIONS = [100, 250, 500] as const;
 const BOT_MOVE_MS = 700; // player auto-bot move cadence
 const NEXT_MS = 900; // pause before auto-dealing the next round
 const DEFAULT_BET = Number(MIN_BET); // auto's starting bet until the player picks one
@@ -145,13 +143,10 @@ export interface PvpView {
   betOptions: number[]; // chip denominations the player may bet now (filtered to ≤ tableMax)
   rounds: RoundResult[];
   auto: boolean;
-  stake: bigint; // this seat's chosen buy-in (locked once a match starts)
-  fundOptions: number[]; // buy-in choices offered before matchmaking
   walletAddress: string;
   walletBalance: bigint;
   digests: { create?: string; deposit?: string; close?: string };
   fund: () => void;
-  setStake: (amount: bigint) => void;
   queue: () => void;
   /** On-demand arena entry: reserve a server bot for this game and play it now. */
   playArena: () => void;
@@ -179,7 +174,6 @@ export function usePvpBlackjack(): PvpView {
   // Arena games autopilot by default (fallback true) so a resume/reload keeps playing; your
   // explicit toggle still sticks for the session. See autoPreference.
   const [auto, setAutoState] = useState(() => defaultAuto("blackjack", true));
-  const [stake, setStakeState] = useState<bigint>(DEFAULT_STAKE);
   const [walletBalance, setWalletBalance] = useState<bigint>(0n);
   const [digests, setDigests] = useState<{
     create?: string;
@@ -205,7 +199,6 @@ export function usePvpBlackjack(): PvpView {
   const requeueRef = useRef<(() => void) | null>(null);
   const autoKickedRef = useRef(false);
   const lastBetRef = useRef<number>(DEFAULT_BET); // remembered bet for auto rounds; set on every player bet
-  const stakeRef = useRef<bigint>(DEFAULT_STAKE); // chosen buy-in, read inside onMatch without stale closures
   const createdAtRef = useRef<bigint>(0n);
   const matchIdRef = useRef<string>("");
   const settledRef = useRef(false);
@@ -300,12 +293,6 @@ export function usePvpBlackjack(): PvpView {
       }
     })();
   }, [walletAddress, refreshBalance]);
-
-  // Pick this seat's buy-in (only meaningful before a match; locked once playing).
-  const setStake = useCallback((amount: bigint) => {
-    stakeRef.current = amount;
-    setStakeState(amount);
-  }, []);
 
   const finishSettle = useCallback(
     async (
@@ -633,10 +620,7 @@ export function usePvpBlackjack(): PvpView {
             // Resume connect failed — commonly a 2nd socket for this wallet racing the relay's
             // routing right after a freeze/reconnect. Preserve the resume record and retry with
             // backoff so the relay can clean up the old session. Only clear after exhausting retries.
-            console.warn(
-              "[blackjack:queue] resume connect failed, will retry",
-              connErr,
-            );
+
             const resumedTid = tunnelRef.current?.tunnelId;
             mp.close();
             mpRef.current = null;
@@ -650,9 +634,7 @@ export function usePvpBlackjack(): PvpView {
             }
             resumeRetryRef.current = 0;
             if (resumedTid) clearResumeRecord(resumedTid);
-            console.warn(
-              "[blackjack:queue] resume exhausted, requesting fresh arena allocation",
-            );
+
             setPhase("idle");
             arenaEnteredRef.current = false;
             if (walletAddress)
@@ -763,7 +745,7 @@ export function usePvpBlackjack(): PvpView {
         const oppEphPubkey = hexToBytes(oppHello);
 
         // Exchange chosen buy-ins so both seats agree on the (possibly asymmetric) starting balances.
-        const myStake = stakeRef.current;
+        const myStake = DEFAULT_STAKE;
         channel.sendPeer({ t: "stake", amount: Number(myStake) });
         const oppStake =
           bufferedStakeRef.current ??
@@ -1123,7 +1105,7 @@ export function usePvpBlackjack(): PvpView {
         wallet: walletAddress,
         stake: stakeStrategy,
         label: "blackjack",
-        stakePerGame: stake,
+        stakePerGame: DEFAULT_STAKE,
         setBusy: () => {
           setError(null);
           setPhase("funding");
@@ -1139,7 +1121,7 @@ export function usePvpBlackjack(): PvpView {
         enter: enterArenaMatch,
       });
     })();
-  }, [walletAddress, signAndExecute, sponsored, stake, enterArenaMatch]);
+  }, [walletAddress, signAndExecute, sponsored, enterArenaMatch]);
 
   // Centralized batched entry (ADR-0028): the on-connect orchestrator deposited blackjack's seat A in
   // the one batched PTB and published {allocation, keypair} to the arena store. Consume it once and
@@ -1329,7 +1311,7 @@ export function usePvpBlackjack(): PvpView {
 
   // Find a new match after a settle, reusing the SAME socket (the relay runs many matches per
   // connection): release the settled match and re-quickMatch in place — keeping Auto on so the
-  // next match auto-plays (the chosen buy-in in stakeRef carries over). Falls back to a full
+  // next match auto-plays (DEFAULT_STAKE carries over). Falls back to a full
   // queue() if the socket is gone.
   const requeue = useCallback(() => {
     const mp = mpRef.current;
@@ -1461,13 +1443,10 @@ export function usePvpBlackjack(): PvpView {
     betOptions,
     rounds,
     auto,
-    stake,
-    fundOptions: [...FUND_OPTIONS],
     walletAddress,
     walletBalance,
     digests,
     fund,
-    setStake,
     queue,
     playArena,
     hit,

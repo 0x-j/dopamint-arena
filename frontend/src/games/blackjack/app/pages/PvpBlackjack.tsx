@@ -14,10 +14,6 @@ import {
 
 import { SketchDefs } from "@/games/blackjack/app/App";
 
-const MIN_BUYIN = 100;
-const chipsToSui = (chips: bigint) =>
-  (Number(chips) / 1e9).toLocaleString("en-US", { maximumFractionDigits: 9 });
-
 function statusText(g: ReturnType<typeof usePvpBlackjack>): string {
   if (g.phase === "opening") return "Opening tunnel on-chain…";
   if (g.phase === "funding") return "Funding your seat…";
@@ -74,7 +70,6 @@ export default function PvpBlackjack() {
 
   // Bet/payout chip animation, driven off the player's (party A) seat — matching the fixed
   // player-bottom / dealer-top layout (same felt motion as the bot-vs-bot self-play table).
-  const [customStake, setCustomStake] = useState(""); // free-typed buy-in (empty → a preset is active)
   const [animState, setAnimState] = useState<
     "idle" | "deal" | "win" | "lose" | "push"
   >("idle");
@@ -450,8 +445,15 @@ export default function PvpBlackjack() {
             <div className="absolute inset-0 z-20 flex items-center justify-center p-4">
               <div className="qp-panel qp-stroke max-w-[min(48rem,95%)] p-10 md:p-12 flex flex-col items-center gap-5 text-center relative">
                 {/* <span className="qp-eyebrow">Blackjack · PvP</span> */}
+                <img
+                  src="/blackjack-logo-gold.svg"
+                  alt=""
+                  aria-hidden="true"
+                  draggable={false}
+                  className="w-20 h-20 md:w-24 md:h-24 select-none"
+                />
                 <h2 className="qp-title uppercase text-center mb-1">
-                  Blackjack PvP
+                  Blackjack
                 </h2>
                 {!account ? (
                   <p className="text-center text-2xl md:text-3xl text-[var(--qp-red)] font-bold py-6 uppercase tracking-widest">
@@ -463,67 +465,6 @@ export default function PvpBlackjack() {
                   </div>
                 ) : (
                   <div className="w-full flex flex-col gap-3">
-                    {/* Buy-in */}
-                    <div className="flex flex-col gap-2">
-                      <span className="text-sm text-[var(--qp-ink-soft)] uppercase tracking-widest text-center font-bold">
-                        Your buy-in
-                      </span>
-                      <div className="grid grid-cols-4 gap-2">
-                        {g.fundOptions.map((amt) => {
-                          const selected =
-                            customStake === "" && g.stake === BigInt(amt);
-                          return (
-                            <button
-                              key={amt}
-                              onClick={() => {
-                                g.setStake(BigInt(amt));
-                                setCustomStake("");
-                              }}
-                              disabled={
-                                g.phase === "queuing" ||
-                                g.phase === "connecting"
-                              }
-                              className={`qp-btn !py-2.5 !text-base font-black tabular-nums transition-colors disabled:opacity-40 ${selected ? "qp-btn--go" : ""}`}
-                            >
-                              {amt.toLocaleString()}
-                            </button>
-                          );
-                        })}
-                      </div>
-                      {/* Custom buy-in */}
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          inputMode="numeric"
-                          min={MIN_BUYIN}
-                          placeholder="Custom amount"
-                          value={customStake}
-                          disabled={
-                            g.phase === "queuing" || g.phase === "connecting"
-                          }
-                          onChange={(e) => {
-                            const v = e.target.value.replace(/[^0-9]/g, "");
-                            setCustomStake(v);
-                            if (v) g.setStake(BigInt(v));
-                          }}
-                          className="flex-1 min-w-0 qp-input bg-[#fffdf6] border-2 border-[var(--qp-ink)] focus:border-[var(--qp-amber)] rounded-md px-3 py-1.5 text-sm font-mono outline-none"
-                        />
-                      </div>
-                      {!isMtpsConfigured && (
-                        <div className="text-[11px] text-[var(--qp-ink-soft)] text-center leading-relaxed">
-                          {Number(g.stake).toLocaleString()} buy-in ≈{" "}
-                          <span className="font-mono text-emerald-600 font-bold">
-                            {chipsToSui(g.stake)} SUI
-                          </span>{" "}
-                          on-chain
-                        </div>
-                      )}
-                      {g.stake < BigInt(MIN_BUYIN) && (
-                        <div className="text-[var(--qp-red)] text-[11px] text-center font-bold">
-                          minimum buy-in is {MIN_BUYIN.toLocaleString()}
-                        </div>
-                      )}
-                    </div>
                     {!funded && (
                       <button
                         onClick={g.fund}
@@ -552,6 +493,11 @@ export default function PvpBlackjack() {
                       >
                         cancel
                       </button>
+                    )}
+                    {g.error && (
+                      <div className="font-bold text-sm text-[var(--qp-red)] bg-red-50 rounded-xl p-3 border-2 border-red-200 w-full break-words text-center">
+                        {g.error}
+                      </div>
                     )}
                   </div>
                 )}

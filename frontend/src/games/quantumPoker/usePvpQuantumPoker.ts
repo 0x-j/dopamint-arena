@@ -1102,7 +1102,7 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
           // Resume connect failed — commonly a 2nd socket for this wallet racing the relay's
           // routing right after a freeze/reconnect. Preserve the resume record and retry with
           // backoff so the relay can clean up the old session. Only clear after exhausting retries.
-          console.warn("[poker:resume] connect failed, will retry", connErr);
+
           const tid = tunnel.tunnelId;
           reset();
           const attempt = resumeRetryRef.current;
@@ -1114,9 +1114,7 @@ export function usePvpQuantumPoker(): PvpQuantumPoker {
           }
           resumeRetryRef.current = 0;
           clearResumeRecord(tid);
-          console.warn(
-            "[poker:resume] exhausted, requesting fresh arena allocation",
-          );
+
           // reset() already set status to "idle" above; re-arm the arena guard so the
           // lazy allocation's entry can be consumed by the arena-entry subscriber.
           arenaEnteredRef.current = false;
